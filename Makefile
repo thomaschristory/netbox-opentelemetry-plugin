@@ -1,6 +1,6 @@
 COMPOSE = docker compose -f dev/docker-compose.yml
 
-.PHONY: test lint format dev down logs-collector e2e
+.PHONY: test lint format dev dev-gunicorn dev-uwsgi down logs-collector e2e
 
 test:
 	uv run pytest
@@ -15,6 +15,12 @@ format:
 
 dev:
 	$(COMPOSE) up -d --build
+
+dev-gunicorn:
+	$(COMPOSE) --profile gunicorn up -d --build
+
+dev-uwsgi:
+	$(COMPOSE) --profile uwsgi up -d --build
 
 down:
 	$(COMPOSE) down

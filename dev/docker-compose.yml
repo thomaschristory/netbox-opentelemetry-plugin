@@ -25,6 +25,8 @@ services:
         condition: service_started
     ports:
       - "8000:8080"
+    environment:
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev,netbox.dev.server=granian
     healthcheck:
       test: /opt/netbox/health.sh
       start_period: 120s
@@ -40,6 +42,45 @@ services:
       - /opt/netbox/venv/bin/python
       - /opt/netbox/netbox/manage.py
       - rqworker
+
+  netbox-gunicorn:
+    <<: *netbox
+    profiles: ["gunicorn"]
+    depends_on:
+      netbox:
+        condition: service_healthy
+    environment:
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev,netbox.dev.server=gunicorn
+    command:
+      - /opt/netbox/venv/bin/gunicorn
+      - --preload
+      - --workers=3
+      - --threads=3
+      - --bind=0.0.0.0:8080
+      - --chdir=/opt/netbox/netbox
+      - netbox.wsgi
+    ports:
+      - "8001:8080"
+
+  netbox-uwsgi:
+    <<: *netbox
+    profiles: ["uwsgi"]
+    depends_on:
+      netbox:
+        condition: service_healthy
+    environment:
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev,netbox.dev.server=uwsgi
+    command:
+      - /opt/netbox/venv/bin/uwsgi
+      - --master
+      - --processes=3
+      - --http-socket=0.0.0.0:8080
+      - --chdir=/opt/netbox/netbox
+      - --module=netbox.wsgi
+      - --need-app
+      - --die-on-term
+    ports:
+      - "8002:8080"
 
   postgres:
     image: docker.io/postgres:18-alpine

@@ -42,7 +42,8 @@ Targets:
 ```
 netbox_opentelemetry_plugin/
   __init__.py      PluginConfig (min/max version, default_settings); ready() -> super().ready(), bootstrap.install(), fully wrapped
-  config.py        PLUGINS_CONFIG + OTEL_* env -> frozen dataclasses, one per module
+  conf.py          PLUGINS_CONFIG + OTEL_* env -> frozen dataclasses, one per module
+                   (not config.py: NetBox reads the package attribute `config` as the PluginConfig)
   otel.py          ALL OpenTelemetry SDK imports, including opentelemetry.sdk._logs; Resource, exporters, processors
   bootstrap.py     per-process guard, role detection, provider detection, module registry, fork hooks, atexit, shutdown
   middleware.py    adds netbox.request_id and enduser.id to the active request span
@@ -109,7 +110,7 @@ ready()  -> super().ready()
 
 ## 5. Configuration
 
-All settings live in `PLUGINS_CONFIG["netbox_opentelemetry_plugin"]`, defaults in `PluginConfig.default_settings`, resolved once per process.
+All settings live in `PLUGINS_CONFIG["netbox_opentelemetry_plugin"]`, resolved once per process. Defaults live in `config.DEFAULTS`, not in `PluginConfig.default_settings`: NetBox merges `default_settings` one level deep only (nested dicts would be replaced wholesale), and pre-filled defaults would make explicit values indistinguishable from defaults, which breaks the `OTEL_*` fallback.
 
 Precedence for every setting: explicit `PLUGINS_CONFIG` value, then the signal specific `OTEL_*` variable, then the generic `OTEL_*` variable, then the default. `OTEL_SDK_DISABLED=true` disables everything.
 
@@ -176,7 +177,9 @@ Validation:
 - SDK `LoggingHandler` attached to each logger in `logs.loggers`, at `logs.level`.
 - Body: formatted message. Severity: mapped from Python level.
 - Attributes: `code.file.path`, `code.function.name`, `code.line.number`, `logger.name`, `thread.name`; `exception.type`, `exception.message`, `exception.stacktrace` when present.
-- Arbitrary `extra=` fields are not exported (allowlist principle).
+- Arbitrary `extra=` fields are not exported (allowlist principle). The SDK `LoggingHandler` exports every non-reserved `LogRecord` attribute by default, so the plugin subclasses it and filters attributes against an allowlist.
+- NetBox's default `LOGGING` is empty, so the `netbox` logger inherits the root level (WARNING). INFO records only reach the handler if `LOGGING` sets a lower level or `set_logger_levels` is true.
+- Providers are passed explicitly to handlers and instrumentors; the plugin does not set the global OTel providers.
 - Inside an active span, records carry `trace_id` and `span_id`.
 - Feedback-loop filter: records from `netbox_opentelemetry_plugin` and `opentelemetry.*` loggers are rejected by the handler. The plugin's own logger writes to stdout only.
 

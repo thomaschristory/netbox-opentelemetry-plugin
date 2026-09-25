@@ -107,3 +107,20 @@ def test_shutdown_removes_handlers(exporter):
     module.install(_context(_settings(["t.logs.remove"]), exporter))
     module.shutdown()
     assert _otel_handlers("t.logs.remove") == []
+
+
+def test_after_fork_repoints_handler_to_new_provider(exporter):
+    ctx = _context(_settings(["t.logs.afterfork"]), exporter)
+    module = LogsModule()
+    module.install(ctx)
+    replacement = InMemoryLogRecordExporter()
+    ctx.logger_provider = otel.build_logger_provider(ctx.resource, replacement, synchronous=True)
+    module.after_fork(ctx)
+    lg = logging.getLogger("t.logs.afterfork")
+    lg.setLevel(logging.INFO)
+    lg.info("after fork")
+    assert [r.log_record.body for r in replacement.get_finished_logs()] == ["after fork"]
+    assert len(exporter.get_finished_logs()) == 0
+    assert len(_otel_handlers("t.logs.afterfork")) == 1
+    lg.setLevel(logging.NOTSET)
+    module.shutdown()

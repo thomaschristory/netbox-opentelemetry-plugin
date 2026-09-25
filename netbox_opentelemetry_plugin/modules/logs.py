@@ -13,7 +13,7 @@ class LogsModule:
     name = "logs"
 
     def __init__(self) -> None:
-        self._handler: logging.Handler | None = None
+        self._handler: otel.AllowlistLoggingHandler | None = None
         self._attached: list[logging.Logger] = []
         self._previous_levels: dict[str, int] = {}
 
@@ -36,6 +36,11 @@ class LogsModule:
             target.addHandler(handler)
             self._attached.append(target)
         self._handler = handler
+
+    def after_fork(self, ctx: Context) -> None:
+        """Point the inherited handler at the provider rebuilt for this process."""
+        if self._handler is not None and ctx.logger_provider is not None:
+            self._handler.set_logger_provider(ctx.logger_provider)
 
     def shutdown(self) -> None:
         if self._handler is None:

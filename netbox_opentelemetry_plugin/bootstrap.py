@@ -24,6 +24,7 @@ logger = logging.getLogger(otel.PLUGIN_LOGGER)
 
 ROLE_WEB = "web"
 ROLE_RQWORKER = "rqworker"
+ROLE_RQ_HORSE = "rq_horse"
 ROLE_MANAGEMENT = "management"
 ROLE_RUNSERVER_PARENT = "runserver_parent"
 
@@ -34,6 +35,7 @@ class _State:
     context: Context | None
     modules: list[Module] = field(default_factory=list)
     owns_logger_provider: bool = False
+    netbox_version: str = "unknown"
 
 
 _state: _State | None = None
@@ -82,15 +84,9 @@ def install(
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("OpenTelemetry resolved config: %s", settings.redacted())
 
-        resource = otel.build_resource(
-            settings.service_name,
-            settings.resource_attributes,
-            service_version=netbox_version,
-            plugin_version=__version__,
-            role=role,
-        )
+        resource = _build_resource(settings, role, netbox_version)
         ctx = Context(settings=settings, role=role, resource=resource)
-        state = _State(pid=os.getpid(), context=ctx)
+        state = _State(pid=os.getpid(), context=ctx, netbox_version=netbox_version)
 
         if settings.logs.enabled:
             _setup_logger_provider(ctx, state)
@@ -112,6 +108,16 @@ def install(
         return ctx
 
 
+def _build_resource(settings: conf.Settings, role: str, netbox_version: str):
+    return otel.build_resource(
+        settings.service_name,
+        settings.resource_attributes,
+        service_version=netbox_version,
+        plugin_version=__version__,
+        role=role,
+    )
+
+
 def shutdown() -> None:
     global _state
     with _lock:
@@ -131,6 +137,72 @@ def shutdown() -> None:
                 ctx.logger_provider.shutdown()
             except Exception as exc:
                 logger.warning("OpenTelemetry: logger provider shutdown failed: %s", type(exc).__name__)
+
+
+def reinit_after_fork() -> None:
+    """Rebuild per-process OTel state in a forked child.
+
+    The SDK restarts its batch threads after fork but keeps the parent's service.instance.id and
+    shares the parent's exporter connection. This gives the child its own Resource, exporter and
+    LoggerProvider. Idempotent: a second call in the same process does nothing.
+    """
+    with _lock:
+        state = _state
+        if state is None or state.pid == os.getpid():
+            return
+        state.pid = os.getpid()
+        ctx = state.context
+        if ctx is None:
+            return
+        try:
+            _rebuild_for_child(ctx, state)
+        except Exception as exc:
+            logger.warning("OpenTelemetry: re-initialisation after fork failed: %s", _describe(exc, ctx.settings))
+
+
+def _rebuild_for_child(ctx: Context, state: _State) -> None:
+    if ctx.role == ROLE_RQWORKER:
+        ctx.role = ROLE_RQ_HORSE
+    resource = _build_resource(ctx.settings, ctx.role, state.netbox_version)
+    inherited = ctx.logger_provider if state.owns_logger_provider else None
+    if inherited is not None:
+        # A fresh exporter gives the child its own HTTP session or gRPC channel instead of
+        # sharing the parent's keep-alive connections.
+        exporter = otel.build_log_exporter(ctx.settings.logs.exporter)
+        ctx.logger_provider = otel.build_logger_provider(resource, exporter)
+    ctx.resource = resource
+    for module in state.modules:
+        try:
+            module.after_fork(ctx)
+        except Exception as exc:
+            logger.warning("OpenTelemetry: %s module after-fork failed: %s", module.name, _describe(exc, ctx.settings))
+    if inherited is not None:
+        otel.discard_logger_provider(inherited)
+
+
+def _before_fork() -> None:
+    # Holding the lock across fork() means no other thread can be half way through install()
+    # or shutdown() when the child's copy of the state is taken.
+    _lock.acquire()
+
+
+def _after_fork_in_parent() -> None:
+    _lock.release()
+
+
+def _after_fork_in_child() -> None:
+    global _lock
+    # The child must not reuse a lock whose state was copied from the parent.
+    _lock = threading.RLock()
+    reinit_after_fork()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_before_fork,
+        after_in_parent=_after_fork_in_parent,
+        after_in_child=_after_fork_in_child,
+    )
 
 
 def _setup_logger_provider(ctx: Context, state: _State) -> None:

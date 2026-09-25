@@ -2,7 +2,17 @@
 
 NetBox plugin that exports NetBox telemetry over OTLP to an OpenTelemetry Collector, from inside the NetBox processes. Each signal is a module that can be enabled or disabled in configuration.
 
-Status: under development. Currently implemented: application logs.
+Status: under development. Currently implemented: application logs, with support for forking web servers.
+
+## Web servers
+
+The plugin works with the web servers NetBox documents:
+
+- Granian (netbox-docker): nothing to configure.
+- gunicorn, with or without `preload_app`: nothing to configure.
+- uWSGI: nothing to configure with pyuwsgi. With the classic uwsgi binary, set `enable-threads = true`, otherwise nothing is exported (the plugin logs a warning).
+
+Each worker process exports with its own `service.instance.id`.
 
 ## Compatibility
 

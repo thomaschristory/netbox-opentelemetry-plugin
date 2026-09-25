@@ -71,7 +71,7 @@ ready()  -> super().ready()
          -> role = detect_role()               web | rqworker | rq_horse | management | runserver_parent
          -> providers = detect_or_build(cfg)   reuse global SDK providers if already set
          -> for each enabled module: try install(ctx) except: warn, skip that module
-         -> os.register_at_fork(before=..., after_in_child=...)
+         -> os.register_at_fork(before, after_in_parent, after_in_child) at import; uwsgi.post_fork_hook when under uWSGI
          -> atexit.register(shutdown)
 ```
 
@@ -83,20 +83,24 @@ ready()  -> super().ready()
 
 ### 4.2 Fork handling
 
-- `before` fork: `force_flush()` with a short timeout so buffered records are not duplicated into the child.
-- `after_in_child` in a web process (uWSGI, gunicorn with preload): discard the inherited processors and metric reader without exporting, rebuild them with a new `service.instance.id`, point the logging handler at the new provider.
-- `after_in_child` in an RQ work-horse (fork during `execute_job`): rebuild span and log processors as synchronous (`Simple*`), no metric reader. The `perform_job` wrapper also flushes in `finally`.
+- The OTel SDK (1.44) re-initialises its own batch processors in a forked child: new worker thread, new locks, cleared queue. A parent's unflushed records are therefore not exported twice, and no flush before fork is needed.
+- The SDK keeps the parent's Resource and shares the parent's exporter (the OTLP HTTP exporter's `requests.Session` is inherited as is). `after_in_child` therefore rebuilds the Resource (new `service.instance.id`), a fresh exporter and a new LoggerProvider, points the logging handler at it (`Module.after_fork`) and drops the inherited provider without shutting it down (its locks were copied from the parent in an unknown state; the SDK has already reset its batch processor). A provider configured outside the plugin is left alone.
+- `before` fork takes the bootstrap lock and `after_in_parent` releases it; the child gets a new lock.
+- The re-initialisation is keyed on the PID and runs at most once per process, so it is safe when both Python's at-fork hooks and uWSGI's `post_fork_hook` fire.
+- A child of the `rqworker` process takes the role `rq_horse`. Synchronous processors and the per-job flush for the horse are part of the RQ milestone.
+- If rebuilding in the child fails, the child keeps the inherited provider (reset by the SDK) and logs one warning; the plugin no longer owns it and will not shut it down at exit.
 
 ### 4.3 Install types (verified against NetBox 4.7.1 and netbox-docker 5.1.1 sources)
 
 | Install | Web server | App loaded before fork | Notes |
 |---|---|---|---|
-| netbox-docker 5.1 (also Helm chart) | Granian WSGI, 4 processes, many threads each | No, each process loads the app | Fork hook not exercised but harmless |
-| Bare metal, gunicorn (`contrib/gunicorn.py`) | 5 workers x 3 threads | No by default, yes with `preload_app` | Fork hook required with preload |
-| Bare metal, uWSGI (`contrib/uwsgi.ini`) | `master = true`, no `lazy-apps` | Yes | Fork hook required; `enable-threads` required |
-| `manage.py runserver` | autoreloader | `ready()` in parent and child | Parent skipped |
+| netbox-docker 5.1 (also Helm chart) | Granian WSGI, 4 processes, many threads each | No. On Python 3.14 Granian starts workers with spawn, each runs `ready()` | Fork hooks not exercised |
+| Bare metal, gunicorn (`contrib/gunicorn.py`) | 5 workers x 3 threads | No by default, yes with `preload_app` | gunicorn forks with `os.fork()`, Python at-fork hooks fire |
+| Bare metal, uWSGI (`contrib/uwsgi.ini`) | `master = true`, no `lazy-apps` | Yes | uWSGI forks in C; the plugin chains `uwsgi.post_fork_hook` |
+| `manage.py runserver` | autoreloader | The serving child is a separate process (`subprocess`, `RUN_MAIN=true`) | Parent skipped |
 
-- uWSGI without `enable-threads` does not run threads created by the application, so batch processors and the periodic metric reader never export. The plugin checks `uwsgi.opt` and logs one warning naming the fix. Docs list it as a requirement.
+- uWSGI runs Python's at-fork hooks only with `py-call-osafterfork`, so the plugin also sets `uwsgi.post_fork_hook` (chaining any hook already set).
+- The classic uwsgi binary does not run threads created by the application unless `enable-threads` (or `threads`) is set; the batch processors would then never export. The plugin logs one warning in that case. pyuwsgi (the PyPI package) always has thread support.
 - All providers are created once per process. Trace context uses contextvars and is thread safe under threaded workers.
 - RQ is identical on every install type: `manage.py rqworker`, `NetBoxRQWorker` (subclass of `rq.Worker`), one forked horse per job, horse exits with `os._exit`.
 

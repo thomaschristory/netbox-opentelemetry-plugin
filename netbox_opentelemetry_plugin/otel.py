@@ -11,10 +11,12 @@ unfiltered root handler and would duplicate exports and bypass the attribute all
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import logging
 import os
 import socket
+import threading
 import time
 import traceback
 from collections.abc import Mapping
@@ -175,12 +177,13 @@ class AllowlistLoggingHandler(logging.Handler):
             self._emitting.reset(token)
 
     def flush(self) -> None:
-        try:
-            force_flush = getattr(self._logger_provider, "force_flush", None)
-            if force_flush is not None:
-                force_flush()
-        except Exception:
-            pass
+        force_flush = getattr(self._logger_provider, "force_flush", None)
+        if force_flush is None:
+            return
+        # Same approach as the SDK's own handler (opentelemetry-python PR 4636): logging.shutdown()
+        # calls flush() while holding this handler's lock. A synchronous force_flush would wait on
+        # the batch worker, and a worker that logs through this handler would wait on the lock.
+        threading.Thread(target=_call_quietly, args=(force_flush,), name="otel-log-flush", daemon=True).start()
 
     def _translate(self, record: logging.LogRecord) -> LogRecord:
         body = self.format(record) if self.formatter else record.getMessage()
@@ -215,6 +218,11 @@ class AllowlistLoggingHandler(logging.Handler):
                 attributes["exception.message"] = str(exc_value.args[0])
             attributes["exception.stacktrace"] = "".join(traceback.format_exception(*exc_info))
         return attributes
+
+
+def _call_quietly(func) -> None:
+    with contextlib.suppress(Exception):
+        func()
 
 
 def build_logging_handler(provider: LoggerProvider, level: int) -> AllowlistLoggingHandler:

@@ -28,6 +28,7 @@ def _walk_non_type_checking(tree: ast.AST):
         if isinstance(node, ast.If) and _is_type_checking(node.test):
             # Still descend into orelse (an `else:` branch is not exempt).
             for child in node.orelse:
+                yield child
                 yield from _walk_non_type_checking(child)
             continue
         yield node
@@ -65,3 +66,15 @@ def test_no_module_imports_opentelemetry_directly_outside_otel():
 def test_python_files_were_actually_checked():
     # Guard against the glob silently matching nothing (e.g. a bad PACKAGE_ROOT).
     assert len(_python_files()) > 3
+
+
+def test_else_branch_of_type_checking_is_checked():
+    tree = ast.parse(
+        "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    pass\nelse:\n    import opentelemetry.trace\n"
+    )
+    assert _opentelemetry_imports(tree) == ["line 5: import opentelemetry.trace"]
+
+
+def test_type_checking_body_is_exempt():
+    tree = ast.parse("from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import opentelemetry.trace\n")
+    assert _opentelemetry_imports(tree) == []

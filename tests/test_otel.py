@@ -2,6 +2,8 @@ import contextlib
 import logging
 import os
 import socket
+import threading
+import time
 
 import pytest
 from opentelemetry import trace
@@ -199,3 +201,33 @@ def test_header_values_are_not_in_settings_repr():
     exporter = ExporterConfig("http://collector:4318/v1/logs", "http/protobuf", {"authorization": "TOPSECRET"})
     settings = Settings(enabled=True, logs=LogsConfig(enabled=True, exporter=exporter))
     assert "TOPSECRET" not in repr(settings)
+
+
+def test_flush_does_not_block_on_provider():
+    called = threading.Event()
+    release = threading.Event()
+
+    class SlowProvider:
+        def force_flush(self):
+            called.set()
+            release.wait(5)
+
+    handler = otel.AllowlistLoggingHandler(logging.INFO, SlowProvider())
+    started = time.monotonic()
+    handler.flush()
+    assert time.monotonic() - started < 0.5
+    assert called.wait(2)
+    release.set()
+
+
+def test_flush_swallows_provider_errors():
+    done = threading.Event()
+
+    class BrokenProvider:
+        def force_flush(self):
+            done.set()
+            raise RuntimeError("flush failed")
+
+    handler = otel.AllowlistLoggingHandler(logging.INFO, BrokenProvider())
+    handler.flush()
+    assert done.wait(2)

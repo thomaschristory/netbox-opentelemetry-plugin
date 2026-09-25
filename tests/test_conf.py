@@ -199,3 +199,28 @@ def test_header_values_not_in_exporter_config_repr():
     s = conf.resolve(user, ENDPOINT_ENV)
     assert "TOPSECRET" not in repr(s)
     assert "TOPSECRET" not in repr(s.logs.exporter)
+
+
+def test_redact_userinfo_keeps_malformed_port_and_ipv6_intact():
+    assert conf._redact_userinfo("https://u:p@host:bad/v1/logs") == "https://***@host:bad/v1/logs"
+    assert conf._redact_userinfo("http://u:p@[::1]:4318/v1/logs") == "http://***@[::1]:4318/v1/logs"
+    assert conf._redact_userinfo("http://collector:4318/v1/logs") == "http://collector:4318/v1/logs"
+
+
+def test_redact_userinfo_unparseable_url_is_fully_masked():
+    assert conf._redact_userinfo("http://u:p@[::1:4318") == conf.REDACTED
+
+
+def test_exporter_repr_hides_credentials_and_headers():
+    cfg = conf.ExporterConfig(
+        "https://user:SECRETPW@collector:4318/v1/logs", "http/protobuf", {"authorization": "TOPSECRET"}
+    )
+    text = repr(cfg)
+    assert "SECRETPW" not in text
+    assert "TOPSECRET" not in text
+    assert "collector:4318" in text
+
+
+def test_malformed_port_does_not_break_redacted_output():
+    s = conf.resolve({"exporter": {"endpoint": "https://u:p@collector:bad"}}, {})
+    assert s.redacted()["logs"]["exporter"]["endpoint"] == "https://***@collector:bad/v1/logs"

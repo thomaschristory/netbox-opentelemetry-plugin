@@ -79,7 +79,8 @@ def install(
             _state = _State(pid=os.getpid(), context=None)
             return None
 
-        logger.debug("OpenTelemetry resolved config: %s", settings.redacted())
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("OpenTelemetry resolved config: %s", settings.redacted())
 
         resource = otel.build_resource(
             settings.service_name,

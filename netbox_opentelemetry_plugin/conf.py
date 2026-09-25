@@ -71,7 +71,7 @@ class ConfigError(ValueError):
     """Invalid configuration value. Messages never include header values."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
 class ExporterConfig:
     endpoint: str
     protocol: str
@@ -90,17 +90,24 @@ class ExporterConfig:
             "certificate": self.certificate,
         }
 
+    def __repr__(self) -> str:
+        return f"ExporterConfig({self.redacted()!r})"
+
 
 def _redact_userinfo(endpoint: str) -> str:
-    """Strip credentials from a URL's authority, e.g. https://user:pass@host -> https://***@host."""
-    parts = urlsplit(endpoint)
-    if not parts.username and not parts.password:
+    """Strip credentials from a URL's authority, e.g. https://user:pass@host -> https://***@host.
+
+    Works on the raw netloc so a malformed port or an IPv6 literal never raises or loses brackets.
+    A URL that cannot be parsed at all is masked completely.
+    """
+    try:
+        parts = urlsplit(endpoint)
+    except ValueError:
+        return REDACTED
+    _, sep, hostport = parts.netloc.rpartition("@")
+    if not sep:
         return endpoint
-    host = parts.hostname or ""
-    if parts.port is not None:
-        host = f"{host}:{parts.port}"
-    netloc = f"{REDACTED}@{host}"
-    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    return urlunsplit((parts.scheme, f"{REDACTED}@{hostport}", parts.path, parts.query, parts.fragment))
 
 
 @dataclass(frozen=True)

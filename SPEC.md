@@ -243,9 +243,9 @@ Validation:
 
 - `dev/docker-compose.yml`: `netboxcommunity/netbox:v4.7.1` (netbox-docker 5.1.1), worker, Postgres, Redis, `otelcol-contrib` with OTLP receiver and `debug` (verbosity detailed) and `file` (JSON) exporters.
 - Plugin mounted and installed editable (`uv pip install -e`) by an entrypoint wrapper.
-- Compose profiles: default (Granian), `gunicorn-preload`, `uwsgi` (with `enable-threads`), `uwsgi-nothreads` (warning path), `ui` (`grafana/otel-lgtm`, Collector forwards to it).
+- Compose profiles: default (Granian), `gunicorn` (gunicorn with `--preload`, host port 8001), `uwsgi` (pyuwsgi master with forked workers, host port 8002), `ui` (`grafana/otel-lgtm`, Collector forwards to it; not implemented yet). The uWSGI threads warning path is covered by unit tests only, since pyuwsgi always has thread support.
 - `dev/scripts/otel_demo.py`: custom script logging at every level, touching objects, with an option to raise.
-- Make targets: `dev`, `dev-gunicorn`, `dev-uwsgi`, `test`, `test-netbox`, `e2e`, `lint`, `logs-collector`.
+- Make targets: `dev`, `test`, `test-netbox`, `e2e`, `lint`, `logs-collector`.
 
 ## 10. Testing
 
@@ -261,7 +261,7 @@ CI (GitHub Actions): ruff; unit tests on Python 3.12, 3.13, 3.14; NetBox integra
 |---|---|---|
 | M0 | scaffold, PluginConfig with min/max version, compose stack, CI | NetBox 4.7.1 loads the plugin; CI green |
 | M1 | config, `otel.py`, bootstrap, logs module | a login produces a log record in the Collector with correct severity, body, resource; missing endpoint gives one warning and NetBox serves |
-| M2 | fork safety | Granian, gunicorn-preload and uWSGI export from every worker PID; no duplicate handlers after autoreload; no-threads warning fires |
+| M2 | fork safety | Granian, gunicorn (with preload) and uWSGI export from every worker PID; no duplicate handlers after autoreload; no-threads warning fires |
 | M3 | RQ flush | all log lines of the sample script arrive, including when it raises |
 | M4 | audit | create, update, delete of a prefix and bulk import of 10 devices produce the expected records with shared `request_id`; rollback produces none; filtering proven by tests |
 | M5 | traces, RQ spans, propagation | API requests produce spans; logs carry the matching trace id; a webhook fired by an edit shares the edit's trace |

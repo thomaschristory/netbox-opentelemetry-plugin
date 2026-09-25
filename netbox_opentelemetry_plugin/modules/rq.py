@@ -12,13 +12,14 @@ import functools
 import inspect
 import logging
 
+from .. import otel
 from ..conf import Settings
 from .base import Context
 
 WRAPPED_ATTR = "_netbox_otel_wrapped"
 EXPECTED_PARAMS = ("self", "job", "queue")
 
-logger = logging.getLogger("netbox_opentelemetry_plugin")
+logger = logging.getLogger(otel.PLUGIN_LOGGER)
 
 
 class RqModule:
@@ -47,7 +48,14 @@ class RqModule:
 
     def _wrap(self, cls: type, attr: str, make_wrapper) -> None:
         original = cls.__dict__.get(attr)
-        if original is None or getattr(original, WRAPPED_ATTR, False):
+        if original is None:
+            logger.warning(
+                "OpenTelemetry: rq %s.%s is missing; this part of the RQ integration is disabled",
+                cls.__name__,
+                attr,
+            )
+            return
+        if getattr(original, WRAPPED_ATTR, False):
             return
         params = tuple(inspect.signature(original).parameters)
         if params != EXPECTED_PARAMS:

@@ -110,7 +110,7 @@ ready()  -> super().ready()
 - `BaseWorker.perform_job` is wrapped: after the job (success, failure or timeout, which rq handles inside `perform_job`), a forked work-horse (`worker.is_horse`) flushes the log provider on a helper thread and waits at most `rq.flush_timeout` seconds. The horse then leaves with `os._exit`, so this is the only flush it gets.
 - `Worker.fork_work_horse` is wrapped to announce the fork, so the child is labelled `rq_horse`.
 - Each wrap first checks the target's signature (`self, job, queue`). On mismatch: one warning, that wrap is skipped, everything else continues. Wraps are marked and never applied twice.
-- `rq.patch_worker = False` disables both wraps; nothing is flushed in the horse then.
+- `rq.patch_worker = False` disables both wraps; nothing is flushed in the horse then, and it keeps the `rqworker` role instead of being labelled `rq_horse`.
 - Not covered: a horse killed by the parent (SIGKILL after `job.timeout + 60` s) cannot flush. `SpawnWorker` (not used by NetBox) starts a fresh interpreter and is not detected as a horse.
 - Job spans, job metrics and trace context propagation are added with the traces and metrics milestones.
 

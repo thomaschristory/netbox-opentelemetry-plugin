@@ -120,6 +120,19 @@ def test_signature_mismatch_skips_wrap(stubs, caplog):
     assert any("unexpected signature" in r.getMessage() for r in caplog.records)
 
 
+def test_missing_target_skips_wrap_and_warns(stubs, caplog):
+    stub_perform = BaseWorker.__dict__["perform_job"]
+    del BaseWorker.perform_job
+    try:
+        with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+            bootstrap.install(USER, env={}, argv=ARGV_RQ)
+        assert "perform_job" not in BaseWorker.__dict__
+        assert getattr(Worker.fork_work_horse, rq_module.WRAPPED_ATTR, False) is True
+        assert any("perform_job" in r.getMessage() and "missing" in r.getMessage() for r in caplog.records)
+    finally:
+        BaseWorker.perform_job = stub_perform
+
+
 def test_patch_worker_false_disables(stubs):
     bootstrap.install({**USER, "rq": {"patch_worker": False}}, env={}, argv=ARGV_RQ)
     assert not getattr(BaseWorker.perform_job, rq_module.WRAPPED_ATTR, False)

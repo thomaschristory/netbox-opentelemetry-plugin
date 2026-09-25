@@ -127,3 +127,20 @@ def test_debug_output_masks_headers(exporter, caplog):
         bootstrap.install(user, env={}, argv=ARGV_WEB)
     assert "TOPSECRET" not in caplog.text
     assert "resolved config" in caplog.text
+
+
+def test_exporter_failure_warning_redacts_header_values(monkeypatch, caplog):
+    user = {
+        **USER,
+        "exporter": {"endpoint": "http://collector:4318", "headers": {"authorization": "Bearer TOPSECRET"}},
+    }
+
+    def boom(cfg):
+        raise RuntimeError("bad header Bearer TOPSECRET")
+
+    monkeypatch.setattr(otel, "build_log_exporter", boom)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        bootstrap.install(user, env={}, argv=ARGV_WEB)
+    assert "TOPSECRET" not in caplog.text
+    assert "***" in caplog.text
+    assert "RuntimeError" in caplog.text

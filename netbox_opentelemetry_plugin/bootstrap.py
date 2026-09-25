@@ -100,7 +100,7 @@ def install(
             try:
                 module.install(ctx)
             except Exception as exc:
-                logger.warning("OpenTelemetry: %s module disabled: %s: %s", module.name, type(exc).__name__, exc)
+                logger.warning("OpenTelemetry: %s module disabled: %s", module.name, _describe(exc, settings))
                 continue
             state.modules.append(module)
 
@@ -143,7 +143,7 @@ def _setup_logger_provider(ctx: Context, state: _State) -> None:
         ctx.logger_provider = otel.build_logger_provider(ctx.resource, exporter)
         state.owns_logger_provider = True
     except Exception as exc:
-        logger.warning("OpenTelemetry: logs disabled: could not build exporter: %s: %s", type(exc).__name__, exc)
+        logger.warning("OpenTelemetry: logs disabled: could not build exporter: %s", _describe(exc, ctx.settings))
 
 
 def _candidate_modules(ctx: Context) -> list[Module]:
@@ -151,3 +151,13 @@ def _candidate_modules(ctx: Context) -> list[Module]:
     if ctx.logger_provider is not None:
         modules.append(LogsModule())
     return modules
+
+
+def _describe(exc: BaseException, settings: conf.Settings) -> str:
+    message = str(exc)
+    exporter = settings.logs.exporter
+    if exporter is not None:
+        for value in exporter.headers.values():
+            if value:
+                message = message.replace(value, conf.REDACTED)
+    return f"{type(exc).__name__}: {message}"

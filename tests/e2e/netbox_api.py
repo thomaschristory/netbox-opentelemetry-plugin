@@ -45,8 +45,10 @@ def ensure_script(base_url: str, header: str, path: Path, module: str, class_nam
     found = requests.get(f"{base_url}/api/extras/scripts/{identifier}/", headers=_headers(header), timeout=10)
     if found.status_code == 200:
         body = found.json()
-        if body.get("vars"):
-            return identifier
+        # Always overwrite the module file with the current dev/scripts/otel_demo.py, even when
+        # "vars" shows the existing file already loads fine: otherwise a repo edit to the script
+        # never reaches a stack where the Script DB record (and its file) already exist from a
+        # previous run.
         with path.open("rb") as fh:
             reupload = requests.patch(
                 f"{base_url}/api/extras/scripts/upload/{body['module']}/",

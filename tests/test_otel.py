@@ -1,9 +1,14 @@
+import contextlib
 import logging
 import os
 import socket
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from netbox_opentelemetry_plugin import otel
 from netbox_opentelemetry_plugin.conf import ExporterConfig
@@ -29,12 +34,21 @@ def pipeline(resource):
     provider.shutdown()
 
 
+@contextlib.contextmanager
 def _logger(name, handler):
     lg = logging.getLogger(name)
+    previous_level = lg.level
+    previous_propagate = lg.propagate
+    previous_handlers = list(lg.handlers)
     lg.setLevel(logging.DEBUG)
     lg.propagate = False
     lg.addHandler(handler)
-    return lg
+    try:
+        yield lg
+    finally:
+        lg.setLevel(previous_level)
+        lg.propagate = previous_propagate
+        lg.handlers = previous_handlers
 
 
 def test_build_resource_attributes(resource):
@@ -49,8 +63,8 @@ def test_build_resource_attributes(resource):
 
 def test_handler_exports_allowlisted_attributes_only(pipeline):
     exporter, handler = pipeline
-    lg = _logger("netbox.test.allowlist", handler)
-    lg.info("hello %s", "world", extra={"secret_token": "s3cr3t"})
+    with _logger("netbox.test.allowlist", handler) as lg:
+        lg.info("hello %s", "world", extra={"secret_token": "s3cr3t"})
     record = exporter.get_finished_logs()[0]
     assert record.log_record.body == "hello world"
     assert record.log_record.severity_text == "INFO"
@@ -60,30 +74,27 @@ def test_handler_exports_allowlisted_attributes_only(pipeline):
     assert attrs["logger.name"] == "netbox.test.allowlist"
     assert attrs["code.function.name"] == "test_handler_exports_allowlisted_attributes_only"
     assert record.resource.attributes["service.name"] == "netbox"
-    lg.removeHandler(handler)
 
 
 def test_handler_exports_exception_attributes(pipeline):
     exporter, handler = pipeline
-    lg = _logger("netbox.test.exc", handler)
-    try:
-        raise ValueError("boom")
-    except ValueError:
-        lg.exception("failed")
+    with _logger("netbox.test.exc", handler) as lg:
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            lg.exception("failed")
     attrs = dict(exporter.get_finished_logs()[0].log_record.attributes)
     assert attrs["exception.type"] == "ValueError"
     assert attrs["exception.message"] == "boom"
     assert "Traceback" in attrs["exception.stacktrace"]
-    lg.removeHandler(handler)
 
 
 def test_handler_level_filters_records(pipeline):
     exporter, handler = pipeline
-    lg = _logger("netbox.test.level", handler)
-    lg.debug("dropped")
-    lg.info("kept")
+    with _logger("netbox.test.level", handler) as lg:
+        lg.debug("dropped")
+        lg.info("kept")
     assert [r.log_record.body for r in exporter.get_finished_logs()] == ["kept"]
-    lg.removeHandler(handler)
 
 
 @pytest.mark.parametrize(
@@ -98,18 +109,16 @@ def test_handler_level_filters_records(pipeline):
 )
 def test_handler_rejects_feedback_loop_loggers(pipeline, name):
     exporter, handler = pipeline
-    lg = _logger(name, handler)
-    lg.warning("must not be exported")
+    with _logger(name, handler) as lg:
+        lg.warning("must not be exported")
     assert len(exporter.get_finished_logs()) == 0
-    lg.removeHandler(handler)
 
 
 def test_similar_prefix_is_not_rejected(pipeline):
     exporter, handler = pipeline
-    lg = _logger("grpcish", handler)
-    lg.warning("exported")
+    with _logger("grpcish", handler) as lg:
+        lg.warning("exported")
     assert len(exporter.get_finished_logs()) == 1
-    lg.removeHandler(handler)
 
 
 def test_build_log_exporter_http():
@@ -133,3 +142,43 @@ def test_build_log_exporter_grpc():
 
 def test_existing_logger_provider_is_none_by_default():
     assert otel.existing_logger_provider() is None
+
+
+def test_malformed_format_does_not_raise(pipeline, monkeypatch):
+    exporter, handler = pipeline
+    monkeypatch.setattr(logging, "raiseExceptions", False)
+    with _logger("netbox.test.malformed", handler) as lg:
+        lg.info("value %s %s", 1)
+    assert len(exporter.get_finished_logs()) == 0
+
+
+def test_extra_cannot_spoof_exception_attributes(pipeline):
+    exporter, handler = pipeline
+    with _logger("netbox.test.spoof", handler) as lg:
+        lg.info("hello", extra={"exception.type": "Fake"})
+    attrs = dict(exporter.get_finished_logs()[0].log_record.attributes)
+    assert "exception.type" not in attrs
+
+
+def test_warning_severity_text_is_warn(pipeline):
+    exporter, handler = pipeline
+    with _logger("netbox.test.warn", handler) as lg:
+        lg.warning("careful")
+    assert exporter.get_finished_logs()[0].log_record.severity_text == "WARN"
+
+
+def test_records_inside_span_carry_trace_id(pipeline):
+    exporter, handler = pipeline
+    span_exporter = InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
+    tracer = tracer_provider.get_tracer(__name__)
+    span = tracer.start_span("test-span")
+    try:
+        with trace.use_span(span), _logger("netbox.test.trace", handler) as lg:
+            lg.info("inside span")
+    finally:
+        span.end()
+    record = exporter.get_finished_logs()[0]
+    assert record.log_record.trace_id == span.get_span_context().trace_id
+    tracer_provider.shutdown()

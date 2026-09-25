@@ -21,7 +21,6 @@ dependencies = [
     "opentelemetry-sdk~=1.44.0",
     "opentelemetry-exporter-otlp-proto-http~=1.44.0",
     "opentelemetry-exporter-otlp-proto-grpc~=1.44.0",
-    "opentelemetry-instrumentation-logging==0.65b0",
 ]
 
 [dependency-groups]

@@ -1,0 +1,86 @@
+name: netbox-otel-dev
+
+x-netbox: &netbox
+  build:
+    context: ..
+    dockerfile: dev/Dockerfile
+  image: netbox-otel-dev:local
+  env_file: env/netbox.env
+  user: "netbox:root"
+  volumes:
+    - ./configuration/plugins.py:/etc/netbox/config/plugins.py:ro
+    - ../netbox_opentelemetry_plugin:/plugin/netbox_opentelemetry_plugin:ro
+
+services:
+  netbox:
+    <<: *netbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    ports:
+      - "8000:8080"
+    healthcheck:
+      test: /opt/netbox/health.sh
+      start_period: 120s
+      timeout: 3s
+      interval: 15s
+
+  netbox-worker:
+    <<: *netbox
+    depends_on:
+      netbox:
+        condition: service_healthy
+    command:
+      - /opt/netbox/venv/bin/python
+      - /opt/netbox/netbox/manage.py
+      - rqworker
+
+  postgres:
+    image: docker.io/postgres:18-alpine
+    env_file: env/postgres.env
+    healthcheck:
+      test: pg_isready -q -t 2 -d $$POSTGRES_DB -U $$POSTGRES_USER
+      start_period: 20s
+      timeout: 30s
+      interval: 10s
+      retries: 5
+    volumes:
+      - postgres-data:/var/lib/postgresql
+
+  redis:
+    image: docker.io/valkey/valkey:9.1-alpine
+    env_file: env/redis.env
+    command: ["sh", "-c", "valkey-server --appendonly yes --requirepass $$REDIS_PASSWORD"]
+    healthcheck: &redis-healthcheck
+      test: '[ $$(valkey-cli --pass "$${REDIS_PASSWORD}" ping) = ''PONG'' ]'
+      start_period: 5s
+      timeout: 3s
+      interval: 1s
+      retries: 5
+
+  redis-cache:
+    image: docker.io/valkey/valkey:9.1-alpine
+    env_file: env/redis-cache.env
+    command: ["sh", "-c", "valkey-server --requirepass $$REDIS_PASSWORD"]
+    healthcheck: *redis-healthcheck
+
+  otel-collector:
+    image: docker.io/otel/opentelemetry-collector-contrib:0.161.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    # Root so the file exporter can write into the bind-mounted dev/data directory on any host.
+    user: "0"
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./otelcol/config.yaml:/etc/otelcol/config.yaml:ro
+      - ./data/collector:/data
+
+volumes:
+  postgres-data:

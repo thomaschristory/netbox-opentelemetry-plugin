@@ -42,16 +42,17 @@ class LogsModule:
         if self._handler is None:
             return
         if ctx.logger_provider is None:
-            for target in self._attached:
-                target.removeHandler(self._handler)
-            self._attached.clear()
-            self._handler = None
+            self._detach()
             return
         self._handler.set_logger_provider(ctx.logger_provider)
 
     def shutdown(self) -> None:
         if self._handler is None:
             return
+        self._detach()
+
+    def _detach(self) -> None:
+        """Remove the handler from every attached logger and restore levels set_logger_levels lowered."""
         for target in self._attached:
             target.removeHandler(self._handler)
         for name, level in self._previous_levels.items():

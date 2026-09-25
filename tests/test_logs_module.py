@@ -134,3 +134,16 @@ def test_after_fork_without_provider_detaches_handler(exporter):
     module.after_fork(ctx)
     assert _otel_handlers("t.logs.detach") == []
     module.shutdown()
+
+
+def test_after_fork_detach_restores_logger_levels(exporter):
+    lg = logging.getLogger("t.logs.detach.levels")
+    lg.setLevel(logging.NOTSET)
+    ctx = _context(_settings(["t.logs.detach.levels"], set_levels=True), exporter)
+    module = LogsModule()
+    module.install(ctx)
+    assert lg.level == logging.INFO
+    ctx.logger_provider = None
+    module.after_fork(ctx)
+    assert lg.level == logging.NOTSET
+    module.shutdown()  # must be a no-op, must not raise

@@ -1,4 +1,5 @@
 import logging
+import time
 
 import pytest
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
@@ -182,3 +183,19 @@ def test_describe_leaves_plain_host_port_alone():
     settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
     text = bootstrap._describe(RuntimeError("connection refused: collector:4318"), settings)
     assert text == "RuntimeError: connection refused: collector:4318"
+
+
+def test_describe_is_fast_on_pathological_input():
+    settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    message = "a" * 100_000 + ":" + "b" * 100_000
+    start = time.monotonic()
+    text = bootstrap._describe(RuntimeError(message), settings)
+    assert time.monotonic() - start < 1
+    assert text.endswith("[truncated]")
+
+
+def test_describe_truncates_long_messages():
+    settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    message = "x" * 100_000
+    text = bootstrap._describe(RuntimeError(message), settings)
+    assert len(text) <= 2000 + len(" [truncated]") + len("RuntimeError: ")

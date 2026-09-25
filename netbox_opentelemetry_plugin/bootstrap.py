@@ -30,8 +30,13 @@ ROLE_RQ_HORSE = "rq_horse"
 ROLE_MANAGEMENT = "management"
 ROLE_RUNSERVER_PARENT = "runserver_parent"
 
-# user:password@ in URLs or host strings, including percent-encoded credentials.
+# user:password@ in URLs or host strings, including percent-encoded credentials. Deliberately
+# favours false positives: any "word:word@" shape is masked, not just valid userinfo. Only ever
+# applied to a message already bounded by _MESSAGE_LIMIT (see _describe) because this pattern can
+# backtrack catastrophically on long inputs with a ":" but no "@" (for example "a" * n + ":" + "b" * n).
 _USERINFO = re.compile(r"[A-Za-z0-9._~%!$&'()*+,;=-]+:[^\s/@'\"]+@")
+
+_MESSAGE_LIMIT = 2000
 
 UWSGI_THREADS_WARNING = (
     "OpenTelemetry: uWSGI is running without thread support, so the exporter's background thread "
@@ -279,13 +284,16 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
     """
     try:
         message = str(exc)
+        if len(message) > _MESSAGE_LIMIT:
+            message = message[:_MESSAGE_LIMIT] + " [truncated]"
         exporter = settings.logs.exporter
         if exporter is not None:
             message = message.replace(exporter.endpoint, conf._redact_userinfo(exporter.endpoint))
             for value in exporter.headers.values():
                 if value:
                     message = message.replace(value, conf.REDACTED)
-        message = _USERINFO.sub(f"{conf.REDACTED}@", message)
+        if "@" in message:
+            message = _USERINFO.sub(f"{conf.REDACTED}@", message)
         return f"{type(exc).__name__}: {message}"
     except Exception:
         return type(exc).__name__

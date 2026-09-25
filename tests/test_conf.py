@@ -160,3 +160,26 @@ def test_non_dict_plugin_config():
     s = conf.resolve(["not", "a", "dict"], ENDPOINT_ENV)
     assert s.enabled is False
     assert s.warnings
+
+
+def test_insecure_defaults_to_none():
+    s = conf.resolve({}, ENDPOINT_ENV)
+    assert s.logs.exporter.insecure is None
+
+
+def test_insecure_explicit_false_is_respected():
+    user = {"exporter": {"insecure": False}}
+    s = conf.resolve(user, ENDPOINT_ENV)
+    assert s.logs.exporter.insecure is False
+
+
+def test_insecure_env_false_is_respected():
+    env = {"OTEL_EXPORTER_OTLP_INSECURE": "false", **ENDPOINT_ENV}
+    s = conf.resolve({}, env)
+    assert s.logs.exporter.insecure is False
+
+
+def test_insecure_env_true_is_respected():
+    env = {"OTEL_EXPORTER_OTLP_LOGS_INSECURE": "true", **ENDPOINT_ENV}
+    s = conf.resolve({}, env)
+    assert s.logs.exporter.insecure is True

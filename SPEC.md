@@ -123,7 +123,7 @@ PLUGINS_CONFIG = {
             "protocol": "http/protobuf",  # OTEL_EXPORTER_OTLP_PROTOCOL; or "grpc"
             "headers": {},  # OTEL_EXPORTER_OTLP_HEADERS; values never logged
             "timeout": 10,  # OTEL_EXPORTER_OTLP_TIMEOUT (seconds)
-            "insecure": False,  # grpc only
+            "insecure": None,  # defaults to inferred from the endpoint scheme, grpc only
             "certificate": None,  # OTEL_EXPORTER_OTLP_CERTIFICATE
         },
         "service_name": "netbox",  # OTEL_SERVICE_NAME

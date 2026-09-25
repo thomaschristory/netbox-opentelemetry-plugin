@@ -23,7 +23,7 @@ DEFAULTS: dict[str, Any] = {
         "protocol": "http/protobuf",
         "headers": {},
         "timeout": 10,
-        "insecure": False,
+        "insecure": None,
         "certificate": None,
     },
     "service_name": "netbox",
@@ -77,7 +77,7 @@ class ExporterConfig:
     protocol: str
     headers: Mapping[str, str] = field(default_factory=dict)
     timeout: float = 10.0
-    insecure: bool = False
+    insecure: bool | None = None
     certificate: str | None = None
 
     def redacted(self) -> dict[str, Any]:
@@ -200,11 +200,9 @@ def resolve_exporter(
     if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
         raise ConfigError("exporter.timeout must be a positive number of seconds")
 
-    insecure = _typed(
-        _pick(exporter_section, "insecure", env, env_names("INSECURE"), defaults["insecure"], _parse_bool),
-        bool,
-        "exporter.insecure",
-    )
+    insecure = _pick(exporter_section, "insecure", env, env_names("INSECURE"), defaults["insecure"], _parse_bool)
+    if insecure is not None:
+        insecure = _typed(insecure, bool, "exporter.insecure")
     certificate = _pick(exporter_section, "certificate", env, env_names("CERTIFICATE"), None, _parse_str)
     if certificate is not None and not isinstance(certificate, str):
         raise ConfigError("exporter.certificate must be a file path")

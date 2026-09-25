@@ -182,3 +182,12 @@ def test_records_inside_span_carry_trace_id(pipeline):
     record = exporter.get_finished_logs()[0]
     assert record.log_record.trace_id == span.get_span_context().trace_id
     tracer_provider.shutdown()
+
+
+def test_grpc_insecure_none_is_inferred_from_http_scheme():
+    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+
+    exporter = otel.build_log_exporter(ExporterConfig("http://collector:4317", "grpc", {}, 3.0, insecure=None))
+    assert isinstance(exporter, OTLPLogExporter)
+    assert exporter._insecure is True
+    exporter.shutdown()

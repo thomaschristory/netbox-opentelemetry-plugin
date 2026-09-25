@@ -7,6 +7,10 @@ so no pytest machinery runs in the child.
 import json
 import logging
 import os
+import select
+import signal
+import threading
+import time
 
 import pytest
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
@@ -50,22 +54,53 @@ def _otel_handlers(name):
     return [h for h in logging.getLogger(name).handlers if isinstance(h, otel.AllowlistLoggingHandler)]
 
 
+CHILD_TIMEOUT = 30
+
+
 def _run_in_child(probe):
     read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(read_fd)
         try:
-            result = {"ok": True, **probe()}
-        except BaseException as exc:
-            result = {"ok": False, "error": repr(exc)}
-        with os.fdopen(write_fd, "w") as fh:
-            json.dump(result, fh)
-        os._exit(0)
+            try:
+                result = {"ok": True, **probe()}
+            except BaseException as exc:
+                result = {"ok": False, "error": repr(exc)}
+            try:
+                with os.fdopen(write_fd, "w") as fh:
+                    json.dump(result, fh)
+            except BaseException:
+                pass
+        finally:
+            os._exit(0)
+
     os.close(write_fd)
-    with os.fdopen(read_fd) as fh:
-        payload = fh.read()
-    os.waitpid(pid, 0)
+    chunks = []
+    deadline = time.monotonic() + CHILD_TIMEOUT
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail(f"child did not finish within {CHILD_TIMEOUT} s (possible deadlock in after-fork hooks)")
+            ready, _, _ = select.select([read_fd], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(read_fd)
+
+    _, status = os.waitpid(pid, 0)
+    payload = b"".join(chunks).decode()
+    if not payload:
+        pytest.fail(f"child produced no output (status={status!r}); it likely crashed before writing its result")
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+        pytest.fail(f"child did not exit cleanly: status={status!r}, payload={payload!r}")
     result = json.loads(payload)
     assert result.pop("ok"), result.get("error")
     return result
@@ -188,6 +223,24 @@ def test_rebuild_failure_warns_and_keeps_current_provider(monkeypatch, exporters
     assert any("re-initialisation after fork failed" in m for m in result["messages"])
 
 
+def test_rebuild_failure_in_rqworker_child_keeps_old_role_and_resource(monkeypatch, exporters):
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_RQ)
+    assert ctx.role == bootstrap.ROLE_RQWORKER
+    assert ctx.resource.attributes["netbox.process.role"] == "rqworker"
+
+    def boom(cfg):
+        raise RuntimeError("no exporter in child")
+
+    # Patched here, in the parent, before forking: the automatic at-fork hook (which runs the
+    # first, real rebuild attempt in the child) inherits this and fails.
+    monkeypatch.setattr(otel, "build_log_exporter", boom)
+
+    def probe():
+        return {"role": ctx.role, "resource_role": ctx.resource.attributes["netbox.process.role"]}
+
+    assert _run_in_child(probe) == {"role": "rqworker", "resource_role": "rqworker"}
+
+
 def test_lock_is_free_in_child(exporters):
     bootstrap.install(USER, env={}, argv=ARGV_WEB)
 
@@ -198,3 +251,72 @@ def test_lock_is_free_in_child(exporters):
         return {"acquired": acquired}
 
     assert _run_in_child(probe) == {"acquired": True}
+
+
+def test_fork_while_batch_worker_lock_is_held(exporters):
+    """Forking while a parent thread holds the batch processor's condition lock must not hang.
+
+    The lock (and any mutex backing it) is copied into the child by fork() in whatever state it
+    was in at that instant. If a hook in the child tries to acquire or otherwise touch that copied
+    lock, and the parent thread that owned it does not exist in the child to release it, the child
+    deadlocks forever. This reproduces the exact condition the SDK's own batch worker creates
+    roughly once a second.
+    """
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    provider = ctx.logger_provider
+    try:
+        batch_processor = provider._multi_log_record_processor._log_record_processors[0]._batch_processor
+        cond = batch_processor._worker_awaken._cond
+    except (AttributeError, IndexError):
+        pytest.skip("SDK internals changed")
+
+    started = threading.Event()
+
+    def holder():
+        with cond:
+            started.set()
+            cond.notify_all()
+            time.sleep(2)
+
+    t = threading.Thread(target=holder, daemon=True)
+    t.start()
+    try:
+        assert started.wait(timeout=5), "helper thread never acquired the condition lock"
+
+        def probe():
+            return {}
+
+        result = _run_in_child(probe)
+    finally:
+        t.join(timeout=5)
+
+    assert result == {}
+
+
+def test_fork_waits_for_bootstrap_lock_holder(exporters):
+    """_before_fork must block until whoever holds bootstrap._lock releases it."""
+    bootstrap.install(USER, env={}, argv=ARGV_WEB)
+
+    started = threading.Event()
+
+    def holder():
+        with bootstrap._lock:
+            started.set()
+            time.sleep(0.3)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    try:
+        assert started.wait(timeout=5), "helper thread never acquired bootstrap._lock"
+
+        def probe():
+            acquired = bootstrap._lock.acquire(timeout=1)
+            if acquired:
+                bootstrap._lock.release()
+            return {"acquired": acquired}
+
+        result = _run_in_child(probe)
+    finally:
+        t.join(timeout=5)
+
+    assert result == {"acquired": True}

@@ -122,16 +122,6 @@ def existing_logger_provider() -> LoggerProvider | None:
     return provider if isinstance(provider, LoggerProvider) else None
 
 
-def discard_logger_provider(provider: LoggerProvider) -> None:
-    """Shut down a provider inherited across fork.
-
-    The SDK clears batch queues in the child, so this exports nothing twice; it only stops the
-    child's copy of the worker thread and closes the child's copy of the exporter connection.
-    """
-    with contextlib.suppress(Exception):
-        provider.shutdown()
-
-
 class ExcludeLoggersFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         name = record.name

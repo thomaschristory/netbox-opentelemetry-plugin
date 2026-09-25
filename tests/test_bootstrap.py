@@ -4,6 +4,7 @@ import pytest
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 
 from netbox_opentelemetry_plugin import bootstrap, otel
+from netbox_opentelemetry_plugin.conf import Settings
 
 USER = {"exporter": {"endpoint": "http://collector:4318"}, "logs": {"loggers": ["t.boot"]}}
 ARGV_WEB = ["granian", "netbox.granian:application"]
@@ -127,6 +128,14 @@ def test_debug_output_masks_headers(exporter, caplog):
         bootstrap.install(user, env={}, argv=ARGV_WEB)
     assert "TOPSECRET" not in caplog.text
     assert "resolved config" in caplog.text
+
+
+def test_describe_never_raises_when_str_fails():
+    class Boom(Exception):
+        def __str__(self):
+            raise RuntimeError("no string for you")
+
+    assert bootstrap._describe(Boom(), Settings(enabled=True)) == "Boom"
 
 
 def test_exporter_failure_warning_redacts_header_values(monkeypatch, caplog):

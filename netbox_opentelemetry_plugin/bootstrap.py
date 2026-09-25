@@ -145,6 +145,14 @@ def reinit_after_fork() -> None:
     The SDK restarts its batch threads after fork but keeps the parent's service.instance.id and
     shares the parent's exporter connection. This gives the child its own Resource, exporter and
     LoggerProvider. Idempotent: a second call in the same process does nothing.
+
+    This never calls shutdown() (or anything else) on an object inherited from the parent: any
+    lock inside such an object (a threading.Lock, a Condition, an SSL/urllib3 connection pool
+    mutex, a gRPC channel's internal state) was copied by fork() in whatever state it happened to
+    be in at that instant. If some other parent thread held that lock at fork time, the copy in
+    the child is born locked with no owner able to release it, and touching it deadlocks the
+    child forever. We simply stop referencing the inherited provider and let its worker thread and
+    exporter connection sit idle and unused; that idle thread/connection is the accepted cost.
     """
     with _lock:
         state = _state
@@ -161,23 +169,29 @@ def reinit_after_fork() -> None:
 
 
 def _rebuild_for_child(ctx: Context, state: _State) -> None:
-    if ctx.role == ROLE_RQWORKER:
-        ctx.role = ROLE_RQ_HORSE
-    resource = _build_resource(ctx.settings, ctx.role, state.netbox_version)
-    inherited = ctx.logger_provider if state.owns_logger_provider else None
-    if inherited is not None:
+    """Build a new role, Resource and (if we own it) LoggerProvider for this process.
+
+    Nothing is assigned onto ctx until the new LoggerProvider has been built successfully, so a
+    failure here (for example the exporter config referencing a now-unreadable certificate file)
+    leaves ctx.role, ctx.resource and ctx.logger_provider exactly as they were: still consistent
+    with each other, still the values inherited from the parent at fork time.
+
+    The old provider (if we owned one) is never shut down here: see reinit_after_fork for why.
+    """
+    role = ROLE_RQ_HORSE if ctx.role == ROLE_RQWORKER else ctx.role
+    resource = _build_resource(ctx.settings, role, state.netbox_version)
+    if state.owns_logger_provider and ctx.logger_provider is not None:
         # A fresh exporter gives the child its own HTTP session or gRPC channel instead of
         # sharing the parent's keep-alive connections.
         exporter = otel.build_log_exporter(ctx.settings.logs.exporter)
         ctx.logger_provider = otel.build_logger_provider(resource, exporter)
+    ctx.role = role
     ctx.resource = resource
     for module in state.modules:
         try:
             module.after_fork(ctx)
         except Exception as exc:
             logger.warning("OpenTelemetry: %s module after-fork failed: %s", module.name, _describe(exc, ctx.settings))
-    if inherited is not None:
-        otel.discard_logger_provider(inherited)
 
 
 def _before_fork() -> None:
@@ -227,10 +241,19 @@ def _candidate_modules(ctx: Context) -> list[Module]:
 
 
 def _describe(exc: BaseException, settings: conf.Settings) -> str:
-    message = str(exc)
-    exporter = settings.logs.exporter
-    if exporter is not None:
-        for value in exporter.headers.values():
-            if value:
-                message = message.replace(value, conf.REDACTED)
-    return f"{type(exc).__name__}: {message}"
+    """Format exc for a log message, redacting exporter header values. Never raises.
+
+    Called from inside except blocks, including in the at-fork hook, so a badly behaved exception
+    (for example one whose __str__ itself raises) must never turn into an exception escaping the
+    hook that is handling it.
+    """
+    try:
+        message = str(exc)
+        exporter = settings.logs.exporter
+        if exporter is not None:
+            for value in exporter.headers.values():
+                if value:
+                    message = message.replace(value, conf.REDACTED)
+        return f"{type(exc).__name__}: {message}"
+    except Exception:
+        return type(exc).__name__

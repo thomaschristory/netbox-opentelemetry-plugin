@@ -413,3 +413,22 @@ def test_fork_waits_for_bootstrap_lock_holder(exporters):
         t.join(timeout=5)
 
     assert result == {"acquired": True, "released": True}
+
+
+def test_grpc_exporter_survives_fork():
+    user = {
+        "exporter": {"endpoint": "http://127.0.0.1:9", "protocol": "grpc", "timeout": 1},
+        "logs": {"loggers": ["t.fork"]},
+    }
+    ctx = bootstrap.install(user, env={}, argv=ARGV_WEB)
+    lg = logging.getLogger("t.fork")
+    lg.setLevel(logging.INFO)
+    lg.info("parent record")
+
+    def probe():
+        lg.info("child record")
+        # Nothing listens on port 9: the export fails, but it must fail within the deadline, not hang.
+        ctx.logger_provider.force_flush(timeout_millis=3000)
+        return {"done": True}
+
+    assert _run_in_child(probe) == {"done": True}

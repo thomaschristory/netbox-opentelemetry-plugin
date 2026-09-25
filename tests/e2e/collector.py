@@ -14,9 +14,9 @@ LOGS_FILE = Path(__file__).resolve().parents[2] / "dev" / "data" / "collector" /
 
 def login(base_url: str, username: str, password: str) -> None:
     session = requests.Session()
-    # uWSGI's --http-socket answers HTTP/1.1 without Connection: close and then closes the
-    # socket anyway; without this header the POST can reuse the now-dead connection and fail
-    # with a transient RemoteDisconnected.
+    # Avoid reusing keep-alive connections that a recycling worker may close: without this
+    # header the POST can reuse a now-dead connection and fail with a transient
+    # RemoteDisconnected.
     page = session.get(f"{base_url}/login/", headers={"Connection": "close"}, timeout=10)
     page.raise_for_status()
     token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page.text).group(1)

@@ -87,8 +87,8 @@ ready()  -> super().ready()
 - The SDK keeps the parent's Resource and shares the parent's exporter (the OTLP HTTP exporter's `requests.Session` is inherited as is). `after_in_child` therefore rebuilds the Resource (new `service.instance.id`), a fresh exporter and a new LoggerProvider, points the logging handler at it (`Module.after_fork`) and drops the inherited provider without shutting it down (its locks were copied from the parent in an unknown state; the SDK has already reset its batch processor). A provider configured outside the plugin is left alone.
 - `before` fork takes the bootstrap lock and `after_in_parent` releases it; the child gets a new lock.
 - The re-initialisation is keyed on the PID and runs at most once per process, so it is safe when both Python's at-fork hooks and uWSGI's `post_fork_hook` fire.
-- A child of the `rqworker` process takes the role `rq_horse`. Synchronous processors and the per-job flush for the horse are part of the RQ milestone.
-- If rebuilding in the child fails, the child keeps the inherited provider (reset by the SDK) and logs one warning; the plugin no longer owns it and will not shut it down at exit.
+- A child of the `rqworker` process takes the role `rq_horse` only when the RQ integration announced the fork (`fork_work_horse`); other forks of the worker process, such as the RQ scheduler, keep the role `rqworker`.
+- If rebuilding in the child fails, the child logs one warning and detaches the logging handler: it exports nothing rather than using the parent's exporter connection.
 
 ### 4.3 Install types (verified against NetBox 4.7.1 and netbox-docker 5.1.1 sources)
 
@@ -104,13 +104,14 @@ ready()  -> super().ready()
 - All providers are created once per process. Trace context uses contextvars and is thread safe under threaded workers.
 - RQ is identical on every install type: `manage.py rqworker`, `NetBoxRQWorker` (subclass of `rq.Worker`), one forked horse per job, horse exits with `os._exit`.
 
-### 4.4 RQ integration (only in the `rqworker` process, except propagation)
+### 4.4 RQ integration (only in the `rqworker` process)
 
-- Worker parent: wrap `execute_job`. After the horse exits, read the job's final status and `started_at` / `ended_at`, record `netbox.rq.jobs` and `netbox.rq.job.duration`. Register the `netbox.rq.queue.depth` gauge here.
-- Horse: wrap `perform_job`. Extract the propagated context from `job.meta`, start a CONSUMER span, run, record exception and ERROR status on failure, end span, `force_flush(rq.flush_timeout)` in `finally`.
-- Web process: wrap `Queue.enqueue_job` to inject the current trace context into `job.meta`.
-- Every wrap checks the target signature with `inspect.signature` first. On mismatch: one warning, that wrap is skipped, everything else continues. Wraps are marked to prevent double application.
-- Opt-outs: `rq.patch_worker = False` disables worker wraps (operators may then set `RQ['WORKER_CLASS']` to the class the plugin ships; note NetBox 4.7 warns on any non-default worker class name). `rq.propagate_context = False` disables the enqueue wrap.
+- `BaseWorker.perform_job` is wrapped: after the job (success, failure or timeout, which rq handles inside `perform_job`), a forked work-horse (`worker.is_horse`) flushes the log provider on a helper thread and waits at most `rq.flush_timeout` seconds. The horse then leaves with `os._exit`, so this is the only flush it gets.
+- `Worker.fork_work_horse` is wrapped to announce the fork, so the child is labelled `rq_horse`.
+- Each wrap first checks the target's signature (`self, job, queue`). On mismatch: one warning, that wrap is skipped, everything else continues. Wraps are marked and never applied twice.
+- `rq.patch_worker = False` disables both wraps; nothing is flushed in the horse then.
+- Not covered: a horse killed by the parent (SIGKILL after `job.timeout + 60` s) cannot flush. `SpawnWorker` (not used by NetBox) starts a fresh interpreter and is not detected as a horse.
+- Job spans, job metrics and trace context propagation are added with the traces and metrics milestones.
 
 ## 5. Configuration
 
@@ -162,7 +163,7 @@ PLUGINS_CONFIG = {
         "rq": {
             "enabled": True,
             "patch_worker": True,
-            "propagate_context": True,
+            "propagate_context": True,  # traces milestone
             "flush_timeout": 5,  # seconds, horse flush
         },
     }
@@ -233,7 +234,7 @@ Validation:
 | Invalid config | one warning per affected module, others run |
 | No endpoint for a module | one warning, module disabled |
 | Collector unreachable | exporter retries in background, then drops; bounded queues; no request blocks |
-| Horse flush slow | bounded by `rq.flush_timeout`; delays only job completion |
+| Horse flush slow | bounded by `rq.flush_timeout` (helper thread); delays only job completion |
 | Error in audit receiver | caught and logged; save proceeds |
 | uWSGI without `enable-threads` | one warning naming the fix |
 | RQ wrap target signature changed | one warning, that wrap skipped |

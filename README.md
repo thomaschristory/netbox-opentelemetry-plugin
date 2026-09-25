@@ -2,7 +2,7 @@
 
 NetBox plugin that exports NetBox telemetry over OTLP to an OpenTelemetry Collector, from inside the NetBox processes. Each signal is a module that can be enabled or disabled in configuration.
 
-Status: under development. Currently implemented: application logs, with support for forking web servers.
+Status: under development. Currently implemented: application logs, with support for forking web servers and RQ work-horses.
 
 ## Web servers
 
@@ -13,6 +13,10 @@ The plugin works with the web servers NetBox documents:
 - uWSGI: nothing to configure with pyuwsgi. With the classic uwsgi binary, set `enable-threads = true`, otherwise nothing is exported (the plugin logs a warning).
 
 Each worker process exports with its own `service.instance.id`.
+
+## Background jobs
+
+Log lines written by jobs and custom scripts in the RQ work-horse are flushed before the horse exits, waiting at most `rq.flush_timeout` seconds (default 5). A horse killed by the worker after its job timeout cannot flush.
 
 ## Compatibility
 

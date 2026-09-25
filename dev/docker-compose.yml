@@ -10,6 +10,9 @@ x-netbox: &netbox
   volumes:
     - ./configuration/plugins.py:/etc/netbox/config/plugins.py:ro
     - ../netbox_opentelemetry_plugin:/plugin/netbox_opentelemetry_plugin:ro
+    # Shared across all server processes: a script uploaded via one process (netbox) must be
+    # readable by the process that runs it (netbox-worker), since SCRIPTS_ROOT is local disk.
+    - netbox-scripts:/opt/netbox/netbox/scripts
 
 services:
   netbox:
@@ -58,6 +61,8 @@ services:
       - --threads=3
       - --bind=0.0.0.0:8080
       - --chdir=/opt/netbox/netbox
+      - --max-requests=20
+      - --max-requests-jitter=5
       - netbox.wsgi
     ports:
       - "8001:8080"
@@ -79,6 +84,7 @@ services:
       - --module=netbox.wsgi
       - --need-app
       - --die-on-term
+      - --max-requests=20
     ports:
       - "8002:8080"
 
@@ -125,3 +131,4 @@ services:
 
 volumes:
   postgres-data:
+  netbox-scripts:

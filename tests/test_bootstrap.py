@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 
 import pytest
@@ -199,3 +200,37 @@ def test_describe_truncates_long_messages():
     message = "x" * 100_000
     text = bootstrap._describe(RuntimeError(message), settings)
     assert len(text) <= 2000 + len(" [truncated]") + len("RuntimeError: ")
+
+
+def test_force_flush_without_state_is_true():
+    assert bootstrap.force_flush(1.0) is True
+
+
+def test_force_flush_flushes_provider(exporter):
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    lg = logging.getLogger("t.boot")
+    lg.setLevel(logging.INFO)
+    lg.info("flush me")
+    assert bootstrap.force_flush(2.0) is True
+    assert [r.log_record.body for r in exporter.get_finished_logs()] == ["flush me"]
+    assert ctx is not None
+
+
+def test_force_flush_gives_up_after_timeout(exporter, monkeypatch):
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    release = threading.Event()
+    monkeypatch.setattr(ctx.logger_provider, "force_flush", lambda timeout_millis=None: release.wait(5))
+    started = time.monotonic()
+    assert bootstrap.force_flush(0.2) is False
+    assert time.monotonic() - started < 1.0
+    release.set()
+
+
+def test_force_flush_never_raises(exporter, monkeypatch):
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+
+    def boom(timeout_millis=None):
+        raise RuntimeError("flush failed")
+
+    monkeypatch.setattr(ctx.logger_provider, "force_flush", boom)
+    assert bootstrap.force_flush(1.0) is True

@@ -56,6 +56,7 @@ class _State:
 _state: _State | None = None
 _lock = threading.RLock()
 _atexit_registered = False
+_next_fork_role: str | None = None
 
 
 def detect_role(argv: Sequence[str], env: Mapping[str, str]) -> str:
@@ -178,7 +179,9 @@ def reinit_after_fork() -> None:
     child forever. We simply stop referencing the inherited provider and let its worker thread and
     exporter connection sit idle and unused; that idle thread/connection is the accepted cost.
     """
+    global _next_fork_role
     with _lock:
+        role_hint, _next_fork_role = _next_fork_role, None
         state = _state
         if state is None or state.pid == os.getpid():
             return
@@ -187,7 +190,7 @@ def reinit_after_fork() -> None:
         if ctx is None:
             return
         try:
-            _rebuild_for_child(ctx, state)
+            _rebuild_for_child(ctx, state, role_hint)
         except Exception as exc:
             logger.warning("OpenTelemetry: re-initialisation after fork failed: %s", _describe(exc, ctx.settings))
             if state.owns_logger_provider:
@@ -200,7 +203,39 @@ def reinit_after_fork() -> None:
                         module.after_fork(ctx)
 
 
-def _rebuild_for_child(ctx: Context, state: _State) -> None:
+def set_next_fork_role(role: str | None) -> None:
+    """Label the child of the next fork (the RQ integration sets this around fork_work_horse)."""
+    global _next_fork_role
+    _next_fork_role = role
+
+
+def force_flush(timeout: float) -> bool:
+    """Flush this process's log provider, waiting at most `timeout` seconds. Never raises.
+
+    The flush runs on a helper thread so a stuck export cannot hold the caller beyond the
+    deadline. Returns False only when the deadline passed.
+    """
+    state = _state
+    if state is None or state.pid != os.getpid() or state.context is None:
+        return True
+    provider = state.context.logger_provider
+    if provider is None:
+        return True
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            provider.force_flush(timeout_millis=int(timeout * 1000))
+        except Exception:
+            pass
+        finally:
+            done.set()
+
+    threading.Thread(target=run, name="otel-flush", daemon=True).start()
+    return done.wait(timeout)
+
+
+def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> None:
     """Build a new role, Resource and (if we own it) LoggerProvider for this process.
 
     Nothing is assigned onto ctx until the new LoggerProvider has been built successfully, so a
@@ -208,9 +243,13 @@ def _rebuild_for_child(ctx: Context, state: _State) -> None:
     leaves ctx.role, ctx.resource and ctx.logger_provider exactly as they were: still consistent
     with each other, still the values inherited from the parent at fork time.
 
+    The role changes only when the parent announced the fork (see `set_next_fork_role`); an
+    unannounced fork of an rqworker process (for example the RQ scheduler's own child) keeps the
+    rqworker role.
+
     The old provider (if we owned one) is never shut down here: see reinit_after_fork for why.
     """
-    role = ROLE_RQ_HORSE if ctx.role == ROLE_RQWORKER else ctx.role
+    role = role_hint or ctx.role
     resource = _build_resource(ctx.settings, role, state.netbox_version)
     if state.owns_logger_provider and ctx.logger_provider is not None:
         # A fresh exporter gives the child its own HTTP session or gRPC channel instead of

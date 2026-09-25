@@ -181,14 +181,40 @@ def test_unflushed_parent_records_are_not_exported_by_child(exporters):
     assert [r.log_record.body for r in exporters[0].get_finished_logs()] == ["before fork"]
 
 
-def test_rqworker_child_becomes_rq_horse(exporters):
+def test_fork_with_horse_hint_becomes_rq_horse(exporters):
     ctx = bootstrap.install(USER, env={}, argv=ARGV_RQ)
-    assert ctx.role == bootstrap.ROLE_RQWORKER
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    try:
+        result = _run_in_child(
+            lambda: {"role": ctx.role, "resource_role": ctx.resource.attributes["netbox.process.role"]}
+        )
+    finally:
+        bootstrap.set_next_fork_role(None)
+    assert result == {"role": "rq_horse", "resource_role": "rq_horse"}
+
+
+def test_other_rqworker_fork_keeps_rqworker_role(exporters):
+    # For example the RQ scheduler, which is a forked multiprocessing.Process.
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_RQ)
 
     def probe():
-        return {"role": ctx.role, "resource_role": ctx.resource.attributes["netbox.process.role"]}
+        return {
+            "role": ctx.role,
+            "resource_role": ctx.resource.attributes["netbox.process.role"],
+            "pid_in_id": ctx.resource.attributes["service.instance.id"].endswith(f"-{os.getpid()}"),
+        }
 
-    assert _run_in_child(probe) == {"role": "rq_horse", "resource_role": "rq_horse"}
+    assert _run_in_child(probe) == {"role": "rqworker", "resource_role": "rqworker", "pid_in_id": True}
+
+
+def test_horse_hint_is_consumed_in_the_child(exporters):
+    bootstrap.install(USER, env={}, argv=ARGV_RQ)
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    try:
+        result = _run_in_child(lambda: {"hint": bootstrap._next_fork_role})
+    finally:
+        bootstrap.set_next_fork_role(None)
+    assert result == {"hint": None}
 
 
 def test_reinit_is_idempotent_within_a_process(exporters):
@@ -268,7 +294,12 @@ def test_rebuild_failure_in_rqworker_child_keeps_old_role_and_resource(monkeypat
     def probe():
         return {"role": ctx.role, "resource_role": ctx.resource.attributes["netbox.process.role"]}
 
-    assert _run_in_child(probe) == {"role": "rqworker", "resource_role": "rqworker"}
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    try:
+        result = _run_in_child(probe)
+    finally:
+        bootstrap.set_next_fork_role(None)
+    assert result == {"role": "rqworker", "resource_role": "rqworker"}
 
 
 def test_lock_is_free_in_child(exporters):

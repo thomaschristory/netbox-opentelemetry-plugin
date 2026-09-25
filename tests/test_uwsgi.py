@@ -109,3 +109,27 @@ def test_uwsgi_threads_disabled(opt, embedded, disabled):
 def test_no_uwsgi_means_no_integration(exporter, monkeypatch):
     monkeypatch.delitem(sys.modules, "uwsgi", raising=False)
     assert bootstrap.install(USER, env={}, argv=["granian"]) is not None
+
+
+def test_reinit_runs_even_if_previous_hook_raises(fake_uwsgi, exporter, monkeypatch):
+    def previous():
+        raise RuntimeError("boom")
+
+    fake_uwsgi.post_fork_hook = previous
+    calls = []
+    monkeypatch.setattr(bootstrap, "_after_fork_in_child", lambda: calls.append("reinit"))
+    bootstrap.install(USER, env={}, argv=ARGV)
+    with pytest.raises(RuntimeError):
+        fake_uwsgi.post_fork_hook()
+    assert calls == ["reinit"]
+
+
+def test_install_tolerates_malformed_uwsgi_opt(fake_uwsgi, exporter, caplog):
+    fake_uwsgi.opt = ["not", "a", "mapping"]
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        ctx = bootstrap.install(USER, env={}, argv=ARGV)
+    assert ctx is not None
+    assert callable(fake_uwsgi.post_fork_hook)
+    warnings = _plugin_warnings(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].startswith("OpenTelemetry: uWSGI integration failed")

@@ -283,7 +283,7 @@ def _uwsgi_module():
     """
     try:
         import uwsgi
-    except ImportError:
+    except Exception:
         return None
     return uwsgi
 
@@ -296,9 +296,11 @@ def _integrate_uwsgi(uwsgi_module) -> None:
     if not getattr(previous, "_netbox_otel", False):
 
         def post_fork_hook():
-            if previous is not None:
-                previous()
-            _after_fork_in_child()
+            try:
+                if previous is not None:
+                    previous()
+            finally:
+                _after_fork_in_child()
 
         post_fork_hook._netbox_otel = True
         uwsgi_module.post_fork_hook = post_fork_hook

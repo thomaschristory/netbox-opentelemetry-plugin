@@ -162,6 +162,15 @@ def test_non_dict_plugin_config():
     assert s.warnings
 
 
+def test_redacted_endpoint_strips_userinfo():
+    user = {"exporter": {"endpoint": "https://user:pass@host:4318"}}
+    s = conf.resolve(user, {})
+    redacted_endpoint = s.logs.exporter.redacted()["endpoint"]
+    # endpoint resolution appends /v1/logs for http/protobuf; userinfo must be stripped regardless
+    assert redacted_endpoint == "https://***@host:4318/v1/logs"
+    assert "user:pass" not in redacted_endpoint
+
+
 def test_insecure_defaults_to_none():
     s = conf.resolve({}, ENDPOINT_ENV)
     assert s.logs.exporter.insecure is None

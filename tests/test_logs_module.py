@@ -64,10 +64,14 @@ def test_records_are_exported(exporter):
     module = LogsModule()
     module.install(ctx)
     lg = logging.getLogger("t.logs.export")
+    previous_level = lg.level
     lg.setLevel(logging.INFO)
-    lg.info("exported line")
-    assert [r.log_record.body for r in exporter.get_finished_logs()] == ["exported line"]
-    module.shutdown()
+    try:
+        lg.info("exported line")
+        assert [r.log_record.body for r in exporter.get_finished_logs()] == ["exported line"]
+    finally:
+        lg.setLevel(previous_level)
+        module.shutdown()
 
 
 def test_logger_levels_untouched_by_default(exporter):

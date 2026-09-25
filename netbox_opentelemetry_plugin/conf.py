@@ -11,7 +11,7 @@ import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 PROTOCOLS = ("http/protobuf", "grpc")
 REDACTED = "***"
@@ -82,13 +82,25 @@ class ExporterConfig:
 
     def redacted(self) -> dict[str, Any]:
         return {
-            "endpoint": self.endpoint,
+            "endpoint": _redact_userinfo(self.endpoint),
             "protocol": self.protocol,
             "headers": {key: REDACTED for key in self.headers},
             "timeout": self.timeout,
             "insecure": self.insecure,
             "certificate": self.certificate,
         }
+
+
+def _redact_userinfo(endpoint: str) -> str:
+    """Strip credentials from a URL's authority, e.g. https://user:pass@host -> https://***@host."""
+    parts = urlsplit(endpoint)
+    if not parts.username and not parts.password:
+        return endpoint
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    netloc = f"{REDACTED}@{host}"
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,12 @@ from .version import __version__
 logger = logging.getLogger("netbox_opentelemetry_plugin")
 
 
+def _django_settings():
+    from django.conf import settings
+
+    return settings
+
+
 class NetBoxOpenTelemetryConfig(PluginConfig):
     name = "netbox_opentelemetry_plugin"
     verbose_name = "NetBox OpenTelemetry"
@@ -21,6 +27,18 @@ class NetBoxOpenTelemetryConfig(PluginConfig):
 
     def ready(self):
         super().ready()
+        try:
+            from . import bootstrap
+
+            settings = _django_settings()
+            release = getattr(settings, "RELEASE", None)
+            bootstrap.install(
+                settings.PLUGINS_CONFIG.get(self.name, {}),
+                netbox_version=getattr(release, "version", "unknown"),
+            )
+        except Exception:
+            # The plugin must never prevent NetBox from starting.
+            logger.warning("OpenTelemetry setup failed; export disabled", exc_info=True)
 
 
 config = NetBoxOpenTelemetryConfig

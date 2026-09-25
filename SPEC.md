@@ -234,8 +234,8 @@ Validation:
 | OTel import error | one warning, plugin inactive, NetBox runs |
 | Invalid config | one warning per affected module, others run |
 | No endpoint for a module | one warning, module disabled |
-| Collector unreachable | exporter retries in background, then drops; bounded queues; no request blocks |
-| Horse flush slow | bounded by `rq.flush_timeout` (helper thread); delays only job completion |
+| Collector unreachable | exporter retries in background, then drops; bounded queues; web requests never block. Each RQ work-horse still waits up to `rq.flush_timeout` after its job before exiting; the job's status is already saved, and the worker starts its next job only once the horse has exited. During an outage this caps each worker at roughly one job per `flush_timeout` |
+| Horse flush slow | bounded by `rq.flush_timeout` (helper thread); delays the worker's next job, not the job's own completion |
 | Error in audit receiver | caught and logged; save proceeds |
 | uWSGI without `enable-threads` | one warning naming the fix |
 | RQ wrap target signature changed | one warning, that wrap skipped |

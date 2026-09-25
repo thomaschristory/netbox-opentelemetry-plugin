@@ -18,6 +18,8 @@ Each worker process exports with its own `service.instance.id`.
 
 Log lines written by jobs and custom scripts in the RQ work-horse are flushed before the horse exits, waiting at most `rq.flush_timeout` seconds (default 5). A horse killed by the worker after its job timeout cannot flush.
 
+This flush happens after the job, not during it: web requests never block on it, but a worker starts its next job only once the current horse has exited. If the Collector is unreachable, every job pays up to the full `flush_timeout` before the worker moves on, capping that worker at roughly one job per `flush_timeout` for the duration of the outage. For busy queues, set a lower `rq.flush_timeout` (for example 1 to 2 seconds) to bound that cost.
+
 ## Compatibility
 
 | Plugin | NetBox |

@@ -121,6 +121,16 @@ def _run_in_child(probe):
                 os.waitpid(pid, 0)
 
 
+def test_after_fork_in_parent_without_before_does_not_raise():
+    """An embedder that runs only the parent hook (skipping _before_fork) must not crash NetBox.
+
+    Fork hooks must never raise. If some embedder invokes after_in_parent without first calling
+    the before hook, _lock.release() on an unheld RLock raises RuntimeError; that must be
+    swallowed, not propagated.
+    """
+    bootstrap._after_fork_in_parent()
+
+
 def test_child_rebuilds_provider_resource_and_repoints_handler(exporters):
     ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
     parent_provider = ctx.logger_provider

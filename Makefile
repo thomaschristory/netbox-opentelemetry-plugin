@@ -3,7 +3,7 @@ COMPOSE = docker compose -f dev/docker-compose.yml
 .PHONY: test lint format dev dev-gunicorn dev-uwsgi down logs-collector e2e
 
 test:
-	uv run pytest
+	uv run pytest -W error::DeprecationWarning
 
 lint:
 	uv run ruff check .

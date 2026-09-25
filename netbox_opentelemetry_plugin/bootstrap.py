@@ -8,6 +8,7 @@ logged as warnings on the plugin logger and NetBox keeps running.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import logging
 import os
 import sys
@@ -218,7 +219,10 @@ def _before_fork() -> None:
 
 
 def _after_fork_in_parent() -> None:
-    _lock.release()
+    # Some embedders run the parent hook without the before hook. Fork hooks must never raise,
+    # so releasing a lock we may not hold is tolerated rather than propagated.
+    with contextlib.suppress(RuntimeError):
+        _lock.release()
 
 
 def _after_fork_in_child() -> None:
@@ -268,6 +272,7 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
         message = str(exc)
         exporter = settings.logs.exporter
         if exporter is not None:
+            message = message.replace(exporter.endpoint, conf._redact_userinfo(exporter.endpoint))
             for value in exporter.headers.values():
                 if value:
                     message = message.replace(value, conf.REDACTED)

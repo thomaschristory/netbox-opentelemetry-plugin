@@ -3,7 +3,7 @@ import logging
 import pytest
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 
-from netbox_opentelemetry_plugin import bootstrap, otel
+from netbox_opentelemetry_plugin import bootstrap, conf, otel
 from netbox_opentelemetry_plugin.conf import Settings
 
 USER = {"exporter": {"endpoint": "http://collector:4318"}, "logs": {"loggers": ["t.boot"]}}
@@ -136,6 +136,14 @@ def test_describe_never_raises_when_str_fails():
             raise RuntimeError("no string for you")
 
     assert bootstrap._describe(Boom(), Settings(enabled=True)) == "Boom"
+
+
+def test_describe_redacts_url_credentials_in_endpoint():
+    settings = conf.resolve({"logs": {"endpoint": "https://user:SECRETPW@collector:4318/v1/logs"}}, env={})
+    exc = RuntimeError("connection failed: https://user:SECRETPW@collector:4318/v1/logs")
+    message = bootstrap._describe(exc, settings)
+    assert "SECRETPW" not in message
+    assert "***@collector:4318" in message
 
 
 def test_exporter_failure_warning_redacts_header_values(monkeypatch, caplog):

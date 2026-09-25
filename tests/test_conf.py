@@ -1,5 +1,7 @@
 import logging
 
+import pytest
+
 from netbox_opentelemetry_plugin import conf
 
 ENDPOINT_ENV = {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector:4318"}
@@ -224,3 +226,29 @@ def test_exporter_repr_hides_credentials_and_headers():
 def test_malformed_port_does_not_break_redacted_output():
     s = conf.resolve({"exporter": {"endpoint": "https://u:p@collector:bad"}}, {})
     assert s.redacted()["logs"]["exporter"]["endpoint"] == "https://***@collector:bad/v1/logs"
+
+
+def test_rq_defaults():
+    s = conf.resolve({}, ENDPOINT_ENV)
+    assert s.rq == conf.RqConfig(enabled=True, patch_worker=True, flush_timeout=5.0)
+    assert s.redacted()["rq"] == {"enabled": True, "patch_worker": True, "flush_timeout": 5.0}
+
+
+def test_rq_explicit_values():
+    s = conf.resolve({"rq": {"patch_worker": False, "flush_timeout": 2}}, ENDPOINT_ENV)
+    assert s.rq.patch_worker is False
+    assert s.rq.flush_timeout == 2.0
+
+
+@pytest.mark.parametrize("bad", [{"flush_timeout": 0}, {"flush_timeout": True}, {"patch_worker": "yes"}, "on"])
+def test_bad_rq_value_disables_only_rq(bad):
+    s = conf.resolve({"rq": bad}, ENDPOINT_ENV)
+    assert s.enabled is True
+    assert s.logs.enabled is True
+    assert s.rq.enabled is False
+    assert any(w.startswith("rq disabled:") for w in s.warnings)
+
+
+def test_rq_does_not_need_an_endpoint():
+    s = conf.resolve({}, {})
+    assert s.rq.enabled is True

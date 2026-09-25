@@ -132,11 +132,25 @@ LOGS_OFF = LogsConfig(enabled=False)
 
 
 @dataclass(frozen=True)
+class RqConfig:
+    enabled: bool = True
+    patch_worker: bool = True
+    flush_timeout: float = 5.0
+
+    def redacted(self) -> dict[str, Any]:
+        return {"enabled": self.enabled, "patch_worker": self.patch_worker, "flush_timeout": self.flush_timeout}
+
+
+RQ_OFF = RqConfig(enabled=False)
+
+
+@dataclass(frozen=True)
 class Settings:
     enabled: bool
     service_name: str = "netbox"
     resource_attributes: Mapping[str, str | bool | int | float] = field(default_factory=dict)
     logs: LogsConfig = LOGS_OFF
+    rq: RqConfig = field(default_factory=RqConfig)
     warnings: tuple[str, ...] = ()
 
     def redacted(self) -> dict[str, Any]:
@@ -145,6 +159,7 @@ class Settings:
             "service_name": self.service_name,
             "resource_attributes": dict(self.resource_attributes),
             "logs": self.logs.redacted(),
+            "rq": self.rq.redacted(),
         }
 
 
@@ -182,11 +197,18 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         warnings.append(f"logs disabled: {exc}")
         logs = LOGS_OFF
 
+    try:
+        rq = _resolve_rq(_section(user, "rq"))
+    except ConfigError as exc:
+        warnings.append(f"rq disabled: {exc}")
+        rq = RQ_OFF
+
     return Settings(
         enabled=True,
         service_name=service_name,
         resource_attributes=resource_attributes,
         logs=logs,
+        rq=rq,
         warnings=tuple(warnings),
     )
 
@@ -255,6 +277,16 @@ def _resolve_logs(
         level=level,
         set_logger_levels=set_levels,
     )
+
+
+def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:
+    defaults = DEFAULTS["rq"]
+    enabled = _typed(section.get("enabled", defaults["enabled"]), bool, "rq.enabled")
+    patch_worker = _typed(section.get("patch_worker", defaults["patch_worker"]), bool, "rq.patch_worker")
+    flush_timeout = section.get("flush_timeout", defaults["flush_timeout"])
+    if isinstance(flush_timeout, bool) or not isinstance(flush_timeout, int | float) or flush_timeout <= 0:
+        raise ConfigError("rq.flush_timeout must be a positive number of seconds")
+    return RqConfig(enabled=enabled, patch_worker=patch_worker, flush_timeout=float(flush_timeout))
 
 
 def _endpoint(

@@ -204,6 +204,27 @@ def test_describe_truncates_long_messages():
     assert len(text) <= 2000 + len(" [truncated]") + len("RuntimeError: ")
 
 
+def test_describe_header_value_straddling_the_cut_is_not_leaked():
+    settings = conf.resolve(
+        {"exporter": {"endpoint": "http://collector:4318", "headers": {"authorization": "Bearer TOPSECRET"}}}, {}
+    )
+    # "x " * 994 is 1988 chars; "Bearer TOPSECRET" (16 chars) then spans indices 1988-2003,
+    # straddling the old 2000-char truncation cut.
+    message = "x " * 994 + "Bearer TOPSECRET tail"
+    text = bootstrap._describe(RuntimeError(message), settings)
+    assert "TOP" not in text
+    assert "Bearer TOPSEC" not in text
+
+
+def test_describe_userinfo_straddling_the_cut_is_not_leaked():
+    settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    # "x " * 990 is 1980 chars; "SECRETPW" then spans indices 1993-2000, straddling the old
+    # 2000-char truncation cut.
+    message = "x " * 990 + "https://user:SECRETPW@host tail"
+    text = bootstrap._describe(RuntimeError(message), settings)
+    assert "SECR" not in text
+
+
 def test_force_flush_without_state_is_true():
     assert bootstrap.force_flush(1.0) is True
 

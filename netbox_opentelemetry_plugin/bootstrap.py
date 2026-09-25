@@ -348,14 +348,27 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
     """
     try:
         message = str(exc)
-        if len(message) > _MESSAGE_LIMIT:
-            message = message[:_MESSAGE_LIMIT] + " [truncated]"
+        # Run the known-literal replacements on the FULL message first: str.replace is linear, so
+        # this is safe on arbitrarily long input, and it means a secret that would straddle the
+        # truncation cut below is still matched and redacted in full.
         exporter = settings.logs.exporter
         if exporter is not None:
             message = message.replace(exporter.endpoint, conf._redact_userinfo(exporter.endpoint))
             for value in exporter.headers.values():
                 if value:
                     message = message.replace(value, conf.REDACTED)
+        if len(message) > _MESSAGE_LIMIT:
+            message = message[:_MESSAGE_LIMIT]
+            # Drop a partial token left dangling at the cut (for example the prefix of a secret
+            # that was not caught above, such as URL userinfo) by cutting back to the last
+            # whitespace in the kept text.
+            for i in range(len(message) - 1, -1, -1):
+                if message[i].isspace():
+                    message = message[:i]
+                    break
+            message += " [truncated]"
+        # Only applied to the now-bounded text: _USERINFO can backtrack catastrophically on long
+        # input containing ":" but no "@".
         if "@" in message:
             message = _USERINFO.sub(f"{conf.REDACTED}@", message)
         return f"{type(exc).__name__}: {message}"

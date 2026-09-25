@@ -12,7 +12,7 @@ x-netbox: &netbox
     - ../netbox_opentelemetry_plugin:/plugin/netbox_opentelemetry_plugin:ro
     # Shared across all server processes: a script uploaded via one process (netbox) must be
     # readable by the process that runs it (netbox-worker), since SCRIPTS_ROOT is local disk.
-    - netbox-scripts:/opt/netbox/netbox/scripts
+    - netbox-scripts-files:/opt/netbox/netbox/scripts
 
 services:
   netbox:
@@ -79,12 +79,17 @@ services:
       - /opt/netbox/venv/bin/uwsgi
       - --master
       - --processes=3
-      - --http-socket=0.0.0.0:8080
+      # A separate HTTP router process (not --http-socket) fronts the workers, so --max-requests
+      # only recycles workers; the router that accepts connections is never restarted.
+      - --http=0.0.0.0:8080
       - --chdir=/opt/netbox/netbox
       - --module=netbox.wsgi
       - --need-app
       - --die-on-term
       - --max-requests=20
+      # Staggers worker recycling (worker_id * delta added to max-requests) so the 3 workers
+      # don't all hit their limit and respawn within the same instant.
+      - --max-requests-delta=5
     ports:
       - "8002:8080"
 
@@ -131,4 +136,4 @@ services:
 
 volumes:
   postgres-data:
-  netbox-scripts:
+  netbox-scripts-files:

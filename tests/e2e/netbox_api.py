@@ -36,8 +36,25 @@ def _headers(header: str) -> dict[str, str]:
 
 def ensure_script(base_url: str, header: str, path: Path, module: str, class_name: str) -> str:
     identifier = f"{module}.{class_name}"
+    # This GET only confirms a Script DB record exists: NetBox creates it once, at upload time,
+    # via ScriptModule.sync_classes(), and the row persists even if the uploaded file later
+    # disappears from storage (for example a scripts volume that got recreated). "vars" is
+    # populated from the loaded Python class, so an empty dict here means the file is missing
+    # even though the DB record is present; overwrite the module's file in place rather than
+    # trusting the 200 status alone.
     found = requests.get(f"{base_url}/api/extras/scripts/{identifier}/", headers=_headers(header), timeout=10)
     if found.status_code == 200:
+        body = found.json()
+        if body.get("vars"):
+            return identifier
+        with path.open("rb") as fh:
+            reupload = requests.patch(
+                f"{base_url}/api/extras/scripts/upload/{body['module']}/",
+                headers=_headers(header),
+                files={"file": (path.name, fh, "text/x-python")},
+                timeout=30,
+            )
+        reupload.raise_for_status()
         return identifier
     with path.open("rb") as fh:
         upload = requests.post(

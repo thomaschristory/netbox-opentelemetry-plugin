@@ -116,52 +116,52 @@ Precedence for every setting: explicit `PLUGINS_CONFIG` value, then the signal s
 
 ```python
 PLUGINS_CONFIG = {
-  "netbox_opentelemetry_plugin": {
-    "enabled": True,
-    "exporter": {
-      "endpoint": None,            # OTEL_EXPORTER_OTLP_ENDPOINT
-      "protocol": "http/protobuf", # OTEL_EXPORTER_OTLP_PROTOCOL; or "grpc"
-      "headers": {},               # OTEL_EXPORTER_OTLP_HEADERS; values never logged
-      "timeout": 10,               # OTEL_EXPORTER_OTLP_TIMEOUT (seconds)
-      "insecure": False,           # grpc only
-      "certificate": None,         # OTEL_EXPORTER_OTLP_CERTIFICATE
-    },
-    "service_name": "netbox",      # OTEL_SERVICE_NAME
-    "resource_attributes": {},     # OTEL_RESOURCE_ATTRIBUTES
-    "logs": {
-      "enabled": True,
-      "endpoint": None,            # OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
-      "loggers": ["netbox", "django", "rq"],
-      "level": "INFO",
-      "set_logger_levels": False,  # if True, also lower listed loggers to `level`
-    },
-    "audit": {
-      "enabled": True,
-      "include_data": False,
-      "exclude_fields": ["password", "secret", "token", "key"],
-    },
-    "traces": {
-      "enabled": False,
-      "endpoint": None,            # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
-      "sampler": "parentbased_traceidratio",  # OTEL_TRACES_SAMPLER
-      "sampler_arg": 1.0,          # OTEL_TRACES_SAMPLER_ARG
-      "instrument": ["django", "psycopg", "redis", "requests"],
-      "excluded_urls": ["/static/", "/metrics", "/api/status/"],
-    },
-    "metrics": {
-      "enabled": False,
-      "endpoint": None,            # OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
-      "export_interval": 60,       # OTEL_METRIC_EXPORT_INTERVAL (seconds)
-      "change_counters": True,
-      "runtime": False,
-    },
-    "rq": {
-      "enabled": True,
-      "patch_worker": True,
-      "propagate_context": True,
-      "flush_timeout": 5,          # seconds, horse flush
-    },
-  }
+    "netbox_opentelemetry_plugin": {
+        "enabled": True,
+        "exporter": {
+            "endpoint": None,  # OTEL_EXPORTER_OTLP_ENDPOINT
+            "protocol": "http/protobuf",  # OTEL_EXPORTER_OTLP_PROTOCOL; or "grpc"
+            "headers": {},  # OTEL_EXPORTER_OTLP_HEADERS; values never logged
+            "timeout": 10,  # OTEL_EXPORTER_OTLP_TIMEOUT (seconds)
+            "insecure": False,  # grpc only
+            "certificate": None,  # OTEL_EXPORTER_OTLP_CERTIFICATE
+        },
+        "service_name": "netbox",  # OTEL_SERVICE_NAME
+        "resource_attributes": {},  # OTEL_RESOURCE_ATTRIBUTES
+        "logs": {
+            "enabled": True,
+            "endpoint": None,  # OTEL_EXPORTER_OTLP_LOGS_ENDPOINT
+            "loggers": ["netbox", "django", "rq"],
+            "level": "INFO",
+            "set_logger_levels": False,  # if True, also lower listed loggers to `level`
+        },
+        "audit": {
+            "enabled": True,
+            "include_data": False,
+            "exclude_fields": ["password", "secret", "token", "key"],
+        },
+        "traces": {
+            "enabled": False,
+            "endpoint": None,  # OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+            "sampler": "parentbased_traceidratio",  # OTEL_TRACES_SAMPLER
+            "sampler_arg": 1.0,  # OTEL_TRACES_SAMPLER_ARG
+            "instrument": ["django", "psycopg", "redis", "requests"],
+            "excluded_urls": ["/static/", "/metrics", "/api/status/"],
+        },
+        "metrics": {
+            "enabled": False,
+            "endpoint": None,  # OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
+            "export_interval": 60,  # OTEL_METRIC_EXPORT_INTERVAL (seconds)
+            "change_counters": True,
+            "runtime": False,
+        },
+        "rq": {
+            "enabled": True,
+            "patch_worker": True,
+            "propagate_context": True,
+            "flush_timeout": 5,  # seconds, horse flush
+        },
+    }
 }
 ```
 

@@ -38,9 +38,16 @@ class LogsModule:
         self._handler = handler
 
     def after_fork(self, ctx: Context) -> None:
-        """Point the inherited handler at the provider rebuilt for this process."""
-        if self._handler is not None and ctx.logger_provider is not None:
-            self._handler.set_logger_provider(ctx.logger_provider)
+        """Point the inherited handler at this process's provider, or detach it if there is none."""
+        if self._handler is None:
+            return
+        if ctx.logger_provider is None:
+            for target in self._attached:
+                target.removeHandler(self._handler)
+            self._attached.clear()
+            self._handler = None
+            return
+        self._handler.set_logger_provider(ctx.logger_provider)
 
     def shutdown(self) -> None:
         if self._handler is None:

@@ -11,6 +11,7 @@ import atexit
 import contextlib
 import logging
 import os
+import re
 import sys
 import threading
 from collections.abc import Mapping, Sequence
@@ -28,6 +29,9 @@ ROLE_RQWORKER = "rqworker"
 ROLE_RQ_HORSE = "rq_horse"
 ROLE_MANAGEMENT = "management"
 ROLE_RUNSERVER_PARENT = "runserver_parent"
+
+# user:password@ in URLs or host strings, including percent-encoded credentials.
+_USERINFO = re.compile(r"[A-Za-z0-9._~%!$&'()*+,;=-]+:[^\s/@'\"]+@")
 
 UWSGI_THREADS_WARNING = (
     "OpenTelemetry: uWSGI is running without thread support, so the exporter's background thread "
@@ -157,7 +161,9 @@ def reinit_after_fork() -> None:
 
     The SDK restarts its batch threads after fork but keeps the parent's service.instance.id and
     shares the parent's exporter connection. This gives the child its own Resource, exporter and
-    LoggerProvider. Idempotent: a second call in the same process does nothing.
+    LoggerProvider. Idempotent: a second call in the same process does nothing. If this process
+    owned its LoggerProvider and the rebuild fails, it detaches the logging handler and exports
+    nothing rather than keep using the inherited, now-orphaned provider.
 
     This never calls shutdown() (or anything else) on an object inherited from the parent: any
     lock inside such an object (a threading.Lock, a Condition, an SSL/urllib3 connection pool
@@ -178,12 +184,15 @@ def reinit_after_fork() -> None:
         try:
             _rebuild_for_child(ctx, state)
         except Exception as exc:
-            # ctx.logger_provider may still be the parent's, inherited across fork: this process
-            # never built its own, so it must not treat itself as owning it. Otherwise this
-            # process's own shutdown() would later call shutdown() on that inherited provider,
-            # which is exactly the deadlock hazard reinit_after_fork's docstring describes.
-            state.owns_logger_provider = False
             logger.warning("OpenTelemetry: re-initialisation after fork failed: %s", _describe(exc, ctx.settings))
+            if state.owns_logger_provider:
+                # This process could not build its own provider. The inherited one shares the parent's
+                # exporter connection, so stop exporting from this process instead of using it.
+                state.owns_logger_provider = False
+                ctx.logger_provider = None
+                for module in state.modules:
+                    with contextlib.suppress(Exception):
+                        module.after_fork(ctx)
 
 
 def _rebuild_for_child(ctx: Context, state: _State) -> None:
@@ -276,6 +285,7 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
             for value in exporter.headers.values():
                 if value:
                     message = message.replace(value, conf.REDACTED)
+        message = _USERINFO.sub(f"{conf.REDACTED}@", message)
         return f"{type(exc).__name__}: {message}"
     except Exception:
         return type(exc).__name__

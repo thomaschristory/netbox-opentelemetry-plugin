@@ -124,3 +124,13 @@ def test_after_fork_repoints_handler_to_new_provider(exporter):
     assert len(_otel_handlers("t.logs.afterfork")) == 1
     lg.setLevel(logging.NOTSET)
     module.shutdown()
+
+
+def test_after_fork_without_provider_detaches_handler(exporter):
+    ctx = _context(_settings(["t.logs.detach"]), exporter)
+    module = LogsModule()
+    module.install(ctx)
+    ctx.logger_provider = None
+    module.after_fork(ctx)
+    assert _otel_handlers("t.logs.detach") == []
+    module.shutdown()

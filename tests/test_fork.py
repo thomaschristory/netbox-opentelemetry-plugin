@@ -221,12 +221,10 @@ def test_external_provider_is_not_rebuilt(monkeypatch, exporters):
     assert _run_in_child(probe) == {"still_external": True, "exporter_count": 0}
 
 
-def test_rebuild_failure_warns_and_keeps_current_provider(monkeypatch, exporters):
+def test_rebuild_failure_detaches_handler_and_drops_ownership(exporters):
     ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
 
     def probe():
-        # The at-fork hook already re-initialised this child once; force a second rebuild that fails.
-        current = ctx.logger_provider
         messages = []
 
         class ListHandler(logging.Handler):
@@ -239,20 +237,20 @@ def test_rebuild_failure_warns_and_keeps_current_provider(monkeypatch, exporters
             raise RuntimeError("no exporter in child")
 
         otel.build_log_exporter = boom
-        bootstrap._state.pid = -1  # force a re-init as if we had just forked
+        bootstrap._state.pid = -1  # force a second re-init as if we had just forked
         bootstrap.reinit_after_fork()
         return {
-            "kept": ctx.logger_provider is current,
+            "provider_is_none": ctx.logger_provider is None,
+            "owns": bootstrap._state.owns_logger_provider,
+            "handlers": len(_otel_handlers("t.fork")),
             "messages": messages,
-            "owns_logger_provider": bootstrap._state.owns_logger_provider,
         }
 
     result = _run_in_child(probe)
-    assert result["kept"] is True
+    assert result["provider_is_none"] is True
+    assert result["owns"] is False
+    assert result["handlers"] == 0
     assert any("re-initialisation after fork failed" in m for m in result["messages"])
-    # Not owned: this process's shutdown() must never call shutdown() on ctx.logger_provider,
-    # since it is still the provider inherited from the parent, not one this child built itself.
-    assert result["owns_logger_provider"] is False
 
 
 def test_rebuild_failure_in_rqworker_child_keeps_old_role_and_resource(monkeypatch, exporters):

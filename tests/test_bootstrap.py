@@ -161,3 +161,24 @@ def test_exporter_failure_warning_redacts_header_values(monkeypatch, caplog):
     assert "TOPSECRET" not in caplog.text
     assert "***" in caplog.text
     assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to establish a new connection to 'user:SECRETPW@collector' port 4318",
+        "cannot reach https://user:SECRETPW@collector:4318/v1/logs",
+        "cannot reach https://user:SECRET%40PW@collector:4318",
+    ],
+)
+def test_describe_scrubs_userinfo_patterns(message):
+    settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    text = bootstrap._describe(RuntimeError(message), settings)
+    assert "SECRET" not in text
+    assert "***@collector" in text
+
+
+def test_describe_leaves_plain_host_port_alone():
+    settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    text = bootstrap._describe(RuntimeError("connection refused: collector:4318"), settings)
+    assert text == "RuntimeError: connection refused: collector:4318"

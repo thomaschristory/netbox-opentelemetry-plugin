@@ -204,7 +204,12 @@ def reinit_after_fork() -> None:
 
 
 def set_next_fork_role(role: str | None) -> None:
-    """Label the child of the next fork (the RQ integration sets this around fork_work_horse)."""
+    """Label the child of the next fork (the RQ integration sets this around fork_work_horse).
+
+    One-shot: the hint is consumed by the next fork and then cleared, in both the parent process
+    (see _after_fork_in_parent) and the child (see reinit_after_fork), so it applies to exactly
+    one fork.
+    """
     global _next_fork_role
     _next_fork_role = role
 
@@ -212,8 +217,15 @@ def set_next_fork_role(role: str | None) -> None:
 def force_flush(timeout: float) -> bool:
     """Flush this process's log provider, waiting at most `timeout` seconds. Never raises.
 
+    True means the flush call returned within the deadline, or there was nothing to flush: no
+    installed state, a process whose PID does not match the installed state (treated as nothing
+    to flush here), or no LoggerProvider. It does not mean the records were exported: a failure
+    inside the provider's force_flush is swallowed and still reported as True, since the flush
+    call itself did not hang past the deadline. False is returned when the deadline passed before
+    the flush finished, or when the helper thread itself could not be started.
+
     The flush runs on a helper thread so a stuck export cannot hold the caller beyond the
-    deadline. Returns False only when the deadline passed.
+    deadline.
     """
     state = _state
     if state is None or state.pid != os.getpid() or state.context is None:
@@ -231,7 +243,12 @@ def force_flush(timeout: float) -> bool:
         finally:
             done.set()
 
-    threading.Thread(target=run, name="otel-flush", daemon=True).start()
+    try:
+        threading.Thread(target=run, name="otel-flush", daemon=True).start()
+    except Exception:
+        # Thread creation can fail (resource limits, interpreter finalization). Nothing was
+        # started, so there is nothing to wait on: report the flush as not completed.
+        return False
     return done.wait(timeout)
 
 
@@ -272,10 +289,15 @@ def _before_fork() -> None:
 
 
 def _after_fork_in_parent() -> None:
+    global _next_fork_role
     # Some embedders run the parent hook without the before hook. Fork hooks must never raise,
     # so releasing a lock we may not hold is tolerated rather than propagated.
     with contextlib.suppress(RuntimeError):
         _lock.release()
+    # The hint is a copy-on-write page shared with the child at fork time; clearing it here only
+    # affects this (parent) process's own memory. It makes the hint apply to exactly one fork in
+    # the parent too, matching the child-side clear in reinit_after_fork.
+    _next_fork_role = None
 
 
 def _after_fork_in_child() -> None:

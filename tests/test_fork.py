@@ -33,9 +33,11 @@ ARGV_RQ = ["/opt/netbox/netbox/manage.py", "rqworker"]
 def reset_state():
     bootstrap.shutdown()
     bootstrap._state = None
+    bootstrap._next_fork_role = None
     yield
     bootstrap.shutdown()
     bootstrap._state = None
+    bootstrap._next_fork_role = None
 
 
 @pytest.fixture
@@ -209,6 +211,25 @@ def test_other_rqworker_fork_keeps_rqworker_role(exporters):
 
 def test_horse_hint_is_consumed_in_the_child(exporters):
     bootstrap.install(USER, env={}, argv=ARGV_RQ)
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    try:
+        result = _run_in_child(lambda: {"hint": bootstrap._next_fork_role})
+    finally:
+        bootstrap.set_next_fork_role(None)
+    assert result == {"hint": None}
+
+
+def test_hint_is_cleared_in_the_parent_after_a_fork():
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    try:
+        _run_in_child(lambda: {})
+        assert bootstrap._next_fork_role is None
+    finally:
+        bootstrap.set_next_fork_role(None)
+
+
+def test_hint_is_cleared_in_the_child_even_without_installed_state():
+    # No bootstrap.install() call: _state is None, exercising reinit_after_fork's early return.
     bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
     try:
         result = _run_in_child(lambda: {"hint": bootstrap._next_fork_role})

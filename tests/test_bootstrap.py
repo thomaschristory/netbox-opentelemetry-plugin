@@ -16,9 +16,11 @@ ARGV_WEB = ["granian", "netbox.granian:application"]
 def reset_state():
     bootstrap.shutdown()
     bootstrap._state = None
+    bootstrap._next_fork_role = None
     yield
     bootstrap.shutdown()
     bootstrap._state = None
+    bootstrap._next_fork_role = None
 
 
 @pytest.fixture
@@ -207,13 +209,12 @@ def test_force_flush_without_state_is_true():
 
 
 def test_force_flush_flushes_provider(exporter):
-    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    bootstrap.install(USER, env={}, argv=ARGV_WEB)
     lg = logging.getLogger("t.boot")
     lg.setLevel(logging.INFO)
     lg.info("flush me")
     assert bootstrap.force_flush(2.0) is True
     assert [r.log_record.body for r in exporter.get_finished_logs()] == ["flush me"]
-    assert ctx is not None
 
 
 def test_force_flush_gives_up_after_timeout(exporter, monkeypatch):
@@ -234,3 +235,25 @@ def test_force_flush_never_raises(exporter, monkeypatch):
 
     monkeypatch.setattr(ctx.logger_provider, "force_flush", boom)
     assert bootstrap.force_flush(1.0) is True
+
+
+def test_force_flush_passes_timeout_millis_to_provider(exporter, monkeypatch):
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    received = {}
+
+    def stub(timeout_millis=None):
+        received["timeout_millis"] = timeout_millis
+
+    monkeypatch.setattr(ctx.logger_provider, "force_flush", stub)
+    assert bootstrap.force_flush(2.5) is True
+    assert received["timeout_millis"] == 2500
+
+
+def test_force_flush_returns_false_when_thread_cannot_start(exporter, monkeypatch):
+    bootstrap.install(USER, env={}, argv=ARGV_WEB)
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    assert bootstrap.force_flush(1.0) is False

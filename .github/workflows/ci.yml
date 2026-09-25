@@ -34,17 +34,6 @@ jobs:
     strategy:
       matrix:
         netbox: ["v4.7.1"]
-    services:
-      postgres:
-        image: postgres:18-alpine
-        env:
-          POSTGRES_USER: netbox
-          POSTGRES_PASSWORD: netbox
-          POSTGRES_DB: netbox
-        ports: ["5432:5432"]
-      redis:
-        image: valkey/valkey:9.1-alpine
-        ports: ["6379:6379"]
     steps:
       - uses: actions/checkout@v5
         with:

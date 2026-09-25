@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from . import conf, otel
 from .modules.base import Context, Module
 from .modules.logs import LogsModule
+from .modules.rq import RqModule
 from .version import __version__
 
 logger = logging.getLogger(otel.PLUGIN_LOGGER)
@@ -333,6 +334,8 @@ def _candidate_modules(ctx: Context) -> list[Module]:
     modules: list[Module] = []
     if ctx.logger_provider is not None:
         modules.append(LogsModule())
+    if ctx.role == ROLE_RQWORKER:
+        modules.append(RqModule())
     return modules
 
 

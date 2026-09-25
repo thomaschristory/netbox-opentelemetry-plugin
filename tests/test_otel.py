@@ -191,3 +191,11 @@ def test_grpc_insecure_none_is_inferred_from_http_scheme():
     assert isinstance(exporter, OTLPLogExporter)
     assert exporter._insecure is True
     exporter.shutdown()
+
+
+def test_header_values_are_not_in_settings_repr():
+    from netbox_opentelemetry_plugin.conf import LogsConfig, Settings
+
+    exporter = ExporterConfig("http://collector:4318/v1/logs", "http/protobuf", {"authorization": "TOPSECRET"})
+    settings = Settings(enabled=True, logs=LogsConfig(enabled=True, exporter=exporter))
+    assert "TOPSECRET" not in repr(settings)

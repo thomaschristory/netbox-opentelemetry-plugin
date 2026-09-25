@@ -75,7 +75,7 @@ class ConfigError(ValueError):
 class ExporterConfig:
     endpoint: str
     protocol: str
-    headers: Mapping[str, str] = field(default_factory=dict)
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     timeout: float = 10.0
     insecure: bool | None = None
     certificate: str | None = None

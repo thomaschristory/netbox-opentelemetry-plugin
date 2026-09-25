@@ -183,3 +183,10 @@ def test_insecure_env_true_is_respected():
     env = {"OTEL_EXPORTER_OTLP_LOGS_INSECURE": "true", **ENDPOINT_ENV}
     s = conf.resolve({}, env)
     assert s.logs.exporter.insecure is True
+
+
+def test_header_values_not_in_exporter_config_repr():
+    user = {"exporter": {"headers": {"authorization": "TOPSECRET"}}}
+    s = conf.resolve(user, ENDPOINT_ENV)
+    assert "TOPSECRET" not in repr(s)
+    assert "TOPSECRET" not in repr(s.logs.exporter)

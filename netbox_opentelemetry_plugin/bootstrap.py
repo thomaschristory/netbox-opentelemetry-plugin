@@ -28,6 +28,11 @@ ROLE_RQ_HORSE = "rq_horse"
 ROLE_MANAGEMENT = "management"
 ROLE_RUNSERVER_PARENT = "runserver_parent"
 
+UWSGI_THREADS_WARNING = (
+    "OpenTelemetry: uWSGI is running without thread support, so the exporter's background thread "
+    "cannot run and nothing will be exported. Set `enable-threads = true` in the uWSGI configuration."
+)
+
 
 @dataclass
 class _State:
@@ -100,6 +105,13 @@ def install(
                 logger.warning("OpenTelemetry: %s module disabled: %s", module.name, _describe(exc, settings))
                 continue
             state.modules.append(module)
+
+        uwsgi_module = _uwsgi_module()
+        if uwsgi_module is not None:
+            try:
+                _integrate_uwsgi(uwsgi_module)
+            except Exception as exc:
+                logger.warning("OpenTelemetry: uWSGI integration failed: %s", _describe(exc, settings))
 
         _state = state
         if not _atexit_registered:
@@ -262,3 +274,53 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
         return f"{type(exc).__name__}: {message}"
     except Exception:
         return type(exc).__name__
+
+
+def _uwsgi_module():
+    """Return the uwsgi module when running inside uWSGI, otherwise None.
+
+    The module is provided by the uWSGI runtime itself and never exists as an installed package.
+    """
+    try:
+        import uwsgi
+    except ImportError:
+        return None
+    return uwsgi
+
+
+def _integrate_uwsgi(uwsgi_module) -> None:
+    # uWSGI forks workers in C and only runs Python's at-fork hooks with py-call-osafterfork.
+    # post_fork_hook is called in every worker after fork. If both fire, the second
+    # re-initialisation is a no-op because it is keyed on the PID.
+    previous = getattr(uwsgi_module, "post_fork_hook", None)
+    if not getattr(previous, "_netbox_otel", False):
+
+        def post_fork_hook():
+            if previous is not None:
+                previous()
+            _after_fork_in_child()
+
+        post_fork_hook._netbox_otel = True
+        uwsgi_module.post_fork_hook = post_fork_hook
+    opt = getattr(uwsgi_module, "opt", None) or {}
+    if uwsgi_threads_disabled(opt, "pyuwsgi" in sys.modules):
+        logger.warning(UWSGI_THREADS_WARNING)
+
+
+def uwsgi_threads_disabled(opt: Mapping, embedded_in_python: bool) -> bool:
+    """True when uWSGI will not run threads started by the application.
+
+    pyuwsgi (the PyPI package: uWSGI embedded in an already running interpreter) always has
+    thread support. The classic uwsgi binary needs enable-threads, which --threads implies.
+    """
+    if embedded_in_python:
+        return False
+    return not (_truthy(opt.get("enable-threads")) or _truthy(opt.get("threads")))
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, bytes):
+        value = value.decode(errors="ignore")
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)

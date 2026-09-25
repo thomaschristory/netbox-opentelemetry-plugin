@@ -1,0 +1,26 @@
+COMPOSE = docker compose -f dev/docker-compose.yml
+
+.PHONY: test lint format dev down logs-collector e2e
+
+test:
+	uv run pytest
+
+lint:
+	uv run ruff check .
+	uv run ruff format --check .
+
+format:
+	uv run ruff check --fix .
+	uv run ruff format .
+
+dev:
+	$(COMPOSE) up -d --build
+
+down:
+	$(COMPOSE) down
+
+logs-collector:
+	$(COMPOSE) logs -f otel-collector
+
+e2e:
+	uv run pytest -m e2e tests/e2e -v

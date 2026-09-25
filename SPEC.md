@@ -68,7 +68,8 @@ Modules depend on `config` and a shared context object (providers, Resource, pro
 ready()  -> super().ready()
          -> guard: if already installed for os.getpid(): return
          -> cfg = config.resolve()             (failure: warn once, stop)
-         -> role = detect_role()               web | rqworker | rq_horse | management | runserver_parent
+         -> role = detect_role()               web | rqworker | management | runserver_parent
+                                                (rq_horse is assigned only after an announced fork, see 4.2)
          -> providers = detect_or_build(cfg)   reuse global SDK providers if already set
          -> for each enabled module: try install(ctx) except: warn, skip that module
          -> os.register_at_fork(before, after_in_parent, after_in_child) at import; uwsgi.post_fork_hook when under uWSGI
@@ -88,7 +89,7 @@ ready()  -> super().ready()
 - `before` fork takes the bootstrap lock and `after_in_parent` releases it; the child gets a new lock.
 - The re-initialisation is keyed on the PID and runs at most once per process, so it is safe when both Python's at-fork hooks and uWSGI's `post_fork_hook` fire.
 - A child of the `rqworker` process takes the role `rq_horse` only when the RQ integration announced the fork (`fork_work_horse`); other forks of the worker process, such as the RQ scheduler, keep the role `rqworker`.
-- If rebuilding in the child fails, the child logs one warning and detaches the logging handler: it exports nothing rather than using the parent's exporter connection.
+- If rebuilding in the child fails, the child logs one warning. When the plugin owns the provider, it also detaches the logging handler and exports nothing rather than using the parent's exporter connection; with a provider configured outside the plugin, only the warning is logged and the inherited, unmodified provider keeps being used.
 
 ### 4.3 Install types (verified against NetBox 4.7.1 and netbox-docker 5.1.1 sources)
 

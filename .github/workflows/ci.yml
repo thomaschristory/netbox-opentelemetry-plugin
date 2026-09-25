@@ -1,0 +1,87 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync
+      - run: uv run pytest -v
+
+  netbox-load:
+    name: loads in NetBox ${{ matrix.netbox }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        netbox: ["v4.7.1"]
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: netbox
+          POSTGRES_PASSWORD: netbox
+          POSTGRES_DB: netbox
+        ports: ["5432:5432"]
+      redis:
+        image: valkey/valkey:9.1-alpine
+        ports: ["6379:6379"]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: plugin
+      - uses: actions/checkout@v5
+        with:
+          repository: netbox-community/netbox
+          ref: ${{ matrix.netbox }}
+          path: netbox
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install NetBox and plugin
+        run: |
+          sudo apt-get update && sudo apt-get install -y libpq-dev
+          python -m pip install --upgrade pip
+          pip install -r netbox/requirements.txt
+          pip install ./plugin
+      - name: Configure NetBox
+        run: |
+          cp netbox/netbox/netbox/configuration_testing.py netbox/netbox/netbox/configuration.py
+          cat >> netbox/netbox/netbox/configuration.py <<'EOF'
+
+          PLUGINS = ["netbox_opentelemetry_plugin"]
+          PLUGINS_CONFIG = {
+              "netbox_opentelemetry_plugin": {
+                  "exporter": {"endpoint": "http://localhost:4318"},
+              },
+          }
+          EOF
+      - name: System check
+        run: python netbox/netbox/manage.py check
+      - name: Handler attached
+        run: |
+          python netbox/netbox/manage.py shell -c "
+          import logging
+          from netbox_opentelemetry_plugin.otel import AllowlistLoggingHandler as H
+          assert any(isinstance(h, H) for h in logging.getLogger('netbox').handlers), 'handler missing'
+          print('handler attached')
+          "

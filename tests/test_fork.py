@@ -4,6 +4,7 @@ Each child runs a probe function, sends a JSON result back over a pipe and leave
 so no pytest machinery runs in the child.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -76,34 +77,48 @@ def _run_in_child(probe):
             os._exit(0)
 
     os.close(write_fd)
-    chunks = []
-    deadline = time.monotonic() + CHILD_TIMEOUT
+    reaped = False
     try:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-                pytest.fail(f"child did not finish within {CHILD_TIMEOUT} s (possible deadlock in after-fork hooks)")
-            ready, _, _ = select.select([read_fd], [], [], remaining)
-            if not ready:
-                continue
-            chunk = os.read(read_fd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-    finally:
-        os.close(read_fd)
+        chunks = []
+        deadline = time.monotonic() + CHILD_TIMEOUT
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+                    reaped = True
+                    pytest.fail(
+                        f"child did not finish within {CHILD_TIMEOUT} s (possible deadlock in after-fork hooks)"
+                    )
+                ready, _, _ = select.select([read_fd], [], [], remaining)
+                if not ready:
+                    continue
+                chunk = os.read(read_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(read_fd)
 
-    _, status = os.waitpid(pid, 0)
-    payload = b"".join(chunks).decode()
-    if not payload:
-        pytest.fail(f"child produced no output (status={status!r}); it likely crashed before writing its result")
-    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
-        pytest.fail(f"child did not exit cleanly: status={status!r}, payload={payload!r}")
-    result = json.loads(payload)
-    assert result.pop("ok"), result.get("error")
-    return result
+        _, status = os.waitpid(pid, 0)
+        reaped = True
+        payload = b"".join(chunks).decode()
+        if not payload:
+            pytest.fail(f"child produced no output (status={status!r}); it likely crashed before writing its result")
+        if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+            pytest.fail(f"child did not exit cleanly: status={status!r}, payload={payload!r}")
+        result = json.loads(payload)
+        assert result.pop("ok"), result.get("error")
+        return result
+    finally:
+        # If select() or read() raised instead of the timeout/EOF paths above running, the child
+        # may still be alive and unreaped at this point. Never leave it behind.
+        if not reaped:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(pid, 0)
 
 
 def test_child_rebuilds_provider_resource_and_repoints_handler(exporters):
@@ -216,11 +231,18 @@ def test_rebuild_failure_warns_and_keeps_current_provider(monkeypatch, exporters
         otel.build_log_exporter = boom
         bootstrap._state.pid = -1  # force a re-init as if we had just forked
         bootstrap.reinit_after_fork()
-        return {"kept": ctx.logger_provider is current, "messages": messages}
+        return {
+            "kept": ctx.logger_provider is current,
+            "messages": messages,
+            "owns_logger_provider": bootstrap._state.owns_logger_provider,
+        }
 
     result = _run_in_child(probe)
     assert result["kept"] is True
     assert any("re-initialisation after fork failed" in m for m in result["messages"])
+    # Not owned: this process's shutdown() must never call shutdown() on ctx.logger_provider,
+    # since it is still the provider inherited from the parent, not one this child built itself.
+    assert result["owns_logger_provider"] is False
 
 
 def test_rebuild_failure_in_rqworker_child_keeps_old_role_and_resource(monkeypatch, exporters):
@@ -294,15 +316,26 @@ def test_fork_while_batch_worker_lock_is_held(exporters):
 
 
 def test_fork_waits_for_bootstrap_lock_holder(exporters):
-    """_before_fork must block until whoever holds bootstrap._lock releases it."""
+    """_before_fork must block until whoever holds bootstrap._lock releases it.
+
+    _after_fork_in_child always swaps in a brand new, unlocked RLock, so the child being able to
+    acquire bootstrap._lock proves nothing on its own: that would succeed even if _before_fork did
+    nothing at all. Instead the holder thread sets a marker in a plain dict immediately before it
+    releases the lock, still while holding it. If _before_fork really blocks until release, the
+    fork() call cannot return (in either process) until that marker is already True in memory, so
+    the child inherits it as True. If _before_fork does not block, the fork can go ahead while the
+    holder still holds the lock, with the marker still False, and the child inherits that instead.
+    """
     bootstrap.install(USER, env={}, argv=ARGV_WEB)
 
     started = threading.Event()
+    state = {"released": False}
 
     def holder():
         with bootstrap._lock:
             started.set()
             time.sleep(0.3)
+            state["released"] = True
 
     t = threading.Thread(target=holder)
     t.start()
@@ -313,10 +346,10 @@ def test_fork_waits_for_bootstrap_lock_holder(exporters):
             acquired = bootstrap._lock.acquire(timeout=1)
             if acquired:
                 bootstrap._lock.release()
-            return {"acquired": acquired}
+            return {"acquired": acquired, "released": state["released"]}
 
         result = _run_in_child(probe)
     finally:
         t.join(timeout=5)
 
-    assert result == {"acquired": True}
+    assert result == {"acquired": True, "released": True}

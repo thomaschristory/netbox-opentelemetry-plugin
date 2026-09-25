@@ -165,6 +165,11 @@ def reinit_after_fork() -> None:
         try:
             _rebuild_for_child(ctx, state)
         except Exception as exc:
+            # ctx.logger_provider may still be the parent's, inherited across fork: this process
+            # never built its own, so it must not treat itself as owning it. Otherwise this
+            # process's own shutdown() would later call shutdown() on that inherited provider,
+            # which is exactly the deadlock hazard reinit_after_fork's docstring describes.
+            state.owns_logger_provider = False
             logger.warning("OpenTelemetry: re-initialisation after fork failed: %s", _describe(exc, ctx.settings))
 
 

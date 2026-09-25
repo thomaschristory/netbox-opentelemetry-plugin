@@ -12,7 +12,8 @@ import socket
 from collections.abc import Mapping
 
 from opentelemetry._logs import get_logger_provider
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.instrumentation.logging.handler import LoggingHandler
+from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import (
     BatchLogRecordProcessor,
     LogRecordExporter,
@@ -120,13 +121,13 @@ class ExcludeLoggersFilter(logging.Filter):
 class AllowlistLoggingHandler(LoggingHandler):
     """LoggingHandler that exports only allowlisted attributes.
 
-    The SDK handler exports every non-reserved LogRecord attribute, including anything passed via
+    Extends the handler from opentelemetry-instrumentation-logging to filter attributes.
+    The base handler exports every non-reserved LogRecord attribute, including anything passed via
     extra=. That would send arbitrary data off the process, so attributes are filtered here.
     """
 
-    @staticmethod
-    def _get_attributes(record: logging.LogRecord):
-        attributes = LoggingHandler._get_attributes(record)
+    def _get_attributes(self, record: logging.LogRecord):
+        attributes = super()._get_attributes(record)
         allowed = {key: value for key, value in attributes.items() if key in LOG_ATTRIBUTE_ALLOWLIST}
         allowed["logger.name"] = record.name
         if record.threadName:
@@ -135,6 +136,6 @@ class AllowlistLoggingHandler(LoggingHandler):
 
 
 def build_logging_handler(provider: LoggerProvider, level: int) -> AllowlistLoggingHandler:
-    handler = AllowlistLoggingHandler(level=level, logger_provider=provider)
+    handler = AllowlistLoggingHandler(level=level, logger_provider=provider, log_code_attributes=True)
     handler.addFilter(ExcludeLoggersFilter())
     return handler

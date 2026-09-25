@@ -8,6 +8,7 @@ contain header values.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -238,7 +239,7 @@ def resolve_exporter(
         raise ConfigError("exporter.headers must be a dict of strings")
 
     timeout = _pick(exporter_section, "timeout", env, env_names("TIMEOUT"), defaults["timeout"], _parse_float)
-    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0 or not math.isfinite(timeout):
         raise ConfigError("exporter.timeout must be a positive number of seconds")
 
     insecure = _pick(exporter_section, "insecure", env, env_names("INSECURE"), defaults["insecure"], _parse_bool)
@@ -282,9 +283,16 @@ def _resolve_logs(
 def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:
     defaults = DEFAULTS["rq"]
     enabled = _typed(section.get("enabled", defaults["enabled"]), bool, "rq.enabled")
+    if not enabled:
+        return RQ_OFF
     patch_worker = _typed(section.get("patch_worker", defaults["patch_worker"]), bool, "rq.patch_worker")
     flush_timeout = section.get("flush_timeout", defaults["flush_timeout"])
-    if isinstance(flush_timeout, bool) or not isinstance(flush_timeout, int | float) or flush_timeout <= 0:
+    if (
+        isinstance(flush_timeout, bool)
+        or not isinstance(flush_timeout, int | float)
+        or flush_timeout <= 0
+        or not math.isfinite(flush_timeout)
+    ):
         raise ConfigError("rq.flush_timeout must be a positive number of seconds")
     return RqConfig(enabled=enabled, patch_worker=patch_worker, flush_timeout=float(flush_timeout))
 

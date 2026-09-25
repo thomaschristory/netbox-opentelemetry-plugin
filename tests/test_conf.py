@@ -252,3 +252,29 @@ def test_bad_rq_value_disables_only_rq(bad):
 def test_rq_does_not_need_an_endpoint():
     s = conf.resolve({}, {})
     assert s.rq.enabled is True
+
+
+@pytest.mark.parametrize("bad_timeout", [float("nan"), float("inf")])
+def test_rq_flush_timeout_rejects_non_finite(bad_timeout):
+    s = conf.resolve({"rq": {"flush_timeout": bad_timeout}}, ENDPOINT_ENV)
+    assert s.rq.enabled is False
+    assert any(w.startswith("rq disabled:") for w in s.warnings)
+
+
+def test_exporter_timeout_rejects_non_finite():
+    s = conf.resolve({"exporter": {"timeout": float("inf")}}, ENDPOINT_ENV)
+    assert s.logs.enabled is False
+    assert any("exporter.timeout" in w for w in s.warnings)
+
+
+def test_exporter_timeout_env_rejects_nan():
+    env = {"OTEL_EXPORTER_OTLP_TIMEOUT": "nan", **ENDPOINT_ENV}
+    s = conf.resolve({}, env)
+    assert s.logs.enabled is False
+    assert any("exporter.timeout" in w for w in s.warnings)
+
+
+def test_rq_disabled_skips_validation():
+    s = conf.resolve({"rq": {"enabled": False, "flush_timeout": -1}}, ENDPOINT_ENV)
+    assert s.rq == conf.RQ_OFF
+    assert not any(w.startswith("rq disabled:") for w in s.warnings)

@@ -37,6 +37,10 @@ ROLE_RUNSERVER_PARENT = "runserver_parent"
 # backtrack catastrophically on long inputs with a ":" but no "@" (for example "a" * n + ":" + "b" * n).
 _USERINFO = re.compile(r"[A-Za-z0-9._~%!$&'()*+,;=-]+:[^\s/@'\"]+@")
 
+# scheme://TOKEN@host userinfo with no colon (a bare token, not a user:password pair). Also only
+# ever applied to a message already bounded by _MESSAGE_LIMIT, for the same reason as _USERINFO.
+_TOKEN_USERINFO = re.compile(r"(//)[^\s/@'\"]+@")
+
 _MESSAGE_LIMIT = 2000
 
 UWSGI_THREADS_WARNING = (
@@ -361,16 +365,21 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
             message = message[:_MESSAGE_LIMIT]
             # Drop a partial token left dangling at the cut (for example the prefix of a secret
             # that was not caught above, such as URL userinfo) by cutting back to the last
-            # whitespace in the kept text.
+            # whitespace in the kept text. If the kept text has no whitespace at all, we cannot
+            # tell whether it ends mid-token, so drop it entirely rather than risk leaking a
+            # prefix of a secret.
+            cut = None
             for i in range(len(message) - 1, -1, -1):
                 if message[i].isspace():
-                    message = message[:i]
+                    cut = i
                     break
+            message = message[:cut] if cut is not None else ""
             message += " [truncated]"
-        # Only applied to the now-bounded text: _USERINFO can backtrack catastrophically on long
-        # input containing ":" but no "@".
+        # Only applied to the now-bounded text: these patterns can backtrack catastrophically on
+        # long input containing ":" or "//" but no "@".
         if "@" in message:
             message = _USERINFO.sub(f"{conf.REDACTED}@", message)
+            message = _TOKEN_USERINFO.sub(rf"\1{conf.REDACTED}@", message)
         return f"{type(exc).__name__}: {message}"
     except Exception:
         return type(exc).__name__

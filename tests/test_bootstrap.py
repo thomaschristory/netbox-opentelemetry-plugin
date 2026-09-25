@@ -225,6 +225,22 @@ def test_describe_userinfo_straddling_the_cut_is_not_leaked():
     assert "SECR" not in text
 
 
+@pytest.mark.parametrize("n", [1970, 1978, 1985, 1995, 2005])
+def test_describe_userinfo_straddling_cut_without_whitespace_is_not_leaked(n):
+    settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    message = "a" * n + "/https://user:SECRETPW@host tail"
+    text = bootstrap._describe(RuntimeError(message), settings)
+    assert "SECR" not in text
+    assert "[truncated]" in text
+
+
+def test_describe_redacts_token_only_userinfo():
+    settings = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    text = bootstrap._describe(RuntimeError("cannot reach https://ABCTOKEN123@collector:4318"), settings)
+    assert "ABCTOKEN" not in text
+    assert "https://***@collector" in text
+
+
 def test_force_flush_without_state_is_true():
     assert bootstrap.force_flush(1.0) is True
 

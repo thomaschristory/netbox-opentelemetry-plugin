@@ -32,6 +32,9 @@ class AuditCaptureMixin:
         self.assertTrue(state is not None and state.context is not None, "the plugin is not installed in this process")
         self.ctx = state.context
         self._saved = (self.ctx.logger_provider, self.ctx.settings)
+        # Pin audit settings so these tests do not depend on the dev environment's PLUGINS_CONFIG
+        # (for example the netbox-integration CI job, which now disables logs but not audit).
+        self.ctx.settings = dataclasses.replace(self.ctx.settings, audit=AuditConfig(enabled=True))
         self.exporter = InMemoryLogRecordExporter()
         self.ctx.logger_provider = otel.build_logger_provider(self.ctx.resource, self.exporter, synchronous=True)
 

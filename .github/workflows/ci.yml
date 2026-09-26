@@ -129,6 +129,7 @@ jobs:
           PLUGINS_CONFIG = {
               "netbox_opentelemetry_plugin": {
                   "exporter": {"endpoint": "http://localhost:4318"},
+                  "logs": {"enabled": False},
               },
           }
           EOF

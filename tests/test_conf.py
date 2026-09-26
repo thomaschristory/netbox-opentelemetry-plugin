@@ -154,6 +154,16 @@ def test_redacted_masks_header_values():
     assert "SECRET-VALUE" not in repr(redacted)
 
 
+def test_redacted_log_exporter_masks_header_values():
+    # log_exporter is resolved independently of logs.exporter (audit needs it even with logs
+    # disabled), so its own redacted() must mask headers the same way.
+    user = {"exporter": {"headers": {"authorization": "Bearer SECRET-VALUE"}}, "logs": {"enabled": False}}
+    s = conf.resolve(user, ENDPOINT_ENV)
+    redacted = s.redacted()
+    assert redacted["log_exporter"]["headers"] == {"authorization": "***"}
+    assert "SECRET-VALUE" not in repr(redacted)
+
+
 def test_malformed_header_env_warning_does_not_leak_value():
     env = {"OTEL_EXPORTER_OTLP_HEADERS": "SECRET-NO-EQUALS-SIGN", **ENDPOINT_ENV}
     s = conf.resolve({}, env)

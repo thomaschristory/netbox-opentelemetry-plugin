@@ -26,7 +26,7 @@ dev-uwsgi:
 	$(COMPOSE) --profile uwsgi up -d --build
 
 down:
-	$(COMPOSE) down
+	$(COMPOSE) --profile gunicorn --profile uwsgi down
 
 logs-collector:
 	$(COMPOSE) logs -f otel-collector

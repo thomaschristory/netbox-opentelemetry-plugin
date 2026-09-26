@@ -294,3 +294,18 @@ def test_force_flush_returns_false_when_thread_cannot_start(exporter, monkeypatc
 
     monkeypatch.setattr(threading.Thread, "start", boom)
     assert bootstrap.force_flush(1.0) is False
+
+
+def test_describe_redacts_trace_exporter_headers_and_endpoint():
+    user = {
+        "logs": {"enabled": False},
+        "audit": {"enabled": False},
+        "traces": {"enabled": True, "endpoint": "https://user:tracepass@tempo:4318/v1/traces"},
+        "exporter": {"headers": {"x-api-key": "trace-secret-value"}},
+    }
+    settings = conf.resolve(user, {})
+    assert settings.log_exporter is None and settings.traces.exporter is not None
+    exc = RuntimeError("POST https://user:tracepass@tempo:4318/v1/traces failed with key trace-secret-value")
+    text = bootstrap._describe(exc, settings)
+    assert "tracepass" not in text
+    assert "trace-secret-value" not in text

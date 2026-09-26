@@ -17,6 +17,16 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 PROTOCOLS = ("http/protobuf", "grpc")
 REDACTED = "***"
 
+TRACE_SAMPLERS = (
+    "always_on",
+    "always_off",
+    "traceidratio",
+    "parentbased_always_on",
+    "parentbased_always_off",
+    "parentbased_traceidratio",
+)
+INSTRUMENTATIONS = ("django", "psycopg", "redis", "requests")
+
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "exporter": {
@@ -150,13 +160,42 @@ AUDIT_OFF = AuditConfig(enabled=False)
 
 
 @dataclass(frozen=True)
+class TracesConfig:
+    enabled: bool
+    exporter: ExporterConfig | None = None
+    sampler: str = "parentbased_traceidratio"
+    sampler_arg: float = 1.0
+    instrument: tuple[str, ...] = INSTRUMENTATIONS
+    excluded_urls: tuple[str, ...] = ("/static/", "/metrics", "/api/status/")
+
+    def redacted(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "exporter": self.exporter.redacted() if self.exporter else None,
+            "sampler": self.sampler,
+            "sampler_arg": self.sampler_arg,
+            "instrument": list(self.instrument),
+            "excluded_urls": list(self.excluded_urls),
+        }
+
+
+TRACES_OFF = TracesConfig(enabled=False)
+
+
+@dataclass(frozen=True)
 class RqConfig:
     enabled: bool = True
     patch_worker: bool = True
     flush_timeout: float = 5.0
+    propagate_context: bool = True
 
     def redacted(self) -> dict[str, Any]:
-        return {"enabled": self.enabled, "patch_worker": self.patch_worker, "flush_timeout": self.flush_timeout}
+        return {
+            "enabled": self.enabled,
+            "patch_worker": self.patch_worker,
+            "flush_timeout": self.flush_timeout,
+            "propagate_context": self.propagate_context,
+        }
 
 
 RQ_OFF = RqConfig(enabled=False)
@@ -170,6 +209,7 @@ class Settings:
     logs: LogsConfig = LOGS_OFF
     audit: AuditConfig = AUDIT_OFF
     log_exporter: ExporterConfig | None = None
+    traces: TracesConfig = TRACES_OFF
     rq: RqConfig = field(default_factory=RqConfig)
     warnings: tuple[str, ...] = ()
 
@@ -181,8 +221,13 @@ class Settings:
             "logs": self.logs.redacted(),
             "audit": self.audit.redacted(),
             "log_exporter": self.log_exporter.redacted() if self.log_exporter else None,
+            "traces": self.traces.redacted(),
             "rq": self.rq.redacted(),
         }
+
+    def exporters(self) -> tuple[ExporterConfig, ...]:
+        """Every resolved exporter; used to redact their endpoints and header values from messages."""
+        return tuple(cfg for cfg in (self.log_exporter, self.traces.exporter) if cfg is not None)
 
 
 def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
@@ -243,6 +288,12 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         logs = replace(logs, exporter=log_exporter)
 
     try:
+        traces = _resolve_traces(_section(user, "traces"), exporter_section, env)
+    except ConfigError as exc:
+        warnings.append(f"traces disabled: {exc}")
+        traces = TRACES_OFF
+
+    try:
         rq = _resolve_rq(_section(user, "rq"))
     except ConfigError as exc:
         warnings.append(f"rq disabled: {exc}")
@@ -255,6 +306,7 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         logs=logs,
         audit=audit,
         log_exporter=log_exporter,
+        traces=traces,
         rq=rq,
         warnings=tuple(warnings),
     )
@@ -334,6 +386,47 @@ def _resolve_audit(section: Mapping[str, Any]) -> AuditConfig:
     return AuditConfig(enabled=True, include_data=include_data, exclude_fields=tuple(exclude))
 
 
+def _resolve_traces(
+    section: Mapping[str, Any], exporter_section: Mapping[str, Any], env: Mapping[str, str]
+) -> TracesConfig:
+    defaults = DEFAULTS["traces"]
+    if not _typed(section.get("enabled", defaults["enabled"]), bool, "traces.enabled"):
+        return TRACES_OFF
+    sampler = _pick(section, "sampler", env, ("OTEL_TRACES_SAMPLER",), defaults["sampler"], _parse_str)
+    if not isinstance(sampler, str) or sampler.strip().lower() not in TRACE_SAMPLERS:
+        raise ConfigError(f"traces.sampler must be one of: {', '.join(TRACE_SAMPLERS)}")
+    sampler_arg = _pick(
+        section, "sampler_arg", env, ("OTEL_TRACES_SAMPLER_ARG",), defaults["sampler_arg"], _parse_float
+    )
+    if (
+        isinstance(sampler_arg, bool)
+        or not isinstance(sampler_arg, int | float)
+        or not math.isfinite(sampler_arg)
+        or not 0 <= sampler_arg <= 1
+    ):
+        raise ConfigError("traces.sampler_arg must be a number between 0 and 1")
+    instrument = section.get("instrument", defaults["instrument"])
+    if not isinstance(instrument, list | tuple) or not all(isinstance(name, str) for name in instrument):
+        raise ConfigError("traces.instrument must be a list of instrumentation names")
+    unknown = [name for name in instrument if name not in INSTRUMENTATIONS]
+    if unknown:
+        raise ConfigError(f"traces.instrument has unknown entries {unknown}; known: {', '.join(INSTRUMENTATIONS)}")
+    excluded = section.get("excluded_urls", defaults["excluded_urls"])
+    if not isinstance(excluded, list | tuple) or not all(isinstance(url, str) for url in excluded):
+        raise ConfigError("traces.excluded_urls must be a list of URL patterns")
+    if any("," in url for url in excluded):
+        raise ConfigError("traces.excluded_urls entries must not contain a comma")
+    exporter = resolve_exporter("traces", section, exporter_section, env)
+    return TracesConfig(
+        enabled=True,
+        exporter=exporter,
+        sampler=sampler.strip().lower(),
+        sampler_arg=float(sampler_arg),
+        instrument=tuple(dict.fromkeys(instrument)),
+        excluded_urls=tuple(excluded),
+    )
+
+
 def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:
     defaults = DEFAULTS["rq"]
     enabled = _typed(section.get("enabled", defaults["enabled"]), bool, "rq.enabled")
@@ -348,7 +441,15 @@ def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:
         or not math.isfinite(flush_timeout)
     ):
         raise ConfigError("rq.flush_timeout must be a positive number of seconds")
-    return RqConfig(enabled=enabled, patch_worker=patch_worker, flush_timeout=float(flush_timeout))
+    propagate_context = _typed(
+        section.get("propagate_context", defaults["propagate_context"]), bool, "rq.propagate_context"
+    )
+    return RqConfig(
+        enabled=enabled,
+        patch_worker=patch_worker,
+        flush_timeout=float(flush_timeout),
+        propagate_context=propagate_context,
+    )
 
 
 def _endpoint(

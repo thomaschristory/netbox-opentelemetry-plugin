@@ -244,8 +244,13 @@ def test_malformed_port_does_not_break_redacted_output():
 
 def test_rq_defaults():
     s = conf.resolve({}, ENDPOINT_ENV)
-    assert s.rq == conf.RqConfig(enabled=True, patch_worker=True, flush_timeout=5.0)
-    assert s.redacted()["rq"] == {"enabled": True, "patch_worker": True, "flush_timeout": 5.0}
+    assert s.rq == conf.RqConfig(enabled=True, patch_worker=True, flush_timeout=5.0, propagate_context=True)
+    assert s.redacted()["rq"] == {
+        "enabled": True,
+        "patch_worker": True,
+        "flush_timeout": 5.0,
+        "propagate_context": True,
+    }
 
 
 def test_rq_explicit_values():
@@ -349,3 +354,101 @@ def test_audit_disabled_skips_validation():
     s = conf.resolve({"audit": {"enabled": False, "include_data": "yes"}}, ENDPOINT_ENV)
     assert s.audit == conf.AUDIT_OFF
     assert not any(w.startswith("audit disabled:") for w in s.warnings)
+
+
+def test_traces_off_by_default():
+    s = conf.resolve({}, ENDPOINT_ENV)
+    assert s.traces == conf.TRACES_OFF
+    assert s.redacted()["traces"]["enabled"] is False
+    assert s.exporters() == (s.log_exporter,)
+
+
+def test_traces_enabled_defaults():
+    s = conf.resolve({"traces": {"enabled": True}}, ENDPOINT_ENV)
+    t = s.traces
+    assert t.enabled is True
+    assert t.exporter.endpoint == "http://collector:4318/v1/traces"
+    assert t.sampler == "parentbased_traceidratio"
+    assert t.sampler_arg == 1.0
+    assert t.instrument == ("django", "psycopg", "redis", "requests")
+    assert t.excluded_urls == ("/static/", "/metrics", "/api/status/")
+    assert s.exporters() == (s.log_exporter, t.exporter)
+    assert s.warnings == ()
+
+
+def test_traces_signal_endpoint_env_and_explicit_endpoint():
+    env = {**ENDPOINT_ENV, "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://tempo:4318/v1/traces"}
+    assert conf.resolve({"traces": {"enabled": True}}, env).traces.exporter.endpoint == "http://tempo:4318/v1/traces"
+    explicit = {"traces": {"enabled": True, "endpoint": "http://other:4318/v1/traces"}}
+    assert conf.resolve(explicit, env).traces.exporter.endpoint == "http://other:4318/v1/traces"
+
+
+def test_traces_sampler_from_env_and_config():
+    env = {**ENDPOINT_ENV, "OTEL_TRACES_SAMPLER": "traceidratio", "OTEL_TRACES_SAMPLER_ARG": "0.25"}
+    t = conf.resolve({"traces": {"enabled": True}}, env).traces
+    assert (t.sampler, t.sampler_arg) == ("traceidratio", 0.25)
+    t = conf.resolve({"traces": {"enabled": True, "sampler": "ALWAYS_ON", "sampler_arg": 1}}, env).traces
+    assert (t.sampler, t.sampler_arg) == ("always_on", 1.0)
+
+
+@pytest.mark.parametrize(
+    ("section", "env", "fragment"),
+    [
+        ({"sampler": "jaeger_remote"}, {}, "traces.sampler"),
+        ({}, {"OTEL_TRACES_SAMPLER": "xray"}, "traces.sampler"),
+        ({"sampler_arg": 1.5}, {}, "traces.sampler_arg"),
+        ({"sampler_arg": True}, {}, "traces.sampler_arg"),
+        ({}, {"OTEL_TRACES_SAMPLER_ARG": "half"}, "OTEL_TRACES_SAMPLER_ARG"),
+        ({"instrument": ["django", "celery"]}, {}, "traces.instrument"),
+        ({"instrument": "django"}, {}, "traces.instrument"),
+        ({"excluded_urls": ["/a/,/b/"]}, {}, "traces.excluded_urls"),
+        ({"excluded_urls": [1]}, {}, "traces.excluded_urls"),
+        ({"enabled": "yes"}, {}, "traces.enabled"),
+    ],
+)
+def test_invalid_traces_settings_disable_traces_only(section, env, fragment):
+    s = conf.resolve({"traces": {"enabled": True, **section}}, {**ENDPOINT_ENV, **env})
+    assert s.traces == conf.TRACES_OFF
+    assert s.logs.enabled is True
+    assert len(s.warnings) == 1
+    assert s.warnings[0].startswith("traces disabled:")
+    assert fragment in s.warnings[0]
+
+
+def test_traces_without_endpoint_warns_once():
+    s = conf.resolve({"traces": {"enabled": True}, "logs": {"enabled": False}, "audit": {"enabled": False}}, {})
+    assert s.traces == conf.TRACES_OFF
+    assert len(s.warnings) == 1
+    assert s.warnings[0].startswith("traces disabled:") and "no endpoint" in s.warnings[0]
+
+
+def test_traces_section_must_be_a_dict():
+    s = conf.resolve({"traces": ["enabled"]}, ENDPOINT_ENV)
+    assert s.traces == conf.TRACES_OFF
+    assert s.warnings == ("traces disabled: traces must be a dict",)
+
+
+def test_instrument_duplicates_collapse_and_empty_list_is_allowed():
+    s = conf.resolve({"traces": {"enabled": True, "instrument": ["redis", "redis", "django"]}}, ENDPOINT_ENV)
+    assert s.traces.instrument == ("redis", "django")
+    s = conf.resolve({"traces": {"enabled": True, "instrument": [], "excluded_urls": []}}, ENDPOINT_ENV)
+    assert s.traces.instrument == ()
+    assert s.traces.excluded_urls == ()
+
+
+def test_traces_redacted_masks_headers():
+    user = {"exporter": {"headers": {"authorization": "Bearer abc"}}, "traces": {"enabled": True}}
+    red = conf.resolve(user, ENDPOINT_ENV).redacted()["traces"]
+    assert red["exporter"]["headers"] == {"authorization": conf.REDACTED}
+    assert red["sampler"] == "parentbased_traceidratio"
+    assert "abc" not in repr(red)
+
+
+def test_rq_propagate_context():
+    assert conf.resolve({}, ENDPOINT_ENV).rq.propagate_context is True
+    s = conf.resolve({"rq": {"propagate_context": False}}, ENDPOINT_ENV)
+    assert s.rq.propagate_context is False
+    assert s.redacted()["rq"]["propagate_context"] is False
+    s = conf.resolve({"rq": {"propagate_context": "no"}}, ENDPOINT_ENV)
+    assert s.rq == conf.RQ_OFF
+    assert "rq.propagate_context" in s.warnings[0]

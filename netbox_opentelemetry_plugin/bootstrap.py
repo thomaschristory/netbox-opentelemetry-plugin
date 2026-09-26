@@ -364,8 +364,7 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
         # Run the known-literal replacements on the FULL message first: str.replace is linear, so
         # this is safe on arbitrarily long input, and it means a secret that would straddle the
         # truncation cut below is still matched and redacted in full.
-        exporter = settings.log_exporter
-        if exporter is not None:
+        for exporter in settings.exporters():
             message = message.replace(exporter.endpoint, conf._redact_userinfo(exporter.endpoint))
             for value in exporter.headers.values():
                 if value:

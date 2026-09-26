@@ -21,6 +21,9 @@ class NetBoxOpenTelemetryConfig(PluginConfig):
     base_url = "opentelemetry"
     min_version = "4.7.0"
     max_version = "4.7.99"
+    # Always registered: NetBox reads it while loading settings, before ready(). Without a
+    # recording span (traces off) it returns immediately.
+    middleware = ["netbox_opentelemetry_plugin.middleware.RequestSpanMiddleware"]
     # Defaults live in conf.DEFAULTS. NetBox merges default_settings one level deep only, and
     # pre-filled defaults would hide which values were set explicitly (needed for OTEL_* fallback).
     default_settings = {}

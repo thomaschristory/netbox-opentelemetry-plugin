@@ -41,6 +41,12 @@ def test_ready_passes_plugin_config_and_version(monkeypatch):
     assert seen == {"user_config": {"enabled": False}, "netbox_version": "4.7.1"}
 
 
+def test_plugin_registers_the_request_span_middleware():
+    assert plugin.NetBoxOpenTelemetryConfig.middleware == [
+        "netbox_opentelemetry_plugin.middleware.RequestSpanMiddleware"
+    ]
+
+
 def test_ready_never_raises(monkeypatch, caplog):
     def boom(*args, **kwargs):
         raise RuntimeError("unexpected")

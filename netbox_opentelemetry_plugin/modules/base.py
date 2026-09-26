@@ -8,6 +8,7 @@ from ..conf import Settings
 if TYPE_CHECKING:
     from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk.resources import Resource
+    from opentelemetry.trace import TracerProvider
 
 
 @dataclass
@@ -18,6 +19,7 @@ class Context:
     role: str
     resource: Resource
     logger_provider: LoggerProvider | None = None
+    tracer_provider: TracerProvider | None = None
 
 
 class Module(Protocol):

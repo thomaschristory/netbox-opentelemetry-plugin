@@ -273,12 +273,12 @@ _URL_ATTRIBUTES = frozenset({"url.full", "http.url", "http.target"})
 # "why? because" still does not match since a space follows the "?". Linear: no nested quantifiers.
 _QUERY_IN_TEXT = re.compile(r"\?\S+")
 
-# psycopg query spans (db.system set by the instrumentor) can end with a status description and an
-# "exception" event whose message/stacktrace carry the offending values straight from PostgreSQL
-# (for example "DETAIL: Key (name)=(...) already exists." or an invalid inet literal). Only the
-# exception type is safe to keep for these spans; see SPEC 7.
-_DB_SYSTEM_ATTRIBUTE = "db.system"
-_DB_EXCEPTION_DROP_ATTRIBUTES = frozenset({"exception.message", "exception.stacktrace"})
+# A span's status description and its "exception" event can carry the offending values straight
+# from the underlying error (for example a PostgreSQL "DETAIL: Key (name)=(...) already exists.",
+# raised on a psycopg query span, or surfacing unhandled on the request's SERVER span or a job's
+# CONSUMER span once Django or rq lets the exception propagate). Only the exception type is safe to
+# keep, for every span; see SPEC 7.
+_EXCEPTION_DROP_ATTRIBUTES = frozenset({"exception.message", "exception.stacktrace"})
 
 
 def build_span_exporter(cfg: ExporterConfig) -> SpanExporter:
@@ -381,49 +381,52 @@ def _scrub_event(event: Event) -> Event | None:
     return Event(event.name, scrubbed, event.timestamp)
 
 
-def _drop_db_exception_details(event: Event) -> Event | None:
+def _drop_exception_details(event: Event) -> Event | None:
     """For an "exception" event, drop exception.message/exception.stacktrace, keep the rest."""
     if event.name != "exception":
         return None
     attributes = event.attributes or {}
-    if not any(key in attributes for key in _DB_EXCEPTION_DROP_ATTRIBUTES):
+    if not any(key in attributes for key in _EXCEPTION_DROP_ATTRIBUTES):
         return None
-    kept = {k: v for k, v in attributes.items() if k not in _DB_EXCEPTION_DROP_ATTRIBUTES}
+    kept = {k: v for k, v in attributes.items() if k not in _EXCEPTION_DROP_ATTRIBUTES}
     return Event(event.name, kept, event.timestamp)
 
 
-def _reduce_db_status_to_exception_type(status: Status) -> Status | None:
-    """Replace a db span's status description with only the text before its first ":", or "" when there is none."""
+def _reduce_status_to_exception_type(status: Status) -> Status | None:
+    """Replace the status description with only the text before its first ":".
+
+    A description with no colon (a bare exception type name, or a plugin-set description such as
+    "job failed") is left unchanged: there is nothing after a colon to drop, and blanking it would
+    destroy information the plugin itself chose to record.
+    """
     if not status.description:
         return None
     exception_type, sep, _ = status.description.partition(":")
-    new_description = exception_type if sep else ""
-    if new_description == status.description:
+    if not sep or exception_type == status.description:
         return None
-    return Status(status.status_code, new_description)
+    return Status(status.status_code, exception_type)
 
 
 def redact_span(span: ReadableSpan) -> ReadableSpan:
     """Return span with headers, query strings and URL queries in free text removed (see SPEC 7).
 
-    A span carrying db.system (a psycopg query span) additionally has its status description
-    reduced to the bare exception type, and exception.message/exception.stacktrace dropped from
-    any "exception" event: PostgreSQL error messages carry the offending values.
+    Every span additionally has its status description reduced to the bare exception type, and
+    exception.message/exception.stacktrace dropped from any "exception" event: an unhandled error
+    (a PostgreSQL error surfacing on a psycopg query span, or on the request's SERVER span or a
+    job's CONSUMER span once it propagates unhandled) can carry the offending values.
 
     Returns the same object when nothing needs to change, so clean spans cost one attribute scan.
     """
     attributes = _redact_attributes(span.attributes or {})
-    is_db_span = _DB_SYSTEM_ATTRIBUTE in (span.attributes or {})
     events = list(span.events)
     events_changed = False
     for index, event in enumerate(events):
         working = event
         changed = False
-        if is_db_span:
-            db_scrubbed = _drop_db_exception_details(working)
-            if db_scrubbed is not None:
-                working = db_scrubbed
-                changed = True
+        dropped = _drop_exception_details(working)
+        if dropped is not None:
+            working = dropped
+            changed = True
         scrubbed = _scrub_event(working)
         if scrubbed is not None:
             working = scrubbed
@@ -432,10 +435,9 @@ def redact_span(span: ReadableSpan) -> ReadableSpan:
             events[index] = working
             events_changed = True
     status = span.status
-    if is_db_span:
-        db_status = _reduce_db_status_to_exception_type(status)
-        if db_status is not None:
-            status = db_status
+    reduced = _reduce_status_to_exception_type(status)
+    if reduced is not None:
+        status = reduced
     if status.description:
         description = scrub_query_strings(status.description)
         if description != status.description:

@@ -101,7 +101,7 @@ def test_scrub_query_strings_does_not_leak_around_punctuation(text, secret):
     assert secret not in scrubbed
 
 
-def _span(attributes, status=None, events=()):
+def _span(attributes, status=None, events=(), kind=SpanKind.CLIENT):
     ctx = trace.SpanContext(trace_id=1, span_id=2, is_remote=False, trace_flags=trace.TraceFlags(1))
     return ReadableSpan(
         name="s",
@@ -109,7 +109,7 @@ def _span(attributes, status=None, events=()):
         resource=RESOURCE,
         attributes=attributes,
         events=events,
-        kind=SpanKind.CLIENT,
+        kind=kind,
         status=status or Status(StatusCode.UNSET),
         start_time=1,
         end_time=2,
@@ -128,6 +128,9 @@ def test_redact_span_rewrites_urls_drops_headers_and_scrubs_text():
             "http.response.header.set_cookie": ("sid=a",),
             "http.request.method": "POST",
         },
+        # Every span now reduces its status description to the bare exception type (see the
+        # dedicated exception-reduction tests below), so the query string after the colon here is
+        # dropped along with the rest of the text, not merely scrubbed.
         status=Status(StatusCode.ERROR, "ConnectionError: url: /x?token=a"),
         events=[Event("exception", {"exception.message": "url: /x?token=a", "exception.escaped": "False"}, 3)],
     )
@@ -141,8 +144,9 @@ def test_redact_span_rewrites_urls_drops_headers_and_scrubs_text():
         "http.request.method": "POST",
     }
     assert red.status.status_code is StatusCode.ERROR
-    assert red.status.description == "ConnectionError: url: /x?REDACTED"
-    assert dict(red.events[0].attributes)["exception.message"] == "url: /x?REDACTED"
+    assert red.status.description == "ConnectionError"
+    assert "exception.message" not in dict(red.events[0].attributes)
+    assert dict(red.events[0].attributes)["exception.escaped"] == "False"
     assert red.events[0].timestamp == 3
     for field in ("context", "parent", "resource", "kind", "start_time", "end_time", "name"):
         assert getattr(red, field) == getattr(span, field)
@@ -186,23 +190,98 @@ def test_redact_span_reduces_db_error_to_exception_type():
     assert dict(red.attributes) == {"db.system": "postgresql", "db.statement": "INSERT INTO users ..."}
 
 
-def test_redact_db_span_status_description_without_colon_becomes_empty():
+def test_redact_span_reduces_db_error_with_stable_db_system_name_attribute():
+    # db.system.name is the stable DB semconv opt-in attribute; the reduction is not gated on any
+    # particular db attribute at all any more, but this proves the stable-semconv case works too.
+    secret_message = "duplicate key value violates unique constraint\nDETAIL: Key (name)=(secret-value) exists."
+    span = _span(
+        {"db.system.name": "postgresql"},
+        status=Status(StatusCode.ERROR, f"UniqueViolation: {secret_message}"),
+        events=[
+            Event(
+                "exception",
+                {
+                    "exception.type": "UniqueViolation",
+                    "exception.message": secret_message,
+                    "exception.stacktrace": secret_message,
+                },
+                3,
+            )
+        ],
+    )
+    red = otel.redact_span(span)
+    assert red.status.description == "UniqueViolation"
+    (event,) = red.events
+    assert dict(event.attributes) == {"exception.type": "UniqueViolation"}
+    dumped = repr(dict(red.attributes)) + repr(red.status.description) + repr(red.events)
+    assert "secret-value" not in dumped
+
+
+def test_redact_server_span_reduces_db_error_with_no_db_attributes_at_all():
+    # A request's SERVER span (or a job's CONSUMER span) has no db.* attributes, yet an unhandled
+    # DB error surfaces the full error text on it: the reduction must not be gated on span kind or
+    # any particular attribute.
+    secret_message = (
+        'duplicate key value violates unique constraint "users_name_key"\n'
+        "DETAIL: Key (name)=(secret-value) already exists."
+    )
+    span = _span(
+        {"http.request.method": "POST"},
+        status=Status(StatusCode.ERROR, f"IntegrityError: {secret_message}"),
+        events=[
+            Event(
+                "exception",
+                {
+                    "exception.type": "IntegrityError",
+                    "exception.message": secret_message,
+                    "exception.stacktrace": f"Traceback (most recent call last):\n...\n{secret_message}",
+                    "exception.escaped": "True",
+                },
+                3,
+            )
+        ],
+        kind=SpanKind.SERVER,
+    )
+    red = otel.redact_span(span)
+    assert red.status.description == "IntegrityError"
+    dumped = repr(dict(red.attributes)) + repr(red.status.description) + repr(red.events)
+    assert "secret-value" not in dumped
+    (event,) = red.events
+    assert dict(event.attributes) == {"exception.type": "IntegrityError", "exception.escaped": "True"}
+
+
+def test_redact_status_description_without_colon_is_preserved_unchanged():
+    # Plugin-set descriptions such as a bare exception type name have no colon and must survive
+    # untouched; "" would silently hide real information the plugin chose to set.
     span = _span({"db.system": "postgresql"}, status=Status(StatusCode.ERROR, "connection lost"))
     red = otel.redact_span(span)
     assert red.status.status_code is StatusCode.ERROR
-    assert red.status.description == ""
+    assert red.status.description == "connection lost"
 
 
-def test_redact_span_leaves_non_db_exception_events_alone():
-    # Regression guard: only spans carrying db.system get the exception-message/stacktrace drop.
+def test_redact_consumer_span_job_failed_description_is_preserved():
+    span = _span(
+        {"messaging.system": "rq"},
+        status=Status(StatusCode.ERROR, "job failed"),
+        events=(),
+        kind=otel.CONSUMER,
+    )
+    red = otel.redact_span(span)
+    assert red.status.description == "job failed"
+
+
+def test_redact_span_reduces_non_db_exception_events_too():
+    # Previously only spans carrying db.system had exception.message/stacktrace dropped; the rule
+    # now applies to every span, since an unhandled DB error can surface on a SERVER or CONSUMER
+    # span that never carries a db.* attribute at all.
     span = _span(
         {"http.request.method": "GET"},
         status=Status(StatusCode.ERROR, "RuntimeError: boom"),
         events=[Event("exception", {"exception.type": "RuntimeError", "exception.message": "boom"}, 3)],
     )
     red = otel.redact_span(span)
-    assert red.status.description == "RuntimeError: boom"
-    assert dict(red.events[0].attributes) == {"exception.type": "RuntimeError", "exception.message": "boom"}
+    assert red.status.description == "RuntimeError"
+    assert dict(red.events[0].attributes) == {"exception.type": "RuntimeError"}
 
 
 def test_db_span_error_drops_message_and_stacktrace_end_to_end():
@@ -223,6 +302,28 @@ def test_db_span_error_drops_message_and_stacktrace_end_to_end():
     assert secret not in dumped
     assert db_span.status.description == "RuntimeError"
     (event,) = db_span.events
+    assert event.name == "exception"
+    assert "exception.message" not in event.attributes
+    assert "exception.stacktrace" not in event.attributes
+    assert event.attributes["exception.type"] == "RuntimeError"
+
+
+def test_server_span_error_drops_message_and_stacktrace_end_to_end():
+    # Django's middleware exits its span activation with the exception still propagating: the SDK
+    # records the exception and sets the status on the SERVER span itself, not on a db.system span.
+    exporter = InMemorySpanExporter()
+    tracer = _provider(exporter).get_tracer("t")
+    secret = "secret-value"
+    with pytest.raises(RuntimeError), tracer.start_as_current_span("request", kind=SpanKind.SERVER):
+        raise RuntimeError(
+            f'duplicate key value violates unique constraint "users_name_key"\n'
+            f"DETAIL: Key (name)=({secret}) already exists."
+        )
+    (span,) = exporter.get_finished_spans()
+    dumped = repr(span.status.description) + repr(span.events)
+    assert secret not in dumped
+    assert span.status.description == "RuntimeError"
+    (event,) = span.events
     assert event.name == "exception"
     assert "exception.message" not in event.attributes
     assert "exception.stacktrace" not in event.attributes

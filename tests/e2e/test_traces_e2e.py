@@ -3,6 +3,7 @@ API requests produce spans, logs and audit records carry the request's trace id,
 by an edit shares that edit's trace. The requests carry their own traceparent, so each test knows
 its trace id."""
 
+import contextlib
 import json
 import secrets
 import time
@@ -58,6 +59,12 @@ def _wait(predicate, timeout=45):
 
 def _assert_no_secret(trace):
     assert SECRET not in json.dumps([span for _, _, span in trace])
+
+
+def _safe_delete(path, header):
+    """Best-effort cleanup: one failing delete must not stop the others from running."""
+    with contextlib.suppress(requests.RequestException):
+        _call("DELETE", path, header)
 
 
 def test_api_request_produces_a_server_span_with_request_id_and_user(header):
@@ -118,37 +125,38 @@ def test_audit_and_log_records_carry_the_request_trace_id(header):
 
 def test_webhook_fired_by_an_edit_shares_the_edit_trace(header):
     suffix = uuid.uuid4().hex[:8]
-    webhook = _call(
-        "POST",
-        "/api/extras/webhooks/",
-        header,
-        json={
-            "name": f"otel-e2e-{suffix}",
-            "payload_url": f"http://webhook-sink:8080/netbox?token={SECRET}",
-            "http_method": "POST",
-            "http_content_type": "application/json",
-        },
-    ).json()
-    rule = _call(
-        "POST",
-        "/api/extras/event-rules/",
-        header,
-        json={
-            "name": f"otel-e2e-{suffix}",
-            "object_types": ["ipam.prefix"],
-            "event_types": ["object_updated"],
-            "action_type": "webhook",
-            "action_object_type": "extras.webhook",
-            "action_object_id": webhook["id"],
-        },
-    ).json()
-    prefix = _call(
-        "POST",
-        "/api/ipam/prefixes/",
-        header,
-        json={"prefix": f"10.{secrets.randbelow(200) + 20}.{secrets.randbelow(250)}.0/24"},
-    ).json()
+    webhook = rule = prefix = None
     try:
+        webhook = _call(
+            "POST",
+            "/api/extras/webhooks/",
+            header,
+            json={
+                "name": f"otel-e2e-{suffix}",
+                "payload_url": f"http://webhook-sink:8080/netbox?token={SECRET}",
+                "http_method": "POST",
+                "http_content_type": "application/json",
+            },
+        ).json()
+        rule = _call(
+            "POST",
+            "/api/extras/event-rules/",
+            header,
+            json={
+                "name": f"otel-e2e-{suffix}",
+                "object_types": ["ipam.prefix"],
+                "event_types": ["object_updated"],
+                "action_type": "webhook",
+                "action_object_type": "extras.webhook",
+                "action_object_id": webhook["id"],
+            },
+        ).json()
+        prefix = _call(
+            "POST",
+            "/api/ipam/prefixes/",
+            header,
+            json={"prefix": f"10.{secrets.randbelow(200) + 20}.{secrets.randbelow(250)}.0/24"},
+        ).json()
         trace_id, traceparent = _traceparent()
         _call("PATCH", f"/api/ipam/prefixes/{prefix['id']}/", header, traceparent, json={"description": suffix})
 
@@ -186,6 +194,11 @@ def test_webhook_fired_by_an_edit_shares_the_edit_trace(header):
         assert record_attr(call, "http.response.status_code") == 204
         _assert_no_secret(_trace(trace_id))
     finally:
-        _call("DELETE", f"/api/ipam/prefixes/{prefix['id']}/", header)
-        _call("DELETE", f"/api/extras/event-rules/{rule['id']}/", header)
-        _call("DELETE", f"/api/extras/webhooks/{webhook['id']}/", header)
+        # Clean up only what was actually created, in reverse order, and don't let one failing
+        # delete skip the others (a partial failure above must not leak every prior object).
+        if prefix is not None:
+            _safe_delete(f"/api/ipam/prefixes/{prefix['id']}/", header)
+        if rule is not None:
+            _safe_delete(f"/api/extras/event-rules/{rule['id']}/", header)
+        if webhook is not None:
+            _safe_delete(f"/api/extras/webhooks/{webhook['id']}/", header)

@@ -7,10 +7,11 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import SpanKind, StatusCode
 from rq.queue import Queue
 from rq.worker.base import BaseWorker
-from rq.worker.worker_classes import Worker
+from rq.worker.worker_classes import SimpleWorker, Worker
 
 from netbox_opentelemetry_plugin import bootstrap, otel
 from netbox_opentelemetry_plugin.modules import rq as rq_module
+from tests.otel_helpers import RecordingMetricExporter, data_points
 
 USER = {"exporter": {"endpoint": "http://collector:4318"}, "logs": {"loggers": ["t.rq"]}}
 TRACES = {**USER, "traces": {"enabled": True, "instrument": []}}
@@ -27,7 +28,9 @@ def stubs(monkeypatch):
     real_perform = BaseWorker.__dict__["perform_job"]
     real_fork = Worker.__dict__["fork_work_horse"]
     real_enqueue = Queue.__dict__["enqueue_job"]
-    calls = {"perform": [], "fork": [], "enqueue": []}
+    real_execute = Worker.__dict__["execute_job"]
+    real_simple_execute = SimpleWorker.__dict__["execute_job"]
+    calls = {"perform": [], "fork": [], "enqueue": [], "execute": []}
 
     def perform_job(self, job, queue):
         calls["perform"].append(job)
@@ -42,7 +45,14 @@ def stubs(monkeypatch):
         calls["enqueue"].append(dict(job.meta) if isinstance(job.meta, dict) else job.meta)
         return job
 
+    def execute_job(self, job, queue):
+        calls["execute"].append(job)
+        if getattr(job, "explode", False):
+            raise OSError("waitpid failed")
+
     BaseWorker.perform_job = perform_job
+    Worker.execute_job = execute_job
+    SimpleWorker.execute_job = execute_job
     Worker.fork_work_horse = fork_work_horse
     Queue.enqueue_job = enqueue_job
     exporter = InMemoryLogRecordExporter()
@@ -56,6 +66,8 @@ def stubs(monkeypatch):
     BaseWorker.perform_job = real_perform
     Worker.fork_work_horse = real_fork
     Queue.enqueue_job = real_enqueue
+    Worker.execute_job = real_execute
+    SimpleWorker.execute_job = real_simple_execute
 
 
 @pytest.fixture
@@ -87,10 +99,21 @@ def _flush(spans):
 
 
 class FakeJob:
-    def __init__(self, func_name="app.tasks.work", meta=None, kwargs=None, broken=False, job_id="j-1"):
+    def __init__(
+        self,
+        func_name="app.tasks.work",
+        meta=None,
+        kwargs=None,
+        broken=False,
+        job_id="j-1",
+        instance=None,
+        status="finished",
+        status_error=None,
+    ):
         self.id = job_id
         self.meta = {} if meta is None else meta
         self._func_name, self._kwargs, self._broken = func_name, kwargs or {}, broken
+        self._instance, self._status, self._status_error = instance, status, status_error
 
     @property
     def func_name(self):
@@ -103,6 +126,17 @@ class FakeJob:
         if self._broken:
             raise ValueError("cannot unpickle")
         return self._kwargs
+
+    @property
+    def instance(self):
+        if self._broken:
+            raise ValueError("cannot unpickle")
+        return self._instance
+
+    def get_status(self, refresh=True):
+        if self._status_error is not None:
+            raise self._status_error
+        return SimpleNamespace(value=self._status)
 
 
 class FakeWorker:
@@ -211,10 +245,16 @@ def test_real_rq_signatures_match():
     import inspect
 
     from rq.worker.base import BaseWorker as RealBase
+    from rq.worker.worker_classes import SimpleWorker as RealSimple
     from rq.worker.worker_classes import Worker as RealWorker
 
-    assert tuple(inspect.signature(RealBase.__dict__["perform_job"]).parameters) == rq_module.EXPECTED_PARAMS
-    assert tuple(inspect.signature(RealWorker.__dict__["fork_work_horse"]).parameters) == rq_module.EXPECTED_PARAMS
+    for cls, attr in (
+        (RealBase, "perform_job"),
+        (RealWorker, "fork_work_horse"),
+        (RealWorker, "execute_job"),
+        (RealSimple, "execute_job"),
+    ):
+        assert tuple(inspect.signature(cls.__dict__[attr]).parameters) == rq_module.WORKER_PARAMS
 
 
 def test_enqueue_stores_trace_context_inside_a_span(stubs, spans):
@@ -449,3 +489,259 @@ def test_real_rq_enqueue_job_signature_matches():
 
     assert tuple(inspect.signature(Queue.__dict__["enqueue_job"]).parameters) == rq_module.ENQUEUE_PARAMS
     assert isinstance(inspect.getattr_static(BaseWorker, "is_horse"), property)
+
+
+METRICS = {**USER, "metrics": {"enabled": True, "export_interval": 3600}}
+NO_PATCH = {**METRICS, "rq": {"patch_worker": False}}
+
+
+@pytest.fixture
+def metrics(monkeypatch):
+    exporter = RecordingMetricExporter()
+    monkeypatch.setattr(otel, "build_metric_exporter", lambda cfg: exporter)
+    return exporter
+
+
+def _collect(exporter):
+    """Export the current cumulative state and return that batch."""
+    count = len(exporter.batches)
+    bootstrap.force_flush(2.0)
+    return exporter.batches[-1] if len(exporter.batches) > count else None
+
+
+def _job_points(exporter, name):
+    return {
+        (
+            p.attributes["messaging.destination.name"],
+            p.attributes["code.function.name"],
+            p.attributes["netbox.rq.job.outcome"],
+        ): p
+        for p in data_points(_collect(exporter), name)
+    }
+
+
+class ScriptJob:
+    """Stands in for a NetBox JobRunner subclass (jobs enqueue the classmethod `handle`)."""
+
+
+def test_job_function_qualifies_methods_and_keeps_functions():
+    assert rq_module.job_function(FakeJob(func_name="extras.webhooks.send_webhook")) == "extras.webhooks.send_webhook"
+    assert rq_module.job_function(FakeJob(func_name="handle", instance=ScriptJob)) == f"{__name__}.ScriptJob.handle"
+    assert rq_module.job_function(FakeJob(func_name="run", instance=ScriptJob())) == f"{__name__}.ScriptJob.run"
+    assert rq_module.job_function(FakeJob(broken=True)) is None
+    script = FakeJob(func_name="handle", instance=ScriptJob)
+    assert rq_module.job_span_name(script) == f"rq.job {__name__}.ScriptJob.handle"
+
+
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        ("finished", "finished"),
+        ("failed", "failed"),
+        ("stopped", "stopped"),
+        ("canceled", "canceled"),
+        ("queued", "retried"),
+        ("scheduled", "retried"),
+        ("started", "unknown"),
+        ("something-new", "unknown"),
+    ],
+)
+def test_job_outcome_maps_rq_status(status, outcome):
+    assert rq_module.job_outcome(FakeJob(status=status)) == outcome
+
+
+def test_job_outcome_is_unknown_when_the_lookup_fails():
+    assert rq_module.job_outcome(FakeJob(status_error=ConnectionError("redis down"))) == "unknown"
+
+
+def test_execute_job_records_duration_and_count_in_the_worker_parent(stubs, metrics):
+    bootstrap.install(METRICS, env={}, argv=ARGV_RQ)
+    queue = SimpleNamespace(name="default")
+    Worker.execute_job(SimpleNamespace(), FakeJob(func_name="app.tasks.work"), queue)
+    Worker.execute_job(SimpleNamespace(), FakeJob(func_name="app.tasks.work", status="failed"), queue)
+    counts = _job_points(metrics, rq_module.JOBS)
+    assert counts[("default", "app.tasks.work", "finished")].value == 1
+    assert counts[("default", "app.tasks.work", "failed")].value == 1
+    durations = _job_points(metrics, rq_module.JOB_DURATION)
+    assert durations[("default", "app.tasks.work", "finished")].count == 1
+
+
+def test_simple_worker_execute_job_is_wrapped_too(stubs, metrics):
+    bootstrap.install(METRICS, env={}, argv=ARGV_RQ)
+    SimpleWorker.execute_job(SimpleNamespace(), FakeJob(), SimpleNamespace(name="low"))
+    assert ("low", "app.tasks.work", "finished") in _job_points(metrics, rq_module.JOBS)
+
+
+def test_a_raising_execute_job_is_still_counted_and_propagates(stubs, metrics):
+    bootstrap.install(METRICS, env={}, argv=ARGV_RQ)
+    job = FakeJob(status="started")
+    job.explode = True
+    with pytest.raises(OSError):
+        Worker.execute_job(SimpleNamespace(), job, SimpleNamespace(name="default"))
+    assert ("default", "app.tasks.work", "unknown") in _job_points(metrics, rq_module.JOBS)
+
+
+def test_undeserialisable_job_is_counted_as_unknown_function(stubs, metrics):
+    bootstrap.install(METRICS, env={}, argv=ARGV_RQ)
+    Worker.execute_job(SimpleNamespace(), FakeJob(broken=True), SimpleNamespace(name="default"))
+    assert ("default", "unknown", "finished") in _job_points(metrics, rq_module.JOBS)
+
+
+def test_metric_recording_failure_never_breaks_the_worker(stubs, metrics, monkeypatch, caplog):
+    bootstrap.install(METRICS, env={}, argv=ARGV_RQ)
+    monkeypatch.setattr(rq_module, "job_outcome", lambda job: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        Worker.execute_job(SimpleNamespace(), FakeJob(), SimpleNamespace(name="default"))
+        Worker.execute_job(SimpleNamespace(), FakeJob(), SimpleNamespace(name="default"))
+    assert len(stubs["execute"]) == 2
+    assert len([r for r in caplog.records if "job metrics" in r.getMessage()]) == 1
+
+
+def test_no_job_metrics_without_metrics_or_with_patch_worker_off(stubs, metrics):
+    bootstrap.install(USER, env={}, argv=ARGV_RQ)
+    assert not getattr(Worker.execute_job, rq_module.WRAPPED_ATTR, False)
+    bootstrap.shutdown()
+    bootstrap._state = None
+    bootstrap.install(NO_PATCH, env={}, argv=ARGV_RQ)
+    assert not getattr(Worker.execute_job, rq_module.WRAPPED_ATTR, False)
+
+
+def test_web_role_gets_no_job_metrics(stubs, metrics):
+    bootstrap.install(METRICS, env={}, argv=ARGV_WEB)
+    assert not getattr(Worker.execute_job, rq_module.WRAPPED_ATTR, False)
+
+
+class FakeQueue:
+    def __init__(self, name, count=0, error=None):
+        self.name, self._count, self._error = name, count, error
+
+    @property
+    def count(self):
+        if self._error is not None:
+            raise self._error
+        return self._count
+
+
+def _install_with_queues(monkeypatch, source):
+    # The SDK keeps the first observable instrument per name and scope, so the gauge under test is
+    # the one bootstrap's own RqModule registers; it reads rq_module.netbox_queues at collection time.
+    monkeypatch.setattr(rq_module, "netbox_queues", source)
+    bootstrap.install(NO_PATCH, env={}, argv=ARGV_RQ)
+
+
+def _depths(exporter):
+    return {
+        p.attributes["messaging.destination.name"]: p.value
+        for p in data_points(_collect(exporter), rq_module.QUEUE_DEPTH)
+    }
+
+
+def test_queue_depth_reports_every_configured_queue(stubs, metrics, monkeypatch):
+    _install_with_queues(monkeypatch, lambda: [FakeQueue("high", 0), FakeQueue("default", 3)])
+    assert _depths(metrics) == {"high": 0, "default": 3}
+
+
+def test_queue_depth_skips_a_failing_queue_and_warns_once(stubs, metrics, monkeypatch, caplog):
+    _install_with_queues(
+        monkeypatch, lambda: [FakeQueue("high", error=ConnectionError("redis down")), FakeQueue("low", 2)]
+    )
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        assert _depths(metrics) == {"low": 2}
+        assert _depths(metrics) == {"low": 2}
+    assert len([r for r in caplog.records if "queue depth" in r.getMessage()]) == 1
+
+
+def test_queue_source_failure_yields_nothing_and_does_not_break_export(stubs, metrics, monkeypatch, caplog):
+    _install_with_queues(monkeypatch, lambda: (_ for _ in ()).throw(ImportError("no django_rq")))
+    ctx = bootstrap._state.context
+    ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes").add(1)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        batch = _collect(metrics)
+        _collect(metrics)
+    assert data_points(batch, rq_module.QUEUE_DEPTH) == []
+    assert data_points(batch, "netbox.object_changes")
+    assert len([r for r in caplog.records if "could not list the RQ queues" in r.getMessage()]) == 1
+
+
+def test_default_queue_source_without_django_rq_is_caught(stubs, metrics, caplog):
+    # Unit tests have no django_rq: the real netbox_queues raises ImportError inside the callback.
+    bootstrap.install(NO_PATCH, env={}, argv=ARGV_RQ)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        assert _depths(metrics) == {}
+    assert len([r for r in caplog.records if "could not list the RQ queues" in r.getMessage()]) == 1
+
+
+def test_queues_are_built_once_per_process(stubs, metrics, monkeypatch):
+    built = []
+
+    def source():
+        built.append(1)
+        return [FakeQueue("default", 1)]
+
+    _install_with_queues(monkeypatch, source)
+    _collect(metrics)
+    _collect(metrics)
+    assert built == [1]
+    # A forked scheduler child. Bootstrap's force_flush skips a PID it did not install in, so the
+    # export thread's call into the gauge callback is made directly.
+    (module,) = [m for m in bootstrap._state.modules if m.name == "rq"]
+    # Scoped, so bootstrap.shutdown() in the fixture teardown runs with the real PID.
+    with monkeypatch.context() as patch:
+        patch.setattr(rq_module.os, "getpid", lambda: -1)
+        assert [o.value for o in module._observe_queue_depth(None)] == [1]
+    assert built == [1, 1]
+
+
+def test_queue_depth_stops_after_shutdown(stubs, metrics, monkeypatch):
+    _install_with_queues(monkeypatch, lambda: [FakeQueue("default", 1)])
+    assert _depths(metrics) == {"default": 1}
+    (module,) = [m for m in bootstrap._state.modules if m.name == "rq"]
+    module.shutdown()
+    assert _depths(metrics) == {}
+
+
+def test_install_registers_queue_depth_in_rqworker_only(stubs, metrics, monkeypatch):
+    registered = []
+    monkeypatch.setattr(rq_module.RqModule, "_register_queue_depth", lambda self, ctx: registered.append(ctx.role))
+    bootstrap.install(NO_PATCH, env={}, argv=ARGV_RQ)
+    bootstrap.shutdown()
+    bootstrap._state = None
+    bootstrap.install({**METRICS, "traces": {"enabled": True, "instrument": []}}, env={}, argv=ARGV_WEB)
+    assert registered == ["rqworker"]
+
+
+def test_metric_names_are_allowlisted():
+    for name in (rq_module.JOB_DURATION, rq_module.JOBS, rq_module.QUEUE_DEPTH):
+        assert name in otel.METRIC_ALLOWLIST
+
+
+def test_job_span_does_not_push_a_handler_when_exc_handlers_is_not_a_list(stubs, spans):
+    class TupleWorker(FakeWorker):
+        def __init__(self):
+            self._exc_handlers = ()
+            self.pushed = []
+
+        def push_exc_handler(self, handler):
+            self.pushed.append(handler)
+
+    worker = TupleWorker()
+    bootstrap.install(TRACES, env={}, argv=ARGV_RQ)
+    ctx = bootstrap._state.context
+    with rq_module._JobSpan(ctx, worker, FakeJob(), SimpleNamespace(name="q")):
+        pass
+    # Pushed without a way to pop it again, the handler would outlive the job span.
+    assert worker.pushed == []
+    assert len(_flush(spans)) == 1
+
+
+def test_job_span_ends_even_when_handler_removal_fails(stubs, spans):
+    class Handlers(list):
+        def remove(self, item):
+            raise RuntimeError("cannot remove")
+
+    worker = FakeWorker()
+    worker._exc_handlers = Handlers()
+    bootstrap.install(TRACES, env={}, argv=ARGV_RQ)
+    with rq_module._JobSpan(bootstrap._state.context, worker, FakeJob(), SimpleNamespace(name="q")):
+        pass
+    assert len(_flush(spans)) == 1

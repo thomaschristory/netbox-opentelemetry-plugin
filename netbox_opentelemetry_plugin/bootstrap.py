@@ -23,6 +23,7 @@ from .modules.audit import AuditModule
 from .modules.base import Context, Module
 from .modules.logs import LogsModule
 from .modules.rq import RqModule
+from .modules.runtime import RuntimeModule
 from .modules.traces import TracesModule
 from .version import __version__
 
@@ -502,6 +503,8 @@ def _candidate_modules(ctx: Context) -> list[Module]:
     # RQ: worker wraps in the rqworker process; the enqueue wrap wherever spans are recorded.
     if ctx.role == ROLE_RQWORKER or ctx.tracer_provider is not None:
         modules.append(RqModule())
+    if ctx.meter_provider is not None:
+        modules.append(RuntimeModule())
     return modules
 
 

@@ -1,3 +1,4 @@
+import contextlib
 import http.server
 import logging
 import threading
@@ -5,26 +6,50 @@ import threading
 import pytest
 import requests
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind
 
 from netbox_opentelemetry_plugin import conf, otel
+from netbox_opentelemetry_plugin.modules import traces as traces_module
 from netbox_opentelemetry_plugin.modules.base import Context
-from netbox_opentelemetry_plugin.modules.traces import TracesModule, instrument_kwargs
+from netbox_opentelemetry_plugin.modules.traces import TracesModule, instrument_kwargs, instrumentations
+from tests.otel_helpers import data_points, metric_names
 
 RESOURCE = Resource.create({"service.name": "t"})
 
 
-def _ctx(instrument=("django", "psycopg", "redis", "requests"), excluded=("/static/", "/api/status/")):
+def _ctx(
+    instrument=("django", "psycopg", "redis", "requests"),
+    excluded=("/static/", "/api/status/"),
+    meter_provider=None,
+    traces_on=True,
+):
     settings = conf.Settings(
-        enabled=True, traces=conf.TracesConfig(enabled=True, instrument=instrument, excluded_urls=excluded)
+        enabled=True,
+        traces=conf.TracesConfig(enabled=traces_on, instrument=instrument, excluded_urls=excluded),
+        metrics=conf.MetricsConfig(enabled=meter_provider is not None),
     )
     exporter = InMemorySpanExporter()
     provider = otel.SwitchableTracerProvider(
         otel.build_tracer_provider(RESOURCE, exporter, otel.build_sampler("always_on", 1.0), synchronous=True)
     )
-    return Context(settings=settings, role="web", resource=RESOURCE, tracer_provider=provider), exporter
+    return (
+        Context(
+            settings=settings,
+            role="web",
+            resource=RESOURCE,
+            tracer_provider=provider if traces_on else None,
+            meter_provider=meter_provider,
+        ),
+        exporter,
+    )
+
+
+def _meter():
+    reader = InMemoryMetricReader()
+    return otel.SwitchableMeterProvider(otel.build_meter_provider(RESOURCE, [reader])), reader
 
 
 class FakeInstrumentor:
@@ -124,6 +149,75 @@ def test_install_without_provider_does_nothing(fakes):
     ctx.tracer_provider = None
     TracesModule().install(ctx)
     assert fakes["django"].kwargs is None
+
+
+def test_metrics_only_instruments_django_and_requests_with_a_noop_tracer():
+    meter, _ = _meter()
+    ctx, _ = _ctx(traces_on=False, meter_provider=meter)
+    assert instrumentations(ctx) == ("django", "requests")
+    for name in ("django", "requests"):
+        kwargs = instrument_kwargs(name, ctx)
+        assert kwargs["meter_provider"] is meter
+        assert not isinstance(kwargs["tracer_provider"], otel.SwitchableTracerProvider)
+
+
+def test_traces_and_metrics_union_keeps_traces_instrument_order():
+    meter, _ = _meter()
+    ctx, _ = _ctx(instrument=("psycopg", "requests"), meter_provider=meter)
+    assert instrumentations(ctx) == ("psycopg", "requests", "django")
+    assert instrument_kwargs("requests", ctx)["tracer_provider"] is ctx.tracer_provider
+    # django is instrumented for metrics only: not in traces.instrument, so no spans.
+    assert instrument_kwargs("django", ctx)["tracer_provider"] is not ctx.tracer_provider
+
+
+def test_traces_only_keeps_the_noop_meter():
+    ctx, _ = _ctx()
+    assert instrumentations(ctx) == ("django", "psycopg", "redis", "requests")
+    assert not isinstance(instrument_kwargs("django", ctx)["meter_provider"], otel.SwitchableMeterProvider)
+
+
+def test_enabled_follows_traces_or_metrics():
+    module = TracesModule()
+    assert module.name == "instrumentation"
+    assert module.enabled(conf.Settings(enabled=True, metrics=conf.MetricsConfig(enabled=True))) is True
+    assert module.enabled(conf.Settings(enabled=True)) is False
+
+
+def test_install_with_metrics_only_applies_http_instrumentors(fakes):
+    fakes.update({name: FakeInstrumentor() for name in ("django", "psycopg", "redis", "requests")})
+    meter, _ = _meter()
+    ctx, _ = _ctx(traces_on=False, meter_provider=meter)
+    TracesModule().install(ctx)
+    assert fakes["django"].kwargs is not None and fakes["requests"].kwargs is not None
+    assert fakes["psycopg"].kwargs is None and fakes["redis"].kwargs is None
+
+
+def test_real_requests_instrumentation_records_client_duration_with_allowlisted_attributes(local_server, monkeypatch):
+    # requests only: the Django instrumentor needs configured Django settings (covered in Task 7).
+    monkeypatch.setattr(traces_module, "HTTP_METRIC_INSTRUMENTATIONS", ("requests",))
+    meter, reader = _meter()
+    ctx, _ = _ctx(instrument=(), traces_on=False, meter_provider=meter)
+    module = TracesModule()
+    module.install(ctx)
+    try:
+        requests.get(f"{local_server}/hook?token=s3cret", timeout=5)
+        with contextlib.suppress(requests.RequestException):
+            requests.get("http://127.0.0.1:9/refused", timeout=2)
+    finally:
+        module.shutdown()
+    data = reader.get_metrics_data()
+    points = data_points(data, "http.client.request.duration")
+    assert points
+    for point in points:
+        assert set(point.attributes) <= {
+            "http.request.method",
+            "server.address",
+            "http.response.status_code",
+            "error.type",
+        }
+    assert any(p.attributes.get("error.type") for p in points)
+    assert "s3cret" not in repr(data)
+    assert metric_names(data) == {"http.client.request.duration"}
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):

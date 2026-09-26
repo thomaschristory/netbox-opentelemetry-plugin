@@ -325,7 +325,7 @@ def test_traces_install_builds_an_owned_switchable_provider(exporter, span_expor
     ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
     assert isinstance(ctx.tracer_provider, otel.SwitchableTracerProvider)
     assert bootstrap._state.owns_tracer_provider is True
-    assert [m.name for m in bootstrap._state.modules] == ["logs", "audit", "traces", "rq"]
+    assert [m.name for m in bootstrap._state.modules] == ["logs", "audit", "instrumentation", "rq"]
     with ctx.tracer_provider.get_tracer("t").start_as_current_span("s"):
         pass
     assert bootstrap.force_flush(2.0) is True
@@ -343,7 +343,7 @@ def test_traces_off_by_default_installs_no_tracing(exporter):
 def test_management_commands_get_no_traces(exporter, span_exporter, argv):
     ctx = bootstrap.install(TRACES_USER, env={}, argv=argv)
     assert ctx.tracer_provider is None
-    assert "traces" not in [m.name for m in bootstrap._state.modules]
+    assert "instrumentation" not in [m.name for m in bootstrap._state.modules]
 
 
 def test_rqworker_gets_traces(exporter, span_exporter):
@@ -561,3 +561,15 @@ def test_describe_redacts_metric_exporter_headers():
     user = {"exporter": {"endpoint": "http://c:4318", "headers": {"k": "s3cret-metrics"}}, "metrics": {"enabled": True}}
     settings = conf.resolve(user, {})
     assert "s3cret-metrics" not in bootstrap._describe(RuntimeError("header s3cret-metrics rejected"), settings)
+
+
+def test_runtime_module_is_a_candidate_only_with_metrics(exporter, metric_exporter, monkeypatch):
+    from netbox_opentelemetry_plugin.modules.runtime import RuntimeModule
+
+    monkeypatch.setattr(RuntimeModule, "install", lambda self, ctx: None)
+    bootstrap.install({**METRICS_USER, "metrics": {**METRICS_USER["metrics"], "runtime": True}}, env={}, argv=ARGV_WEB)
+    assert any(m.name == "runtime" for m in bootstrap._state.modules)
+    bootstrap.shutdown()
+    bootstrap._state = None
+    bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    assert not any(m.name == "runtime" for m in bootstrap._state.modules)

@@ -150,7 +150,7 @@ def test_include_data_loads_at_commit_time_and_filters():
     ctx, exporter = _ctx(include_data=True, exclude=("description",))
     loaded_calls = []
 
-    def load_data(pks):
+    def load_data(alias, pks):
         loaded_calls.append(sorted(pks))
         return {
             pk: ({"description": "old", "status": "active"}, {"description": "new", "status": "reserved"}) for pk in pks
@@ -176,7 +176,7 @@ def test_batched_load_data_is_called_once_for_all_pending_pks_in_one_commit():
     ctx, exporter = _ctx(include_data=True, exclude=())
     calls = []
 
-    def load_data(pks):
+    def load_data(alias, pks):
         calls.append(sorted(pks))
         return {pk: (None, {"n": pk}) for pk in pks}
 
@@ -200,10 +200,40 @@ def test_batched_load_data_is_called_once_for_all_pending_pks_in_one_commit():
     assert seen == set(pks)
 
 
+def test_include_data_loads_are_scoped_to_the_database_alias():
+    # A pk can exist on more than one database alias (netbox-branching writes ObjectChange to a
+    # branch's own alias). Each alias's change must be loaded from, and attached with, that
+    # alias's own data, not another alias's data for the same pk.
+    ctx, exporter = _ctx(include_data=True, exclude=())
+    calls = []
+
+    def load_data(alias, pks):
+        calls.append((alias, sorted(pks)))
+        return {pk: (None, {"alias": alias, "n": pk}) for pk in pks}
+
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks.append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    receiver(sender=None, instance=_change(pk=42), created=True, using="default")
+    receiver(sender=None, instance=_change(pk=42), created=True, using="branch-1")
+    for callback in callbacks:
+        callback()
+
+    assert sorted(calls) == [("branch-1", [42]), ("default", [42])]
+    records = exporter.get_finished_logs()
+    assert len(records) == 2
+    by_alias = {json.loads(r.log_record.attributes["netbox.change.postchange_data"])["alias"]: r for r in records}
+    assert set(by_alias) == {"default", "branch-1"}
+
+
 def test_missing_pk_in_loaded_data_yields_no_data_attributes():
     ctx, exporter = _ctx(include_data=True, exclude=())
 
-    def load_data(pks):
+    def load_data(alias, pks):
         return {}  # the row is gone (for example a concurrent delete)
 
     callbacks = []
@@ -227,7 +257,7 @@ def test_rolled_back_pks_are_cleared_from_pending_on_the_next_load():
     ctx, exporter = _ctx(include_data=True, exclude=())
     calls = []
 
-    def load_data(pks):
+    def load_data(alias, pks):
         calls.append(sorted(pks))
         return {pk: (None, {"n": pk}) for pk in pks if pk != 999}
 
@@ -264,7 +294,7 @@ def test_non_json_serializable_data_warns_and_emits_nothing(caplog):
     class Unserializable:
         pass
 
-    def load_data(pks):
+    def load_data(alias, pks):
         return {pk: (None, {"bad": Unserializable()}) for pk in pks}
 
     callbacks = []
@@ -285,7 +315,7 @@ def test_non_json_serializable_data_warns_and_emits_nothing(caplog):
 def test_full_attribute_set_with_include_data_for_update():
     ctx, exporter = _ctx(include_data=True, exclude=())
 
-    def load_data(pks):
+    def load_data(alias, pks):
         return {pk: ({"status": "active"}, {"status": "reserved"}) for pk in pks}
 
     callbacks = []
@@ -360,7 +390,7 @@ def test_failures_never_raise_and_warn_once(caplog):
 def test_commit_time_failure_never_raises_and_warns_once(caplog):
     ctx, exporter = _ctx(include_data=True)
 
-    def broken_load(pks):
+    def broken_load(alias, pks):
         raise RuntimeError("db down")
 
     callbacks = []

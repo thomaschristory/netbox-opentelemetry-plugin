@@ -144,45 +144,53 @@ def make_receiver(ctx: Context, *, on_commit, label_for, load_data):
             # Type name only: exception text could contain object data.
             logger.warning("OpenTelemetry: audit record failed: %s", type(exc).__name__)
 
-    def pending() -> set[int]:
-        pks = getattr(local, "pending", None)
-        if pks is None:
-            pks = set()
-            local.pending = pks
-        return pks
+    def pending() -> set[tuple[str, int]]:
+        keys = getattr(local, "pending", None)
+        if keys is None:
+            keys = set()
+            local.pending = keys
+        return keys
 
-    def cache() -> dict[int, tuple]:
+    def cache() -> dict[tuple[str, int], tuple]:
         loaded = getattr(local, "cache", None)
         if loaded is None:
             loaded = {}
             local.cache = loaded
         return loaded
 
-    def load(pk: int):
-        """Return this pk's (pre, post) data, batch-loading every pending pk on first use.
+    def load(alias: str, pk: int):
+        """Return this (alias, pk)'s (pre, post) data, batch-loading every pending key on first use.
 
         The first commit callback in a transaction pays for one batched load of everything
-        already pending (every change saved earlier in the same transaction); later callbacks in
-        that same transaction find their data already cached. A pk left over from a transaction
-        that rolled back (its post_save ran, but on_commit never called back) is requested again
-        here, found missing, and dropped from `pending` regardless, so it cannot accumulate.
+        already pending (every change saved earlier in the same transaction, grouped by the
+        database alias each was written to); later callbacks in that same transaction find their
+        data already cached. A key left over from a transaction that rolled back (its post_save
+        ran, but on_commit never called back) is requested again here, found missing, and dropped
+        from `pending` regardless, so it cannot accumulate. Keying on (alias, pk) rather than pk
+        alone keeps a pk that exists on two aliases (for example a NetBox-branching branch and the
+        default database) from picking up the wrong alias's data.
         """
-        pks = list(pending())
-        if pks:
-            found: dict[int, tuple] = {}
-            for chunk in _chunks(pks, LOAD_CHUNK_SIZE):
-                found.update(load_data(chunk))
+        keys = list(pending())
+        if keys:
+            by_alias: dict[str, list[int]] = {}
+            for key_alias, key_pk in keys:
+                by_alias.setdefault(key_alias, []).append(key_pk)
+            found: dict[tuple[str, int], tuple] = {}
+            for key_alias, pks in by_alias.items():
+                for chunk in _chunks(pks, LOAD_CHUNK_SIZE):
+                    for loaded_pk, data in load_data(key_alias, chunk).items():
+                        found[(key_alias, loaded_pk)] = data
             cache().update(found)
-            pending().difference_update(pks)
-        return cache().pop(pk, None)
+            pending().difference_update(keys)
+        return cache().pop((alias, pk), None)
 
-    def emit(snap: ChangeSnapshot) -> None:
+    def emit(snap: ChangeSnapshot, alias: str) -> None:
         try:
             provider = ctx.logger_provider
             cfg = ctx.settings.audit
             if provider is None or not cfg.enabled:
                 return
-            data = load(snap.pk) if cfg.include_data and load_data is not None else None
+            data = load(alias, snap.pk) if cfg.include_data and load_data is not None else None
             otel.emit_event(
                 provider,
                 AUDIT_SCOPE,
@@ -201,10 +209,11 @@ def make_receiver(ctx: Context, *, on_commit, label_for, load_data):
             # (loading a fixture) never runs inside NetBox's own change-logging transaction.
             return
         try:
+            alias = kwargs.get("using") or "default"
             snap = snapshot(instance, label_for)
             if ctx.settings.audit.include_data:
-                pending().add(snap.pk)
-            on_commit(lambda: emit(snap), using=kwargs.get("using"))
+                pending().add((alias, snap.pk))
+            on_commit(lambda: emit(snap, alias), using=kwargs.get("using"))
         except Exception as exc:
             warn_once(exc)
 
@@ -234,18 +243,16 @@ class AuditModule:
             content_type = ContentType.objects.get_for_id(content_type_id)
             return f"{content_type.app_label}.{content_type.model}"
 
-        def load_data(pks: list[int]) -> dict[int, tuple]:
-            result: dict[int, tuple] = {}
-            for chunk in _chunks(list(pks), LOAD_CHUNK_SIZE):
-                result.update(
-                    {
-                        pk: (pre, post)
-                        for pk, pre, post in ObjectChange.objects.filter(pk__in=chunk).values_list(
-                            "pk", "prechange_data", "postchange_data"
-                        )
-                    }
-                )
-            return result
+        def load_data(alias: str, pks: list[int]) -> dict[int, tuple]:
+            # Read from the alias the change was written to (netbox-branching writes ObjectChange
+            # to a branch's own alias via router.db_for_write); chunking of up to LOAD_CHUNK_SIZE
+            # pks per query happens once, in make_receiver's load(), not here.
+            return {
+                pk: (pre, post)
+                for pk, pre, post in ObjectChange.objects.using(alias)
+                .filter(pk__in=pks)
+                .values_list("pk", "prechange_data", "postchange_data")
+            }
 
         receiver = make_receiver(ctx, on_commit=transaction.on_commit, label_for=label_for, load_data=load_data)
         post_save.connect(receiver, sender=ObjectChange, dispatch_uid=DISPATCH_UID, weak=False)

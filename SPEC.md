@@ -203,6 +203,7 @@ Validation:
   - `enduser.id` (str, the change's `user_name`): only when non-empty.
   - With `audit.include_data`: `netbox.change.prechange_data` and `netbox.change.postchange_data`, each a JSON string (`json.dumps(..., sort_keys=True)`) of the stored value filtered recursively by `exclude_fields` (case-insensitive substring match on keys), only when that stored value is not null.
 - With `audit.include_data`, the pre/post data is read from the database at commit time rather than from the `post_save` instance, batched per thread (one query per up to 1000 pending changes, not one query per change). This is what lets a later, same-request update to `postchange_data` (the M2M case above) reach the record that was already queued for that change.
+- `ObjectChange` rows are emitted regardless of which database alias they were written to, including a netbox-branching branch's own alias (NetBox picks the alias with `router.db_for_write`). With `audit.include_data`, that data is read back from the same alias the change was written to, batched separately per alias, so a pk that exists on more than one alias never picks up another alias's data.
 - Never raises into NetBox: the receiver and the commit callback each catch every exception. On failure, one warning is logged per process, naming only the exception type (never its message, which could contain object data).
 
 Known limitations:

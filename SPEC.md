@@ -210,6 +210,7 @@ Known limitations:
 - If NetBox updates an M2M change record in a later transaction than the one that created it, the data sent with the first record does not include that later update. This only matters with `include_data`; same-transaction M2M updates are covered above.
 - The log pipeline buffers up to 20,000 records per process while audit is on. A single commit larger than that can drop records, and the SDK reports this only on its own logger, which the plugin does not export.
 - When a `LoggerProvider` configured outside the plugin is reused (4.1's provider detection), its queue is not resized; the 20,000 figure above applies only to a provider the plugin builds itself.
+- With `include_data`, a record can grow large for an object with big JSON fields. Most Collectors reject a request above their configured body size limit, dropping the whole batch that record was in, not just that record. Keep `include_data` off, or exclude large fields such as `config_context` and `local_context_data` in `audit.exclude_fields`.
 
 ### 6.3 Traces
 - Django: one span per request, named from the route template. The plugin middleware adds `netbox.request_id` and `enduser.id`.

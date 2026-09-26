@@ -531,3 +531,12 @@ def test_force_flush_on_switchable_is_thread_safe_enough():
     for t in threads:
         t.join(5)
     assert not any(t.is_alive() for t in threads)
+
+
+def test_clean_error_span_is_returned_unchanged():
+    span = _span(
+        {},
+        status=Status(StatusCode.ERROR, "IntegrityError"),
+        events=[Event("exception", {"exception.type": "X"}, 3)],
+    )
+    assert otel.redact_span(span) is span

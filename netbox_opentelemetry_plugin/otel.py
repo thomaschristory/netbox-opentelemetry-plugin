@@ -2,7 +2,7 @@
 
 The logs SDK lives in underscore modules (opentelemetry.sdk._logs) and its API changes between
 releases. Keeping every SDK import here means such changes are fixed in one place. This file also
-holds every tracing import (SDK trace, propagators, instrumentors).
+holds every tracing and metrics import (SDK trace and metrics, propagators, instrumentors).
 
 AllowlistLoggingHandler below is implemented directly on the stable opentelemetry._logs API
 rather than subclassing opentelemetry-instrumentation-logging's handler: that package registers
@@ -16,6 +16,7 @@ import contextlib
 import contextvars
 import importlib
 import logging
+import math
 import os
 import re
 import socket
@@ -25,16 +26,20 @@ import traceback
 from collections.abc import Mapping
 
 import opentelemetry.context
+from opentelemetry import metrics as metrics_api
 from opentelemetry import trace
 from opentelemetry._logs import LogRecord, SeverityNumber, get_logger_provider
 from opentelemetry.context import Context
-from opentelemetry.metrics import MeterProvider, NoOpMeterProvider
+from opentelemetry.metrics import MeterProvider, NoOpMeterProvider, Observation
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import (
     BatchLogRecordProcessor,
     LogRecordExporter,
     SimpleLogRecordProcessor,
 )
+from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
+from opentelemetry.sdk.metrics.export import MetricExporter, MetricReader, PeriodicExportingMetricReader
+from opentelemetry.sdk.metrics.view import DropAggregation, View
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Event, ReadableSpan, SpanProcessor, TracerProvider, sampling
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter
@@ -667,3 +672,262 @@ def emit_event(
             event_name=event_name,
         )
     )
+
+
+# --- Metrics --------------------------------------------------------------------------------
+
+_JOB_ATTRIBUTES = frozenset({"messaging.destination.name", "code.function.name", "netbox.rq.job.outcome"})
+
+# SPEC 7: nothing leaves the process unless it is listed. The plugin-owned MeterProvider exports
+# only these instruments, each with only these attribute keys. None (runtime wildcards only) keeps
+# the instrumentor's own attributes, which are low-cardinality process states.
+METRIC_ALLOWLIST: Mapping[str, frozenset[str] | None] = {
+    "http.server.request.duration": frozenset(
+        {"http.request.method", "http.route", "http.response.status_code", "error.type"}
+    ),
+    "http.client.request.duration": frozenset(
+        {"http.request.method", "server.address", "http.response.status_code", "error.type"}
+    ),
+    "netbox.rq.job.duration": _JOB_ATTRIBUTES,
+    "netbox.rq.jobs": _JOB_ATTRIBUTES,
+    "netbox.rq.queue.depth": frozenset({"messaging.destination.name"}),
+    "netbox.object_changes": frozenset({"netbox.change.action", "netbox.change.object_type"}),
+    "process.*": None,
+    "cpython.gc.*": None,
+}
+
+
+def metric_views() -> list[View]:
+    """Drop every instrument, then add one View per allowlisted name.
+
+    An instrument matching the catch-all and a named View gets one dropped stream and one exported
+    stream; an instrument matching only the catch-all is not exported at all.
+    """
+    views = [View(instrument_name="*", aggregation=DropAggregation())]
+    for name, keys in METRIC_ALLOWLIST.items():
+        if keys is None:
+            views.append(View(instrument_name=name))
+        else:
+            views.append(View(instrument_name=name, attribute_keys=set(keys)))
+    return views
+
+
+def build_metric_exporter(cfg: ExporterConfig) -> MetricExporter:
+    if cfg.protocol == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
+            OTLPMetricExporter as GrpcMetricExporter,
+        )
+
+        return GrpcMetricExporter(
+            endpoint=cfg.endpoint,
+            insecure=cfg.insecure,
+            credentials=_grpc_credentials(cfg),
+            headers=dict(cfg.headers),
+            timeout=cfg.timeout,
+        )
+
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
+        OTLPMetricExporter as HttpMetricExporter,
+    )
+
+    return HttpMetricExporter(
+        endpoint=cfg.endpoint,
+        headers=dict(cfg.headers),
+        timeout=cfg.timeout,
+        certificate_file=cfg.certificate,
+    )
+
+
+def build_meter_provider(resource: Resource, readers) -> SdkMeterProvider:
+    # shutdown_on_exit=False: bootstrap owns shutdown ordering, as for the other providers.
+    return SdkMeterProvider(
+        metric_readers=list(readers), resource=resource, shutdown_on_exit=False, views=metric_views()
+    )
+
+
+class MetricsPipeline:
+    """A plugin-owned MeterProvider and the thread that exports it every `interval` seconds.
+
+    The SDK's PeriodicExportingMetricReader starts its own ticker thread and restarts it in every
+    forked child through an at-fork hook, so each RQ work-horse would export the parent's
+    cumulative state through the parent's exporter connection. The reader here is created with an
+    infinite interval (no thread, no at-fork hook) and this class drives collection instead. Its
+    thread does not survive fork: bootstrap builds a new pipeline in a child only where metrics
+    belong (never in a horse).
+    """
+
+    def __init__(self, resource: Resource, exporter: MetricExporter, *, interval: float, timeout: float) -> None:
+        self._timeout_millis = timeout * 1000
+        self._reader: MetricReader = PeriodicExportingMetricReader(
+            exporter, export_interval_millis=math.inf, export_timeout_millis=self._timeout_millis
+        )
+        self.provider = build_meter_provider(resource, [self._reader])
+        self._interval = interval
+        self._stop = threading.Event()
+        self._warned = False
+        self._thread = threading.Thread(target=self._run, name="otel-metrics", daemon=True)
+        try:
+            self._thread.start()
+        except Exception:
+            with contextlib.suppress(Exception):
+                self.provider.shutdown()
+            raise
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self._collect()
+
+    def _collect(self) -> None:
+        try:
+            # Export errors are caught and logged by the reader itself; this catches collection
+            # errors (for example a timeout) so the thread keeps its interval.
+            self._reader.collect(timeout_millis=self._timeout_millis)
+        except Exception as exc:
+            if not self._warned:
+                self._warned = True
+                logger.warning("OpenTelemetry: metric collection failed: %s", type(exc).__name__)
+
+    def force_flush(self, timeout_millis: int = 10_000) -> bool:
+        return self.provider.force_flush(timeout_millis)
+
+    def shutdown(self, timeout: float) -> None:
+        """Stop the thread, export once more (the reader has no thread of its own to do it), shut down."""
+        self._stop.set()
+        self._thread.join(timeout)
+        try:
+            with contextlib.suppress(Exception):
+                self.provider.force_flush(timeout * 1000)
+        finally:
+            self.provider.shutdown(timeout * 1000)
+
+
+class _SwitchableInstrument:
+    """A synchronous instrument that resolves the provider's current delegate on each measurement."""
+
+    def __init__(self, meter: _SwitchableMeter, factory: str, args: tuple, kwargs: dict) -> None:
+        self._meter, self._factory, self._args, self._kwargs = meter, factory, args, kwargs
+        self._cached: tuple[object, object] = (None, None)
+
+    def _instrument(self):
+        meter = self._meter.delegate_meter()
+        cached_for, instrument = self._cached
+        if cached_for is not meter or instrument is None:
+            instrument = getattr(meter, self._factory)(*self._args, **self._kwargs)
+            # One tuple assignment, so a concurrent reader sees either the old or the new pair.
+            self._cached = (meter, instrument)
+        return instrument
+
+    def add(self, *args, **kwargs) -> None:
+        self._instrument().add(*args, **kwargs)
+
+    def record(self, *args, **kwargs) -> None:
+        self._instrument().record(*args, **kwargs)
+
+    def set(self, *args, **kwargs) -> None:
+        self._instrument().set(*args, **kwargs)
+
+
+class _SwitchableMeter(metrics_api.Meter):
+    def __init__(self, owner: SwitchableMeterProvider, args: tuple) -> None:
+        super().__init__(args[0], args[1], args[2])
+        self._owner = owner
+        self._args = args
+        self._cached: tuple[object, metrics_api.Meter | None] = (None, None)
+
+    def delegate_meter(self) -> metrics_api.Meter:
+        delegate = self._owner.delegate
+        cached_for, meter = self._cached
+        if cached_for is not delegate or meter is None:
+            meter = delegate.get_meter(*self._args)
+            self._cached = (delegate, meter)
+        return meter
+
+    def create_counter(self, *args, **kwargs):
+        return _SwitchableInstrument(self, "create_counter", args, kwargs)
+
+    def create_up_down_counter(self, *args, **kwargs):
+        return _SwitchableInstrument(self, "create_up_down_counter", args, kwargs)
+
+    def create_histogram(self, *args, **kwargs):
+        return _SwitchableInstrument(self, "create_histogram", args, kwargs)
+
+    def create_gauge(self, *args, **kwargs):
+        return _SwitchableInstrument(self, "create_gauge", args, kwargs)
+
+    def create_observable_counter(self, *args, **kwargs):
+        return self._owner._observe(self, "create_observable_counter", args, kwargs)
+
+    def create_observable_up_down_counter(self, *args, **kwargs):
+        return self._owner._observe(self, "create_observable_up_down_counter", args, kwargs)
+
+    def create_observable_gauge(self, *args, **kwargs):
+        return self._owner._observe(self, "create_observable_gauge", args, kwargs)
+
+
+class SwitchableMeterProvider(metrics_api.MeterProvider):
+    """The MeterProvider handed to every instrument; instruments are cached by their callers for the
+    process lifetime (the Django middleware keeps them as class attributes).
+
+    Synchronous instruments resolve the delegate on each measurement. Observable instruments are
+    pulled by the delegate's readers, so they are registered on the delegate at creation and again
+    on every new delegate. Bootstrap swaps the delegate after fork: a new SDK provider in a web or
+    worker child, a no-op provider in an RQ work-horse.
+    """
+
+    def __init__(self, delegate: metrics_api.MeterProvider) -> None:
+        self._delegate = delegate
+        self._observables: list[tuple[_SwitchableMeter, str, tuple, dict]] = []
+
+    @property
+    def delegate(self) -> metrics_api.MeterProvider:
+        return self._delegate
+
+    def get_meter(self, name, version=None, schema_url=None, attributes=None) -> metrics_api.Meter:
+        return _SwitchableMeter(self, (name, version, schema_url, attributes))
+
+    def _observe(self, meter: _SwitchableMeter, factory: str, args: tuple, kwargs: dict):
+        self._observables.append((meter, factory, args, kwargs))
+        return getattr(meter.delegate_meter(), factory)(*args, **kwargs)
+
+    def set_delegate(self, provider: metrics_api.MeterProvider) -> None:
+        self._delegate = provider
+        for meter, factory, args, kwargs in list(self._observables):
+            try:
+                getattr(meter.delegate_meter(), factory)(*args, **kwargs)
+            except Exception as exc:
+                logger.warning("OpenTelemetry: could not register an observable metric: %s", type(exc).__name__)
+
+    def force_flush(self, timeout_millis: int = 10_000) -> bool:
+        flush = getattr(self._delegate, "force_flush", None)
+        return True if flush is None else flush(timeout_millis)
+
+
+def existing_meter_provider() -> SdkMeterProvider | None:
+    """Return the global SDK MeterProvider if something (for example opentelemetry-instrument) set one."""
+    provider = metrics_api.get_meter_provider()
+    return provider if isinstance(provider, SdkMeterProvider) else None
+
+
+def observation(value: int | float, attributes: Mapping[str, str]) -> Observation:
+    return Observation(value, dict(attributes))
+
+
+def load_system_metrics_instrumentor(config: Mapping[str, list[str] | None]):
+    from opentelemetry.instrumentation.system_metrics import SystemMetricsInstrumentor
+
+    return SystemMetricsInstrumentor(config={name: (list(v) if v is not None else None) for name, v in config.items()})
+
+
+def repoint_system_metrics_process(instrumentor) -> bool:
+    """Point the system-metrics instrumentor's process handle at the current process.
+
+    The instrumentor stores psutil.Process(os.getpid()) when it is created; in a forked child that
+    handle still describes the parent. `_proc` is private to opentelemetry-instrumentation-system-metrics
+    0.65b0 (pinned; a test fails if it moves). Returns False when the attribute is not there.
+    """
+    if not hasattr(instrumentor, "_proc"):
+        return False
+    import psutil
+
+    instrumentor._proc = psutil.Process(os.getpid())
+    return True

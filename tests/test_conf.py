@@ -1,4 +1,5 @@
 import logging
+import math
 
 import pytest
 
@@ -452,3 +453,79 @@ def test_rq_propagate_context():
     s = conf.resolve({"rq": {"propagate_context": "no"}}, ENDPOINT_ENV)
     assert s.rq == conf.RQ_OFF
     assert "rq.propagate_context" in s.warnings[0]
+
+
+BASE = {"exporter": {"endpoint": "http://collector:4318"}}
+
+
+def test_metrics_off_by_default():
+    settings = conf.resolve(BASE, {})
+    assert settings.metrics.enabled is False
+    assert settings.metrics is conf.METRICS_OFF
+
+
+def test_metrics_enabled_resolves_exporter_and_defaults():
+    settings = conf.resolve({**BASE, "metrics": {"enabled": True}}, {})
+    m = settings.metrics
+    assert m.enabled and m.change_counters and not m.runtime
+    assert m.export_interval == 60.0
+    assert m.exporter.endpoint == "http://collector:4318/v1/metrics"
+    assert m.exporter in settings.exporters()
+
+
+def test_metrics_signal_endpoint_env_wins_over_generic():
+    env = {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://a:4318", "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://b:4318/m"}
+    assert conf.resolve({"metrics": {"enabled": True}}, env).metrics.exporter.endpoint == "http://b:4318/m"
+
+
+def test_export_interval_env_is_milliseconds():
+    env = {"OTEL_METRIC_EXPORT_INTERVAL": "15000"}
+    assert conf.resolve({**BASE, "metrics": {"enabled": True}}, env).metrics.export_interval == 15.0
+
+
+def test_explicit_export_interval_is_seconds_and_wins_over_env():
+    env = {"OTEL_METRIC_EXPORT_INTERVAL": "15000"}
+    settings = conf.resolve({**BASE, "metrics": {"enabled": True, "export_interval": 5}}, env)
+    assert settings.metrics.export_interval == 5.0
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "60", math.inf, math.nan])
+def test_bad_export_interval_disables_metrics_only(value):
+    settings = conf.resolve({**BASE, "metrics": {"enabled": True, "export_interval": value}}, {})
+    assert settings.metrics is conf.METRICS_OFF
+    assert settings.logs.enabled
+    assert any("metrics disabled" in w for w in settings.warnings)
+
+
+def test_bad_export_interval_env_disables_metrics():
+    settings = conf.resolve({**BASE, "metrics": {"enabled": True}}, {"OTEL_METRIC_EXPORT_INTERVAL": "soon"})
+    assert settings.metrics is conf.METRICS_OFF
+
+
+@pytest.mark.parametrize("key", ["change_counters", "runtime"])
+def test_metrics_flags_must_be_bool(key):
+    settings = conf.resolve({**BASE, "metrics": {"enabled": True, key: "yes"}}, {})
+    assert settings.metrics is conf.METRICS_OFF
+
+
+def test_metrics_without_endpoint_warns_and_disables():
+    settings = conf.resolve({"logs": {"enabled": False}, "audit": {"enabled": False}, "metrics": {"enabled": True}}, {})
+    assert settings.metrics is conf.METRICS_OFF
+    assert any(w.startswith("metrics disabled: no endpoint") for w in settings.warnings)
+
+
+def test_metrics_redacted_masks_headers():
+    user = {**BASE, "exporter": {**BASE["exporter"], "headers": {"x-key": "s3cret"}}, "metrics": {"enabled": True}}
+    redacted = conf.resolve(user, {}).redacted()
+    assert redacted["metrics"]["exporter"]["headers"] == {"x-key": conf.REDACTED}
+    assert "s3cret" not in repr(redacted)
+
+
+def test_excluded_urls_are_resolved_with_traces_off():
+    settings = conf.resolve({**BASE, "traces": {"excluded_urls": ["/health/"]}}, {})
+    assert settings.traces.enabled is False
+    assert settings.traces.excluded_urls == ("/health/",)
+
+
+def test_plugin_logger_name_lives_in_conf():
+    assert conf.PLUGIN_LOGGER == "netbox_opentelemetry_plugin"

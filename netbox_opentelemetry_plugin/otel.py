@@ -41,9 +41,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcess
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
-from .conf import ExporterConfig
+from .conf import PLUGIN_LOGGER, ExporterConfig
 
-PLUGIN_LOGGER = "netbox_opentelemetry_plugin"
 logger = logging.getLogger(PLUGIN_LOGGER)
 
 # Records from these loggers are never exported: the plugin's own warnings, the OTel SDK, and the

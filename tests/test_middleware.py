@@ -88,3 +88,9 @@ def test_no_recording_span_does_not_touch_the_user():
 
     mw = middleware.RequestSpanMiddleware(lambda req: "ok")
     assert mw(_Untouchable()) == "ok"
+
+
+def test_middleware_logger_uses_the_plugin_logger_name():
+    from netbox_opentelemetry_plugin import conf, middleware
+
+    assert middleware.logger.name == conf.PLUGIN_LOGGER

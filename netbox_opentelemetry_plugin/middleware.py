@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("netbox_opentelemetry_plugin")
+from .conf import PLUGIN_LOGGER
+
+logger = logging.getLogger(PLUGIN_LOGGER)
 
 _warned = False
 

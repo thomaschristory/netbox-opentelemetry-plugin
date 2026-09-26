@@ -17,6 +17,10 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 PROTOCOLS = ("http/protobuf", "grpc")
 REDACTED = "***"
 
+# The plugin's own logger. Its records go to stdout only and are never exported (feedback loops).
+# Defined here, not in otel.py, so code that must not import OpenTelemetry can use it.
+PLUGIN_LOGGER = "netbox_opentelemetry_plugin"
+
 TRACE_SAMPLERS = (
     "always_on",
     "always_off",
@@ -183,6 +187,27 @@ TRACES_OFF = TracesConfig(enabled=False)
 
 
 @dataclass(frozen=True)
+class MetricsConfig:
+    enabled: bool
+    exporter: ExporterConfig | None = None
+    export_interval: float = 60.0
+    change_counters: bool = True
+    runtime: bool = False
+
+    def redacted(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "exporter": self.exporter.redacted() if self.exporter else None,
+            "export_interval": self.export_interval,
+            "change_counters": self.change_counters,
+            "runtime": self.runtime,
+        }
+
+
+METRICS_OFF = MetricsConfig(enabled=False)
+
+
+@dataclass(frozen=True)
 class RqConfig:
     enabled: bool = True
     patch_worker: bool = True
@@ -210,6 +235,7 @@ class Settings:
     audit: AuditConfig = AUDIT_OFF
     log_exporter: ExporterConfig | None = None
     traces: TracesConfig = TRACES_OFF
+    metrics: MetricsConfig = METRICS_OFF
     rq: RqConfig = field(default_factory=RqConfig)
     warnings: tuple[str, ...] = ()
 
@@ -222,12 +248,13 @@ class Settings:
             "audit": self.audit.redacted(),
             "log_exporter": self.log_exporter.redacted() if self.log_exporter else None,
             "traces": self.traces.redacted(),
+            "metrics": self.metrics.redacted(),
             "rq": self.rq.redacted(),
         }
 
     def exporters(self) -> tuple[ExporterConfig, ...]:
         """Every resolved exporter; used to redact their endpoints and header values from messages."""
-        return tuple(cfg for cfg in (self.log_exporter, self.traces.exporter) if cfg is not None)
+        return tuple(cfg for cfg in (self.log_exporter, self.traces.exporter, self.metrics.exporter) if cfg is not None)
 
 
 def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
@@ -294,6 +321,12 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         traces = TRACES_OFF
 
     try:
+        metrics = _resolve_metrics(_section(user, "metrics"), exporter_section, env)
+    except ConfigError as exc:
+        warnings.append(f"metrics disabled: {exc}")
+        metrics = METRICS_OFF
+
+    try:
         rq = _resolve_rq(_section(user, "rq"))
     except ConfigError as exc:
         warnings.append(f"rq disabled: {exc}")
@@ -307,6 +340,7 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         audit=audit,
         log_exporter=log_exporter,
         traces=traces,
+        metrics=metrics,
         rq=rq,
         warnings=tuple(warnings),
     )
@@ -386,12 +420,24 @@ def _resolve_audit(section: Mapping[str, Any]) -> AuditConfig:
     return AuditConfig(enabled=True, include_data=include_data, exclude_fields=tuple(exclude))
 
 
+def _excluded_urls(section: Mapping[str, Any]) -> tuple[str, ...]:
+    excluded = section.get("excluded_urls", DEFAULTS["traces"]["excluded_urls"])
+    if not isinstance(excluded, list | tuple) or not all(isinstance(url, str) for url in excluded):
+        raise ConfigError("traces.excluded_urls must be a list of URL patterns")
+    # The Django instrumentor takes a single comma-separated string of patterns, so a comma inside
+    # one entry would silently split it into two patterns.
+    if any("," in url for url in excluded):
+        raise ConfigError("traces.excluded_urls entries must not contain a comma")
+    return tuple(excluded)
+
+
 def _resolve_traces(
     section: Mapping[str, Any], exporter_section: Mapping[str, Any], env: Mapping[str, str]
 ) -> TracesConfig:
     defaults = DEFAULTS["traces"]
     if not _typed(section.get("enabled", defaults["enabled"]), bool, "traces.enabled"):
-        return TRACES_OFF
+        # excluded_urls also apply to HTTP server metrics, so they are resolved even with traces off.
+        return TracesConfig(enabled=False, excluded_urls=_excluded_urls(section))
     sampler = _pick(section, "sampler", env, ("OTEL_TRACES_SAMPLER",), defaults["sampler"], _parse_str)
     if not isinstance(sampler, str) or sampler.strip().lower() not in TRACE_SAMPLERS:
         raise ConfigError(f"traces.sampler must be one of: {', '.join(TRACE_SAMPLERS)}")
@@ -411,11 +457,7 @@ def _resolve_traces(
     unknown = [name for name in instrument if name not in INSTRUMENTATIONS]
     if unknown:
         raise ConfigError(f"traces.instrument has unknown entries {unknown}; known: {', '.join(INSTRUMENTATIONS)}")
-    excluded = section.get("excluded_urls", defaults["excluded_urls"])
-    if not isinstance(excluded, list | tuple) or not all(isinstance(url, str) for url in excluded):
-        raise ConfigError("traces.excluded_urls must be a list of URL patterns")
-    if any("," in url for url in excluded):
-        raise ConfigError("traces.excluded_urls entries must not contain a comma")
+    excluded = _excluded_urls(section)
     exporter = resolve_exporter("traces", section, exporter_section, env)
     return TracesConfig(
         enabled=True,
@@ -450,6 +492,41 @@ def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:
         flush_timeout=float(flush_timeout),
         propagate_context=propagate_context,
     )
+
+
+def _resolve_metrics(
+    section: Mapping[str, Any], exporter_section: Mapping[str, Any], env: Mapping[str, str]
+) -> MetricsConfig:
+    defaults = DEFAULTS["metrics"]
+    if not _typed(section.get("enabled", defaults["enabled"]), bool, "metrics.enabled"):
+        return METRICS_OFF
+    interval = _pick(
+        section, "export_interval", env, ("OTEL_METRIC_EXPORT_INTERVAL",), defaults["export_interval"], _parse_millis
+    )
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, int | float)
+        or interval <= 0
+        or not math.isfinite(interval)
+    ):
+        raise ConfigError("metrics.export_interval must be a positive number of seconds")
+    change_counters = _typed(
+        section.get("change_counters", defaults["change_counters"]), bool, "metrics.change_counters"
+    )
+    runtime = _typed(section.get("runtime", defaults["runtime"]), bool, "metrics.runtime")
+    exporter = resolve_exporter("metrics", section, exporter_section, env)
+    return MetricsConfig(
+        enabled=True,
+        exporter=exporter,
+        export_interval=float(interval),
+        change_counters=change_counters,
+        runtime=runtime,
+    )
+
+
+def _parse_millis(raw: str, name: str) -> float:
+    # OTEL_METRIC_EXPORT_INTERVAL is in milliseconds (OpenTelemetry SDK convention); the plugin setting is seconds.
+    return _parse_float(raw, name) / 1000
 
 
 def _endpoint(

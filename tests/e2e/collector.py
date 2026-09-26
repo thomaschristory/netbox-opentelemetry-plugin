@@ -57,3 +57,16 @@ def record_time_ns(record: dict) -> int:
 def string_attr(resource: dict, key: str) -> str | None:
     value = resource.get(key)
     return None if value is None else value.get("stringValue")
+
+
+def record_attr(record: dict, key: str):
+    """Return a log record attribute as a Python value (OTLP JSON encodes ints as strings)."""
+    for attribute in record.get("attributes", []):
+        if attribute["key"] == key:
+            value = attribute["value"]
+            if "intValue" in value:
+                return int(value["intValue"])
+            for kind in ("stringValue", "boolValue", "doubleValue"):
+                if kind in value:
+                    return value[kind]
+    return None

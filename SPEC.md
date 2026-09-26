@@ -145,6 +145,8 @@ PLUGINS_CONFIG = {
             "enabled": True,
             "include_data": False,
             "exclude_fields": ["password", "secret", "token", "key"],
+            # Audit uses the log pipeline exporter (logs.endpoint, then exporter.*) and works
+            # even when logs.enabled is False.
         },
         "traces": {
             "enabled": False,
@@ -190,12 +192,23 @@ Validation:
 - Feedback-loop filter: records from `netbox_opentelemetry_plugin` and `opentelemetry.*` loggers are rejected by the handler. The plugin's own logger writes to stdout only.
 
 ### 6.2 Audit
-- Receiver: `post_save` on `core.models.ObjectChange`, `created=True` only, emission deferred with `transaction.on_commit` so rolled back changes produce nothing.
-- Emitted through the OTel Logger API directly (independent of the logs module and of stdout). Uses the logs exporter settings (`logs.endpoint`, then `exporter.*`); the LoggerProvider is built when either `logs` or `audit` is enabled.
-- Event name `netbox.object_change`, severity INFO, body `"<action> <app_label>.<model> <object_repr>"`.
-- Attributes: `netbox.change.id`, `netbox.change.action`, `netbox.change.object_type`, `netbox.change.object_id`, `netbox.change.object_repr`, `netbox.change.request_id`, `netbox.change.message`, `netbox.change.related_object_type`, `netbox.change.related_object_id` (when present), `enduser.id` (username).
-- With `audit.include_data`: `netbox.change.prechange_data` and `netbox.change.postchange_data` as JSON strings, filtered recursively by `exclude_fields` (case-insensitive substring match on keys).
-- Errors in the receiver are caught and logged; the save always proceeds.
+- Receiver: `post_save` on `core.models.ObjectChange`, `created=True` only (a later `created=False` save of the same record, which NetBox uses to fold an M2M change into the record made earlier in the same request, is ignored by the receiver itself); a raw save (for example loading a fixture) is also ignored. Emission is deferred with `transaction.on_commit`, so a rolled back change produces nothing.
+- Emitted through the OTel Logger API directly (independent of the logs module and of stdout). Uses the logs exporter settings (`logs.endpoint`, then `exporter.*`); the LoggerProvider is built when either `logs` or `audit` is enabled, so audit works with `logs.enabled = False`.
+- Instrumentation scope `netbox_opentelemetry_plugin.audit`. Event name `netbox.object_change`. Severity INFO. Timestamp: the `ObjectChange` row's `time` (the change's own time, not when the record is emitted).
+- Body: `"<action> <app_label>.<model> <object_repr>"`, for example `"update dcim.device edge-rtr-01"`.
+- Attributes, only these and only when noted:
+  - `netbox.change.id` (int), `netbox.change.action` (str), `netbox.change.object_type` (str, `app_label.model`), `netbox.change.object_id` (int), `netbox.change.object_repr` (str), `netbox.change.request_id` (str): always present.
+  - `netbox.change.message` (str): only when non-empty.
+  - `netbox.change.related_object_type` and `netbox.change.related_object_id`: only when both are set.
+  - `enduser.id` (str, the change's `user_name`): only when non-empty.
+  - With `audit.include_data`: `netbox.change.prechange_data` and `netbox.change.postchange_data`, each a JSON string (`json.dumps(..., sort_keys=True)`) of the stored value filtered recursively by `exclude_fields` (case-insensitive substring match on keys), only when that stored value is not null.
+- With `audit.include_data`, the pre/post data is read from the database at commit time rather than from the `post_save` instance, batched per thread (one query per up to 1000 pending changes, not one query per change). This is what lets a later, same-request update to `postchange_data` (the M2M case above) reach the record that was already queued for that change.
+- Never raises into NetBox: the receiver and the commit callback each catch every exception. On failure, one warning is logged per process, naming only the exception type (never its message, which could contain object data).
+
+Known limitations:
+- If NetBox updates an M2M change record in a later transaction than the one that created it, the data sent with the first record does not include that later update. This only matters with `include_data`; same-transaction M2M updates are covered above.
+- The log pipeline buffers up to 20,000 records per process while audit is on. A single commit larger than that can drop records, and the SDK reports this only on its own logger, which the plugin does not export.
+- When a `LoggerProvider` configured outside the plugin is reused (4.1's provider detection), its queue is not resized; the 20,000 figure above applies only to a provider the plugin builds itself.
 
 ### 6.3 Traces
 - Django: one span per request, named from the route template. The plugin middleware adds `netbox.request_id` and `enduser.id`.
@@ -252,7 +265,7 @@ Validation:
 ## 10. Testing
 
 1. Unit (pytest, no NetBox): config precedence and validation, masking, module install idempotency with in-memory exporters (`InMemorySpanExporter`, `InMemoryLogExporter`, `InMemoryMetricReader`), feedback filter, `exclude_fields` filter, audit mapping, a real `os.fork()` test for child rebuild, RQ wrap signature checks against rq 2.12 including the mismatch path.
-2. NetBox integration (NetBox test runner, NetBox v4.7.1 checkout, Postgres and Redis services): audit on create, update, delete; no audit on rollback; bulk import of 10 objects shares one `request_id`; request spans carry `netbox.request_id`; logs inside requests carry the trace id; a real forking `rq.Worker` runs a job and its spans, logs and parent metrics arrive.
+2. NetBox integration: a NetBox layer under `tests_netbox/`, run with the NetBox test runner (`make test-netbox`) against a NetBox v4.7.1 checkout with Postgres and Redis services, and in CI by the `netbox-integration` job. Currently covers audit: create, update and delete of a prefix via the API produce the expected records with a distinct `request_id` each; `include_data` on filters `exclude_fields` out of `postchange_data`; a bulk API create of 10 devices shares one `request_id`; a rolled back change emits nothing while a committed one emits exactly one record. Later milestones add request spans carrying `netbox.request_id`, logs inside requests carrying the trace id, and a real forking `rq.Worker` running a job whose spans, logs and parent metrics arrive.
 3. End-to-end (`make e2e`): drives the compose stack via the API and the sample script (normal and raising), then asserts on the Collector's JSON file output. Runs per web server profile.
 
 CI (GitHub Actions): ruff; unit tests on Python 3.12, 3.13, 3.14; NetBox integration on 4.7.1; e2e for Granian and uWSGI on nightly or manual trigger.
@@ -265,7 +278,7 @@ CI (GitHub Actions): ruff; unit tests on Python 3.12, 3.13, 3.14; NetBox integra
 | M1 | config, `otel.py`, bootstrap, logs module | a login produces a log record in the Collector with correct severity, body, resource; missing endpoint gives one warning and NetBox serves |
 | M2 | fork safety | Granian, gunicorn (with preload) and uWSGI export from every worker PID; no duplicate handlers after autoreload; no-threads warning fires |
 | M3 | RQ flush | all log lines of the sample script arrive, including when it raises |
-| M4 | audit | create, update, delete of a prefix and bulk import of 10 devices produce the expected records with shared `request_id`; rollback produces none; filtering proven by tests |
+| M4 | audit | create, update, delete of a prefix and bulk import of 10 devices produce the expected records with shared `request_id`; rollback produces none; filtering proven by tests (integration tests: devices via API bulk create; e2e: prefixes) |
 | M5 | traces, RQ spans, propagation | API requests produce spans; logs carry the matching trace id; a webhook fired by an edit shares the edit's trace |
 | M6 | metrics, change counters, runtime | all metrics of 6.4 visible in the Collector; job metrics come from the worker parent |
 | M7 | docs and release | MkDocs Material site (install per install type, config reference, OpenShift Collector example, limitations), README with compatibility matrix, CHANGELOG, tagged release on PyPI |

@@ -87,6 +87,20 @@ def test_scrub_query_strings_in_free_text():
     assert otel.scrub_query_strings("why? because") == "why? because"
 
 
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("url: /x?tok=ab(cd) z", "cd"),
+        ('http://h/p?tok="q"sec', "sec"),
+        ("http://[::1]?tok=sec", "sec"),
+        ("GET /p~?tok=sec", "sec"),
+    ],
+)
+def test_scrub_query_strings_does_not_leak_around_punctuation(text, secret):
+    scrubbed = otel.scrub_query_strings(text)
+    assert secret not in scrubbed
+
+
 def _span(attributes, status=None, events=()):
     ctx = trace.SpanContext(trace_id=1, span_id=2, is_remote=False, trace_flags=trace.TraceFlags(1))
     return ReadableSpan(

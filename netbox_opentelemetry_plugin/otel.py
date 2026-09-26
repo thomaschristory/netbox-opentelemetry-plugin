@@ -266,9 +266,11 @@ REDACTED_QUERY = "REDACTED"
 _HEADER_ATTRIBUTE_PREFIXES = ("http.request.header.", "http.response.header.")
 _QUERY_ONLY_ATTRIBUTES = frozenset({"url.query"})
 _URL_ATTRIBUTES = frozenset({"url.full", "http.url", "http.target"})
-# A path or host character followed by "?" and a run of non-space characters, as in
-# "url: /hook?token=abc" inside an exception message. Linear: no nested quantifiers.
-_QUERY_IN_TEXT = re.compile(r"(?<=[\w/.\-])\?[^\s'\"()<>]+")
+# A "?" followed by a run of non-space characters, as in "url: /hook?token=abc" inside an
+# exception message. No lookbehind and no excluded punctuation: over-redacting free text (for
+# example swallowing a trailing ")" or a quote) is the safe failure, unlike leaving a secret in.
+# "why? because" still does not match since a space follows the "?". Linear: no nested quantifiers.
+_QUERY_IN_TEXT = re.compile(r"\?\S+")
 
 
 def build_span_exporter(cfg: ExporterConfig) -> SpanExporter:

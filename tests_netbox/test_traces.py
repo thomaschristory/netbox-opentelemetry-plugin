@@ -13,7 +13,6 @@ import django_rq
 from core.models import Job
 from django.db import connections
 from django.urls import reverse
-from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
@@ -35,7 +34,6 @@ TEST_QUEUE = "netbox-otel-test"
 class TracingMixin:
     @classmethod
     def setUpClass(cls):
-        super().setUpClass()
         state = bootstrap._state
         assert state is not None and state.context is not None, "the plugin is not installed in this process"
         base = state.context
@@ -50,28 +48,37 @@ class TracingMixin:
         )
         # role rqworker so the RQ module also wraps perform_job (run here by a SimpleWorker).
         cls.trace_ctx = dataclasses.replace(
-            base, settings=settings, role="rqworker", tracer_provider=otel.SwitchableTracerProvider(sdk_provider)
+            base,
+            settings=settings,
+            role=bootstrap.ROLE_RQWORKER,
+            tracer_provider=otel.SwitchableTracerProvider(sdk_provider),
         )
         cls.traces_module = TracesModule()
         cls.traces_module.install(cls.trace_ctx)
         cls.rq_module = RqModule()
         cls.rq_module.install(cls.trace_ctx)
-        # The Django test runner opens the default DB connection (running migration checks, then
-        # setUpTestData) before this class installs the psycopg instrumentation, which only wraps
-        # *future* connect() calls. Without this, that already-open connection would produce no
-        # CLIENT spans for the rest of the test process. Instrument it directly here; undone in
-        # tearDownClass so later test classes (for example test_audit.py) see a plain connection.
-        cls._instrumented_connections = [c.connection for c in connections.all() if c.connection is not None]
-        for connection in cls._instrumented_connections:
-            PsycopgInstrumentor().instrument_connection(connection, tracer_provider=cls.trace_ctx.tracer_provider)
+        # Modules are installed, and any connection left open by an earlier test class is closed,
+        # before super().setUpClass(): TestCase's class-level atomic block (entered there) is what
+        # opens this class's DB connection, and psycopg instrumentation only wraps *future*
+        # psycopg.connect() calls. Closing first forces that connection open through the plugin's
+        # own wrap (with its real capture_parameters/enable_commenter settings), instead of
+        # leaving in place a connection made before any instrumentation existed.
+        connections.close_all()
+        super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
-        for connection in cls._instrumented_connections:
-            PsycopgInstrumentor().uninstrument_connection(connection)
+        # super().tearDownClass() (TestCase) rolls back the class atomic block and closes the
+        # connections it opened. Modules are shut down after that, unwrapping psycopg.connect (and
+        # the other instrumentors) for whatever connects next. Connections are closed again
+        # afterwards so no later test class (for example test_audit.py) inherits a connection whose
+        # cursor_factory still points at this class's now-shutdown TracerProvider: uninstrument()
+        # only removes the wrap on future connects, not the cursor_factory already set on an open
+        # connection object.
+        super().tearDownClass()
         cls.rq_module.shutdown()
         cls.traces_module.shutdown()
-        super().tearDownClass()
+        connections.close_all()
 
     def setUp(self):
         super().setUp()

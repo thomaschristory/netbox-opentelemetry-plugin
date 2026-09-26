@@ -415,7 +415,8 @@ def _candidate_modules(ctx: Context) -> list[Module]:
         modules.append(AuditModule())
     if ctx.tracer_provider is not None:
         modules.append(TracesModule())
-    if ctx.role == ROLE_RQWORKER:
+    # RQ: worker wraps in the rqworker process; the enqueue wrap wherever spans are recorded.
+    if ctx.role == ROLE_RQWORKER or ctx.tracer_provider is not None:
         modules.append(RqModule())
     return modules
 

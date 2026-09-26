@@ -324,7 +324,7 @@ def test_traces_install_builds_an_owned_switchable_provider(exporter, span_expor
     ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
     assert isinstance(ctx.tracer_provider, otel.SwitchableTracerProvider)
     assert bootstrap._state.owns_tracer_provider is True
-    assert [m.name for m in bootstrap._state.modules] == ["logs", "audit", "traces"]
+    assert [m.name for m in bootstrap._state.modules] == ["logs", "audit", "traces", "rq"]
     with ctx.tracer_provider.get_tracer("t").start_as_current_span("s"):
         pass
     assert bootstrap.force_flush(2.0) is True

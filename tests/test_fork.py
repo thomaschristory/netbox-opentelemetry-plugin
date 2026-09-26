@@ -15,6 +15,8 @@ import time
 
 import pytest
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 
 from netbox_opentelemetry_plugin import bootstrap, otel
 
@@ -27,6 +29,7 @@ pytestmark = [
 USER = {"exporter": {"endpoint": "http://collector:4318"}, "logs": {"loggers": ["t.fork"]}}
 ARGV_WEB = ["gunicorn", "netbox.wsgi"]
 ARGV_RQ = ["/opt/netbox/netbox/manage.py", "rqworker"]
+TRACES_USER = {**USER, "traces": {"enabled": True, "instrument": []}}
 
 
 @pytest.fixture(autouse=True)
@@ -432,3 +435,99 @@ def test_grpc_exporter_survives_fork():
         return {"done": True}
 
     assert _run_in_child(probe) == {"done": True}
+
+
+@pytest.fixture
+def span_exporters(monkeypatch):
+    created = []
+
+    def factory(cfg):
+        exporter = InMemorySpanExporter()
+        created.append(exporter)
+        return exporter
+
+    monkeypatch.setattr(otel, "build_span_exporter", factory)
+    return created
+
+
+def test_child_rebuilds_tracer_provider_and_keeps_the_switchable(exporters, span_exporters):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    switchable = ctx.tracer_provider
+    parent_delegate = switchable.delegate
+    tracer = switchable.get_tracer("t")  # an instrumentor would hold this tracer across the fork
+    with tracer.start_as_current_span("parent-unflushed", kind=SpanKind.SERVER):
+        pass
+
+    def probe():
+        with tracer.start_as_current_span("child", kind=SpanKind.SERVER):
+            pass
+        ctx.tracer_provider.force_flush()
+        spans = span_exporters[-1].get_finished_spans()
+        return {
+            "same_switchable": ctx.tracer_provider is switchable,
+            "new_delegate": switchable.delegate is not parent_delegate,
+            "names": [s.name for s in spans],
+            "instance_ids": [s.resource.attributes["service.instance.id"] for s in spans],
+            "pid": os.getpid(),
+            "exporter_count": len(span_exporters),
+        }
+
+    result = _run_in_child(probe)
+    assert result["same_switchable"] and result["new_delegate"]
+    assert result["names"] == ["child"]
+    assert result["instance_ids"] == [f"{result['instance_ids'][0].rsplit('-', 1)[0]}-{result['pid']}"]
+    assert result["exporter_count"] == 2
+    ctx.tracer_provider.force_flush()
+    assert [s.name for s in span_exporters[0].get_finished_spans()] == ["parent-unflushed"]
+    assert switchable.delegate is parent_delegate
+
+
+def test_horse_spans_carry_the_rq_horse_role(exporters, span_exporters):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_RQ)
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    try:
+
+        def probe():
+            with ctx.tracer_provider.get_tracer("t").start_as_current_span("job", kind=SpanKind.CONSUMER):
+                pass
+            ctx.tracer_provider.force_flush()
+            (span,) = span_exporters[-1].get_finished_spans()
+            return {"role": span.resource.attributes["netbox.process.role"]}
+
+        result = _run_in_child(probe)
+    finally:
+        bootstrap.set_next_fork_role(None)
+    assert result == {"role": "rq_horse"}
+
+
+def test_tracer_rebuild_failure_stops_span_export_in_the_child(exporters, span_exporters, monkeypatch):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    tracer = ctx.tracer_provider.get_tracer("t")
+
+    def boom(cfg):
+        raise OSError("certificate unreadable")
+
+    monkeypatch.setattr(otel, "build_span_exporter", boom)
+
+    def probe():
+        with tracer.start_as_current_span("child", kind=SpanKind.SERVER) as span:
+            recording = span.is_recording()
+        return {
+            "recording": recording,
+            "owns": bootstrap._state.owns_tracer_provider,
+            "parent_exporter_spans": len(span_exporters[0].get_finished_spans()),
+            "logger_provider": ctx.logger_provider is None,
+        }
+
+    result = _run_in_child(probe)
+    assert result == {"recording": False, "owns": False, "parent_exporter_spans": 0, "logger_provider": True}
+
+
+def test_external_tracer_provider_is_not_rebuilt(exporters, monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    external = TracerProvider()
+    monkeypatch.setattr(otel, "existing_tracer_provider", lambda: external)
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    result = _run_in_child(lambda: {"same": ctx.tracer_provider is external})
+    assert result == {"same": True}

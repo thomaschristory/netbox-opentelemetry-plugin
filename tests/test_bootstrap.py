@@ -4,12 +4,14 @@ import time
 
 import pytest
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from netbox_opentelemetry_plugin import bootstrap, conf, otel
 from netbox_opentelemetry_plugin.conf import Settings
 
 USER = {"exporter": {"endpoint": "http://collector:4318"}, "logs": {"loggers": ["t.boot"]}}
 ARGV_WEB = ["granian", "netbox.granian:application"]
+TRACES_USER = {**USER, "traces": {"enabled": True, "instrument": []}}
 
 
 @pytest.fixture(autouse=True)
@@ -309,3 +311,95 @@ def test_describe_redacts_trace_exporter_headers_and_endpoint():
     text = bootstrap._describe(exc, settings)
     assert "tracepass" not in text
     assert "trace-secret-value" not in text
+
+
+@pytest.fixture
+def span_exporter(monkeypatch):
+    exp = InMemorySpanExporter()
+    monkeypatch.setattr(otel, "build_span_exporter", lambda cfg: exp)
+    return exp
+
+
+def test_traces_install_builds_an_owned_switchable_provider(exporter, span_exporter):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    assert isinstance(ctx.tracer_provider, otel.SwitchableTracerProvider)
+    assert bootstrap._state.owns_tracer_provider is True
+    assert [m.name for m in bootstrap._state.modules] == ["logs", "audit", "traces"]
+    with ctx.tracer_provider.get_tracer("t").start_as_current_span("s"):
+        pass
+    assert bootstrap.force_flush(2.0) is True
+    (span,) = span_exporter.get_finished_spans()
+    assert span.resource.attributes["netbox.process.role"] == "web"
+
+
+def test_traces_off_by_default_installs_no_tracing(exporter):
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    assert ctx.tracer_provider is None
+    assert [m.name for m in bootstrap._state.modules] == ["logs", "audit"]
+
+
+@pytest.mark.parametrize("argv", [["manage.py", "migrate"], ["manage.py", "nbshell"]])
+def test_management_commands_get_no_traces(exporter, span_exporter, argv):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=argv)
+    assert ctx.tracer_provider is None
+    assert "traces" not in [m.name for m in bootstrap._state.modules]
+
+
+def test_rqworker_gets_traces(exporter, span_exporter):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=["/opt/netbox/netbox/manage.py", "rqworker"])
+    assert ctx.tracer_provider is not None
+
+
+def test_external_tracer_provider_is_reused(exporter, monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    external = TracerProvider()
+    monkeypatch.setattr(otel, "existing_tracer_provider", lambda: external)
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    assert ctx.tracer_provider is external
+    assert bootstrap._state.owns_tracer_provider is False
+    bootstrap.shutdown()
+    # Not ours to shut down: it still hands out recording spans.
+    assert external.get_tracer("t").start_span("x").is_recording()
+
+
+def test_span_exporter_failure_disables_traces_only(exporter, monkeypatch, caplog):
+    def boom(cfg):
+        raise OSError("certificate unreadable")
+
+    monkeypatch.setattr(otel, "build_span_exporter", boom)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    assert ctx.tracer_provider is None
+    assert ctx.logger_provider is not None
+    assert any("trace export disabled" in r.getMessage() for r in caplog.records)
+
+
+def test_force_flush_flushes_spans_and_logs(exporter, span_exporter):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    logging.getLogger("t.boot").setLevel(logging.INFO)
+    with ctx.tracer_provider.get_tracer("t").start_as_current_span("s"):
+        logging.getLogger("t.boot").info("in span")
+    assert bootstrap.force_flush(2.0) is True
+    assert len(span_exporter.get_finished_spans()) == 1
+    assert [r.log_record.body for r in exporter.get_finished_logs()] == ["in span"]
+
+
+def test_force_flush_reports_a_slow_tracer_flush(exporter, span_exporter, monkeypatch):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    release = threading.Event()
+    monkeypatch.setattr(ctx.tracer_provider, "force_flush", lambda timeout_millis=30000: release.wait(5))
+    started = time.monotonic()
+    try:
+        assert bootstrap.force_flush(0.2) is False
+    finally:
+        release.set()
+    assert time.monotonic() - started < 1.5
+
+
+def test_shutdown_shuts_down_the_owned_tracer_provider(exporter, span_exporter, monkeypatch):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    calls = []
+    monkeypatch.setattr(ctx.tracer_provider, "shutdown", lambda: calls.append("tracer"))
+    bootstrap.shutdown()
+    assert calls == ["tracer"]

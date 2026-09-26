@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -22,6 +23,7 @@ from .modules.audit import AuditModule
 from .modules.base import Context, Module
 from .modules.logs import LogsModule
 from .modules.rq import RqModule
+from .modules.traces import TracesModule
 from .version import __version__
 
 logger = logging.getLogger(otel.PLUGIN_LOGGER)
@@ -31,6 +33,10 @@ ROLE_RQWORKER = "rqworker"
 ROLE_RQ_HORSE = "rq_horse"
 ROLE_MANAGEMENT = "management"
 ROLE_RUNSERVER_PARENT = "runserver_parent"
+
+# Short management commands never start trace exporter threads (SPEC 4.1). The RQ work-horse
+# inherits the rqworker's provider and rebuilds it after fork.
+TRACE_ROLES = frozenset({ROLE_WEB, ROLE_RQWORKER})
 
 # A bulk edit or bulk import can write thousands of ObjectChange rows inside a single commit; the
 # default BatchLogRecordProcessor queue (2048) is sized for scattered log lines, not that burst.
@@ -61,6 +67,7 @@ class _State:
     context: Context | None
     modules: list[Module] = field(default_factory=list)
     owns_logger_provider: bool = False
+    owns_tracer_provider: bool = False
     netbox_version: str = "unknown"
 
 
@@ -118,6 +125,9 @@ def install(
         if settings.log_exporter is not None:
             _setup_logger_provider(ctx, state)
 
+        if settings.traces.enabled and role in TRACE_ROLES:
+            _setup_tracer_provider(ctx, state)
+
         for module in _candidate_modules(ctx):
             if not module.enabled(settings):
                 continue
@@ -159,13 +169,18 @@ def shutdown() -> None:
         if state is None or state.pid != os.getpid():
             return
         _state = None
+        ctx = state.context
         # Remove handlers first so records emitted during shutdown do not hit a closed provider.
         for module in reversed(state.modules):
             try:
                 module.shutdown()
             except Exception as exc:
                 logger.warning("OpenTelemetry: %s module shutdown failed: %s", module.name, type(exc).__name__)
-        ctx = state.context
+        if state.owns_tracer_provider and ctx is not None and ctx.tracer_provider is not None:
+            try:
+                ctx.tracer_provider.shutdown()
+            except Exception as exc:
+                logger.warning("OpenTelemetry: tracer provider shutdown failed: %s", type(exc).__name__)
         if state.owns_logger_provider and ctx is not None and ctx.logger_provider is not None:
             try:
                 ctx.logger_provider.shutdown()
@@ -179,8 +194,9 @@ def reinit_after_fork() -> None:
     The SDK restarts its batch threads after fork but keeps the parent's service.instance.id and
     shares the parent's exporter connection. This gives the child its own Resource, exporter and
     LoggerProvider. Idempotent: a second call in the same process does nothing. If this process
-    owned its LoggerProvider and the rebuild fails, it detaches the logging handler and exports
-    nothing rather than keep using the inherited, now-orphaned provider.
+    owned its LoggerProvider and the rebuild fails, it detaches the logging handler and points the
+    tracer provider at a no-op provider rather than keep using the inherited, now-orphaned
+    providers.
 
     This never calls shutdown() (or anything else) on an object inherited from the parent: any
     lock inside such an object (a threading.Lock, a Condition, an SSL/urllib3 connection pool
@@ -204,6 +220,11 @@ def reinit_after_fork() -> None:
             _rebuild_for_child(ctx, state, role_hint)
         except Exception as exc:
             logger.warning("OpenTelemetry: re-initialisation after fork failed: %s", _describe(exc, ctx.settings))
+            if state.owns_tracer_provider and ctx.tracer_provider is not None:
+                # Same reason as below: never export through the inherited exporter connection.
+                state.owns_tracer_provider = False
+                with contextlib.suppress(Exception):
+                    ctx.tracer_provider.set_delegate(otel.noop_tracer_provider())
             if state.owns_logger_provider:
                 # This process could not build its own provider. The inherited one shares the parent's
                 # exporter connection, so stop exporting from this process instead of using it.
@@ -226,65 +247,86 @@ def set_next_fork_role(role: str | None) -> None:
 
 
 def force_flush(timeout: float) -> bool:
-    """Flush this process's log provider, waiting at most `timeout` seconds. Never raises.
+    """Flush every provider of this process (logs and traces) in parallel, waiting at most
+    `timeout` seconds in total. Never raises.
 
-    True means the flush call returned within the deadline, or there was nothing to flush: no
+    True means every flush call returned within the deadline, or there was nothing to flush: no
     installed state, a process whose PID does not match the installed state (treated as nothing
-    to flush here), or no LoggerProvider. It does not mean the records were exported: a failure
-    inside the provider's force_flush is swallowed and still reported as True, since the flush
-    call itself did not hang past the deadline. False is returned when the deadline passed before
-    the flush finished, or when the helper thread itself could not be started.
+    to flush here), or no providers. It does not mean the records were exported: a failure inside
+    a provider's force_flush is swallowed and still counts as that flush having returned, since
+    the flush call itself did not hang past the deadline. False is returned when the deadline
+    passed before every flush finished, or when a helper thread itself could not be started.
 
-    The flush runs on a helper thread so a stuck export cannot hold the caller beyond the
-    deadline.
+    Each provider's flush runs on its own helper thread, in parallel, so a stuck export cannot
+    hold the caller beyond the deadline.
     """
     state = _state
     if state is None or state.pid != os.getpid() or state.context is None:
         return True
-    provider = state.context.logger_provider
-    if provider is None:
+    ctx = state.context
+    providers = [p for p in (ctx.logger_provider, ctx.tracer_provider) if p is not None]
+    if not providers:
         return True
-    done = threading.Event()
+    deadline = time.monotonic() + timeout
+    done_events = []
+    for provider in providers:
+        done = threading.Event()
 
-    def run() -> None:
+        def run(provider=provider, done=done) -> None:
+            try:
+                provider.force_flush(timeout_millis=int(timeout * 1000))
+            except Exception:
+                pass
+            finally:
+                done.set()
+
         try:
-            provider.force_flush(timeout_millis=int(timeout * 1000))
+            threading.Thread(target=run, name="otel-flush", daemon=True).start()
         except Exception:
-            pass
-        finally:
-            done.set()
-
-    try:
-        threading.Thread(target=run, name="otel-flush", daemon=True).start()
-    except Exception:
-        # Thread creation can fail (resource limits, interpreter finalization). Nothing was
-        # started, so there is nothing to wait on: report the flush as not completed.
-        return False
-    return done.wait(timeout)
+            # Thread creation can fail (resource limits, interpreter finalization). Nothing was
+            # started, so there is nothing to wait on: report the flush as not completed.
+            return False
+        done_events.append(done)
+    return all(done.wait(max(0.0, deadline - time.monotonic())) for done in done_events)
 
 
 def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> None:
-    """Build a new role, Resource and (if we own it) LoggerProvider for this process.
+    """Build a new role, Resource and (if we own them) LoggerProvider/tracer SDK provider for this process.
 
-    Nothing is assigned onto ctx until the new LoggerProvider has been built successfully, so a
+    Nothing is assigned onto ctx until every new provider has been built successfully, so a
     failure here (for example the exporter config referencing a now-unreadable certificate file)
-    leaves ctx.role, ctx.resource and ctx.logger_provider exactly as they were: still consistent
-    with each other, still the values inherited from the parent at fork time.
+    leaves ctx.role, ctx.resource, ctx.logger_provider and ctx.tracer_provider exactly as they
+    were: still consistent with each other, still the values inherited from the parent at fork
+    time.
 
     The role changes only when the parent announced the fork (see `set_next_fork_role`); an
     unannounced fork of an rqworker process (for example the RQ scheduler's own child) keeps the
     rqworker role.
 
-    The old provider (if we owned one) is never shut down here: see reinit_after_fork for why.
+    The old logger provider (if we owned one) is never shut down here: see reinit_after_fork for
+    why. The tracer provider is different: we own the SwitchableTracerProvider handed to
+    instrumentors for the process lifetime, and only replace the SDK provider behind it, so there
+    is nothing of ours to shut down; the old SDK provider is simply dropped, for the same
+    never-touch-inherited-state reason.
     """
     role = role_hint or ctx.role
     resource = _build_resource(ctx.settings, role, state.netbox_version)
+    # Build everything first, assign afterwards: a failure leaves ctx exactly as inherited.
+    new_logger_provider = None
     if state.owns_logger_provider and ctx.logger_provider is not None:
         # A fresh exporter gives the child its own HTTP session or gRPC channel instead of
         # sharing the parent's keep-alive connections.
         exporter = otel.build_log_exporter(ctx.settings.log_exporter)
         max_queue_size = AUDIT_QUEUE_SIZE if ctx.settings.audit.enabled else None
-        ctx.logger_provider = otel.build_logger_provider(resource, exporter, max_queue_size=max_queue_size)
+        new_logger_provider = otel.build_logger_provider(resource, exporter, max_queue_size=max_queue_size)
+    new_tracer_provider = None
+    if state.owns_tracer_provider and ctx.tracer_provider is not None:
+        new_tracer_provider = _build_tracer_provider(ctx.settings, resource)
+    if new_logger_provider is not None:
+        ctx.logger_provider = new_logger_provider
+    if new_tracer_provider is not None:
+        # Instrumentors hold the switchable provider; only the SDK provider behind it changes.
+        ctx.tracer_provider.set_delegate(new_tracer_provider)
     ctx.role = role
     ctx.resource = resource
     for module in state.modules:
@@ -342,11 +384,37 @@ def _setup_logger_provider(ctx: Context, state: _State) -> None:
         logger.warning("OpenTelemetry: log export disabled: could not build exporter: %s", _describe(exc, ctx.settings))
 
 
+def _build_tracer_provider(settings: conf.Settings, resource):
+    cfg = settings.traces
+    return otel.build_tracer_provider(
+        resource, otel.build_span_exporter(cfg.exporter), otel.build_sampler(cfg.sampler, cfg.sampler_arg)
+    )
+
+
+def _setup_tracer_provider(ctx: Context, state: _State) -> None:
+    existing = otel.existing_tracer_provider()
+    if existing is not None:
+        logger.info("OpenTelemetry: reusing the TracerProvider configured outside the plugin")
+        ctx.tracer_provider = existing
+        return
+    try:
+        provider = _build_tracer_provider(ctx.settings, ctx.resource)
+    except Exception as exc:
+        logger.warning(
+            "OpenTelemetry: trace export disabled: could not build exporter: %s", _describe(exc, ctx.settings)
+        )
+        return
+    ctx.tracer_provider = otel.SwitchableTracerProvider(provider)
+    state.owns_tracer_provider = True
+
+
 def _candidate_modules(ctx: Context) -> list[Module]:
     modules: list[Module] = []
     if ctx.logger_provider is not None:
         modules.append(LogsModule())
         modules.append(AuditModule())
+    if ctx.tracer_provider is not None:
+        modules.append(TracesModule())
     if ctx.role == ROLE_RQWORKER:
         modules.append(RqModule())
     return modules

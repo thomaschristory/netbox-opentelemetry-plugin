@@ -2,7 +2,7 @@
 
 NetBox plugin that exports NetBox telemetry over OTLP to an OpenTelemetry Collector, from inside the NetBox processes. Each signal is a module that can be enabled or disabled in configuration.
 
-Status: under development. Currently implemented: application logs and audit records, with support for forking web servers and RQ work-horses.
+Status: under development. Currently implemented: application logs, audit records and traces, with support for forking web servers and RQ work-horses.
 
 ## Web servers
 
@@ -23,6 +23,35 @@ Only a horse killed with SIGKILL cannot flush: a hang past `job.timeout + 60` se
 This flush happens after the job, not during it: web requests never block on it, but a worker starts its next job only once the current horse has exited. If the Collector is unreachable, every job pays up to the full `flush_timeout` before the worker moves on, capping that worker at roughly one job per `flush_timeout` for the duration of the outage. For busy queues, set a lower `rq.flush_timeout` (for example 1 to 2 seconds) to bound that cost.
 
 Audit records for changes made inside a job or a custom script, and log lines written by them, are flushed by this same mechanism: both wait on the horse before it exits. With `rq.enabled = False` or `rq.patch_worker = False`, the flush wrap is never installed, and records buffered when the horse exits are lost.
+
+## Traces
+
+```python
+PLUGINS_CONFIG = {
+    "netbox_opentelemetry_plugin": {
+        "traces": {"enabled": True},
+    },
+}
+```
+
+With `traces.enabled`, the plugin instruments Django, psycopg, redis and outbound `requests` calls, and adds a span around every RQ job. A NetBox web request produces one span per HTTP request (named from the route template), with `netbox.request_id` and, when the request is authenticated, `enduser.id`. Database queries, redis commands and outbound HTTP calls made while handling that request or job are child spans of it.
+
+When a job is enqueued from inside a request or another job (NetBox's own `Queue.enqueue_job`), the current trace context travels with it in `job.meta`, so the job's span, and anything it does, such as an outbound webhook call, share the same trace as the request that enqueued it. This is how a change made through the API, its audit record, the log lines the request writes, and any webhook fired by it end up correlated under one trace id.
+
+`traces.instrument` selects which instrumentors run (`django`, `psycopg`, `redis`, `requests`, all on by default). `traces.excluded_urls` skips instrumenting the listed URL prefixes, `/static/`, `/metrics` and `/api/status/` by default.
+
+Sampling is controlled by `traces.sampler` and `traces.sampler_arg` (default `parentbased_traceidratio` at `1.0`, meaning every trace with a sampled or absent parent is kept). Unset, these fall back to the standard `OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` environment variables, then to the default above. A database or redis span with no parent, such as a query made outside any request or job, for example an RQ worker's own polling and heartbeat commands, is dropped before the sampler runs rather than starting a trace of its own.
+
+Nothing sensitive leaves the process through spans: no HTTP header value, no SQL bind parameter, and no URL query string, inbound or outbound, is exported. A query string on an exported URL attribute becomes `?REDACTED`; the same replacement is applied to status descriptions and exception event attributes, so a secret embedded in a failed request's URL cannot leak through those either. Only the W3C trace context is copied into an RQ job's `meta`, never baggage.
+
+Known limitations:
+
+- A psycopg connection opened before the plugin's `ready()`, for example by startup code, is not traced until Django closes and reopens it (`CONN_MAX_AGE`).
+- Jobs created through `enqueue_at`, `enqueue_in`, `enqueue_many` or the rq scheduler, and retried or requeued jobs, start their own trace: only `Queue.enqueue_job` carries context forward.
+- With django-rq's `COMMIT_MODE` set to `"request_finished"`, a job is enqueued after the request's span has already ended, so it is not linked to that request's trace.
+- If a `TracerProvider` is already configured outside the plugin (for example by `opentelemetry-instrument`) and reused, the plugin's redaction and its filter for parentless database and redis spans do not apply; that provider's own configuration decides what is exported.
+- If another rq exception handler registered before the plugin's own returns `False`, the job span still gets an ERROR status but no exception event, since the plugin's handler is never reached.
+- The `exception.message` attribute of a log record (application logs, not spans) is not scrubbed for URL query strings.
 
 ## Audit records
 

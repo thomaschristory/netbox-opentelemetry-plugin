@@ -1,4 +1,5 @@
-"""Helpers shared by the e2e tests: log in to NetBox and read the Collector's JSON log output."""
+"""Helpers shared by the e2e tests: log in to NetBox and read the Collector's JSON log and trace
+output."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ from pathlib import Path
 import requests
 
 LOGS_FILE = Path(__file__).resolve().parents[2] / "dev" / "data" / "collector" / "logs.json"
+TRACES_FILE = LOGS_FILE.parent / "traces.json"
 
 
 def login(base_url: str, username: str, password: str) -> None:
@@ -45,6 +47,24 @@ def log_records() -> Iterator[tuple[dict, dict, dict]]:
             for scope_logs in resource_logs.get("scopeLogs", []):
                 for record in scope_logs.get("logRecords", []):
                     yield resource, scope_logs.get("scope", {}), record
+
+
+def spans() -> Iterator[tuple[dict, dict, dict]]:
+    if not TRACES_FILE.exists():
+        return
+    for line in TRACES_FILE.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            # Tolerates a partially written last line (the file exporter may still be flushing it).
+            continue
+        for resource_spans in data.get("resourceSpans", []):
+            resource = {a["key"]: a["value"] for a in resource_spans.get("resource", {}).get("attributes", [])}
+            for scope_spans in resource_spans.get("scopeSpans", []):
+                for span in scope_spans.get("spans", []):
+                    yield resource, scope_spans.get("scope", {}), span
 
 
 def record_time_ns(record: dict) -> int:

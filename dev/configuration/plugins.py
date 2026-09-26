@@ -9,5 +9,6 @@ PLUGINS_CONFIG = {
             # NetBox's default LOGGING is empty, so the netbox logger sits at WARNING without this.
             "set_logger_levels": True,
         },
+        "traces": {"enabled": True},
     },
 }

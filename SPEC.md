@@ -33,7 +33,7 @@ Targets:
 
 - Distribution name `netbox-opentelemetry-plugin`, import name `netbox_opentelemetry_plugin`.
 - `pyproject.toml` with hatchling. Lint and format with ruff, tests with pytest.
-- All OTel dependencies are regular dependencies, pinned to a tested range: `opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`, `opentelemetry-exporter-otlp-proto-grpc`, `opentelemetry-instrumentation-django`, `-psycopg`, `-redis`, `-requests`, `-system-metrics`. Modules are selected in configuration, not at install time.
+- All OTel dependencies are regular dependencies, pinned to a tested range: `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`, `opentelemetry-exporter-otlp-proto-grpc` at `~=1.44.0`; the four instrumentation packages `opentelemetry-instrumentation-django`, `-psycopg`, `-redis`, `-requests` at `==0.65b0`; `-system-metrics` is added with the metrics milestone. Modules are selected in configuration, not at install time.
 - No `django_apps`, no models, no migrations.
 - README contains a compatibility matrix (plugin version to NetBox version), as recommended by the NetBox plugin docs.
 
@@ -90,6 +90,7 @@ ready()  -> super().ready()
 - The re-initialisation is keyed on the PID and runs at most once per process, so it is safe when both Python's at-fork hooks and uWSGI's `post_fork_hook` fire.
 - A child of the `rqworker` process takes the role `rq_horse` only when the RQ integration announced the fork (`fork_work_horse`); other forks of the worker process, such as the RQ scheduler, keep the role `rqworker`.
 - If rebuilding in the child fails, the child logs one warning. When the plugin owns the provider, it also detaches the logging handler and exports nothing rather than using the parent's exporter connection; with a provider configured outside the plugin, only the warning is logged and the inherited, unmodified provider keeps being used.
+- The TracerProvider handed to instrumentors is a switchable wrapper created once; after fork the child builds its own SDK TracerProvider and exporter and swaps them in. On a failed rebuild, span export stops in that process (no-op provider).
 
 ### 4.3 Install types (verified against NetBox 4.7.1 and netbox-docker 5.1.1 sources)
 
@@ -112,7 +113,7 @@ ready()  -> super().ready()
 - Each wrap first checks the target's signature (`self, job, queue`). On mismatch: one warning, that wrap is skipped, everything else continues. Wraps are marked and never applied twice.
 - `rq.patch_worker = False` disables both wraps; nothing is flushed in the horse then, and it keeps the `rqworker` role instead of being labelled `rq_horse`.
 - Not covered: a horse killed by the parent (SIGKILL after `job.timeout + 60` s) cannot flush. `SpawnWorker` (not used by NetBox) starts a fresh interpreter and is not detected as a horse.
-- Job spans, job metrics and trace context propagation are added with the traces and metrics milestones.
+- `Queue.enqueue_job` is wrapped (web and worker processes alike) to store the current span's W3C trace context in `job.meta["netbox_otel_context"]`, gated by `rq.propagate_context`. `BaseWorker.perform_job` runs each job inside a CONSUMER span (see 6.3), parented on that stored context when present. The horse flush (above) flushes the log provider and the tracer provider in parallel, still bounded by the single `rq.flush_timeout`.
 
 ## 5. Configuration
 
@@ -213,12 +214,24 @@ Known limitations:
 - With `include_data`, a record can grow large for an object with big JSON fields. Most Collectors reject a request above their configured body size limit, dropping the whole batch that record was in, not just that record. Keep `include_data` off, or exclude large fields such as `config_context` and `local_context_data` in `audit.exclude_fields`.
 
 ### 6.3 Traces
-- Django: one span per request, named from the route template. The plugin middleware adds `netbox.request_id` and `enduser.id`.
+- Django: one span per request, named `<METHOD> <route template>`. `RequestSpanMiddleware` adds `netbox.request_id` (str, always when the span records) and `enduser.id` (str, username, only when authenticated).
 - psycopg: span per query; statement recorded, bind parameters never.
 - redis: span per command, only when listed in `traces.instrument`.
 - requests: span per outbound call, `traceparent` injected; URL query strings replaced with `REDACTED`.
 - No HTTP headers are captured by any instrumentor.
-- RQ: CONSUMER span `rq.job <func_name>` with `messaging.system=rq`, `messaging.destination.name`, `messaging.message.id`, `netbox.job.id` and `netbox.job.name` for NetBox `Job`s. Parent is the enqueuing request when context was propagated.
+- RQ: CONSUMER span, scope `netbox_opentelemetry_plugin.rq`, name `rq.job <func_name>` (`rq.job` when the job cannot be deserialised). Attributes: `messaging.system = "rq"`, `messaging.destination.name` (queue name), `messaging.message.id` (rq job id), and for NetBox `core.Job` jobs `netbox.job.id` (int) and `netbox.job.name` (str, only when non-empty). Parent: the context in `job.meta["netbox_otel_context"]` when `rq.propagate_context` is on, otherwise a root span. On failure: status ERROR, exception event.
+- The instrumentations use the stable HTTP semantic conventions (`url.full`, `http.request.method`, ...): the plugin sets `OTEL_SEMCONV_STABILITY_OPT_IN=http` unless an operator already set it.
+- A CLIENT span with no parent (a psycopg or redis call outside a request or job, for example a startup query, or an RQ worker's own poll and heartbeat commands) is dropped before the configured sampler runs, so it does not start a trace of its own.
+- Redaction runs at export, in a `SpanProcessor` ahead of the exporting one, and covers every exported span kind (including SERVER, not only the outbound CLIENT spans instrumentors add attributes to): `http.request.header.*` / `http.response.header.*` are removed; `url.query` becomes `REDACTED`; `url.full`, `http.url` and `http.target` end in `?REDACTED` when they had a query; status descriptions and exception event attributes have any `path?query` replaced with `path?REDACTED`. A span that fails to redact is dropped rather than exported as is.
+- Only the W3C trace context (`traceparent`) is written to `job.meta["netbox_otel_context"]`; baggage is not copied, so a job never receives arbitrary request-scoped data through this channel.
+
+Known limitations:
+- A psycopg connection opened before the plugin's `ready()` (for example by startup code) is not traced until Django closes and reopens it (`CONN_MAX_AGE`).
+- Jobs created through `enqueue_at`, `enqueue_in`, `enqueue_many` or the rq scheduler, and retried or requeued jobs, start their own trace: only `Queue.enqueue_job` carries context.
+- With django-rq `COMMIT_MODE = "request_finished"`, the enqueue happens after the request's span has already ended, so the job is not linked to the request's trace.
+- With a `TracerProvider` configured outside the plugin (4.1's provider detection), the plugin's redaction and the parentless-CLIENT-span filter do not apply: that provider's own configuration governs what is exported.
+- If an rq exception handler registered before the plugin's own returns `False` (telling rq to stop walking the handler stack), the job span still gets status ERROR, but without an exception event, since the plugin's handler was not reached.
+- The `exception.message` attribute of a log record (logs module) is not scrubbed for URL query strings; only span attributes, status descriptions and span exception events are.
 
 ### 6.4 Metrics
 
@@ -240,7 +253,7 @@ Known limitations:
 - Nothing leaves the process unless it is listed in section 6.
 - Audit data payloads are off by default and filtered when on.
 - Exporter header values never appear in logs, debug output or exception messages.
-- No HTTP headers, no SQL bind parameters, no outbound URL query strings in spans.
+- No HTTP headers, no SQL bind parameters, no URL query strings (inbound or outbound) in spans.
 
 ## 8. Failure behaviour
 
@@ -267,8 +280,8 @@ Known limitations:
 ## 10. Testing
 
 1. Unit (pytest, no NetBox): config precedence and validation, masking, module install idempotency with in-memory exporters (`InMemorySpanExporter`, `InMemoryLogExporter`, `InMemoryMetricReader`), feedback filter, `exclude_fields` filter, audit mapping, a real `os.fork()` test for child rebuild, RQ wrap signature checks against rq 2.12 including the mismatch path.
-2. NetBox integration: a NetBox layer under `tests_netbox/`, run with the NetBox test runner (`make test-netbox`) against a NetBox v4.7.1 checkout with Postgres and Redis services, and in CI by the `netbox-integration` job. Currently covers audit: create, update and delete of a prefix via the API produce the expected records with a distinct `request_id` each; `include_data` on filters `exclude_fields` out of `postchange_data`; a bulk API create of 10 devices shares one `request_id`; a rolled back change emits nothing while a committed one emits exactly one record. Later milestones add request spans carrying `netbox.request_id`, logs inside requests carrying the trace id, and a real forking `rq.Worker` running a job whose spans, logs and parent metrics arrive.
-3. End-to-end (`make e2e`): drives the compose stack via the API and the sample script (normal and raising), then asserts on the Collector's JSON file output. Runs per web server profile.
+2. NetBox integration: a NetBox layer under `tests_netbox/`, run with the NetBox test runner (`make test-netbox`) against a NetBox v4.7.1 checkout with Postgres and Redis services, and in CI by the `netbox-integration` job. Covers audit: create, update and delete of a prefix via the API produce the expected records with a distinct `request_id` each; `include_data` on filters `exclude_fields` out of `postchange_data`; a bulk API create of 10 devices shares one `request_id`; a rolled back change emits nothing while a committed one emits exactly one record. Covers traces: a request produces a span carrying `netbox.request_id` and `enduser.id`; query strings are redacted; excluded URLs are not instrumented; a log record written inside a request carries the request's trace id; a real forking `rq.Worker` (via `SimpleWorker`) runs a job whose span carries context propagated from the enqueuing request, an outbound HTTP call inside the job is its own child span, and NetBox job attributes (`netbox.job.id`, `netbox.job.name`) are present. The forking work-horse and the web edit that reaches a webhook are proven live by `make e2e`, not by the NetBox test runner.
+3. End-to-end (`make e2e`): drives the compose stack via the API and the sample script (normal and raising), then asserts on the Collector's JSON file output. Runs per web server profile. With traces enabled, also proves: an API request produces a SERVER span carrying `netbox.request_id` and `enduser.id`; a log record and an audit record from the same request carry its trace id and the request's span id; a webhook fired by an edit shares that edit's trace, with the RQ job span parented on the request's span and the outbound call parented on the job span.
 
 CI (GitHub Actions): ruff; unit tests on Python 3.12, 3.13, 3.14; NetBox integration on 4.7.1; e2e for Granian and uWSGI on nightly or manual trigger.
 

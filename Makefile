@@ -1,9 +1,12 @@
 COMPOSE = docker compose -f dev/docker-compose.yml
 
-.PHONY: test lint format dev dev-gunicorn dev-uwsgi down logs-collector e2e
+.PHONY: test test-netbox lint format dev dev-gunicorn dev-uwsgi down logs-collector e2e
 
 test:
 	uv run pytest -W error::DeprecationWarning
+
+test-netbox:
+	$(COMPOSE) exec -T netbox /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py test --keepdb --noinput --parallel 1 /plugin/tests_netbox
 
 lint:
 	uv run ruff check .

@@ -74,3 +74,63 @@ jobs:
           assert any(isinstance(h, H) for h in logging.getLogger('netbox').handlers), 'handler missing'
           print('handler attached')
           "
+
+  netbox-integration:
+    name: integration tests on NetBox ${{ matrix.netbox }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        netbox: ["v4.7.1"]
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: netbox
+          POSTGRES_PASSWORD: netbox
+          POSTGRES_DB: netbox
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U netbox"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: valkey/valkey:9.1-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: plugin
+      - uses: actions/checkout@v5
+        with:
+          repository: netbox-community/netbox
+          ref: ${{ matrix.netbox }}
+          path: netbox
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install NetBox and plugin
+        run: |
+          sudo apt-get update && sudo apt-get install -y libpq-dev
+          python -m pip install --upgrade pip
+          pip install -r netbox/requirements.txt
+          pip install ./plugin
+      - name: Configure NetBox
+        run: |
+          cp netbox/netbox/netbox/configuration_testing.py netbox/netbox/netbox/configuration.py
+          cat >> netbox/netbox/netbox/configuration.py <<'EOF'
+
+          PLUGINS = ["netbox_opentelemetry_plugin"]
+          PLUGINS_CONFIG = {
+              "netbox_opentelemetry_plugin": {
+                  "exporter": {"endpoint": "http://localhost:4318"},
+              },
+          }
+          EOF
+      - name: Integration tests
+        run: python netbox/netbox/manage.py test --noinput --parallel 1 "$GITHUB_WORKSPACE/plugin/tests_netbox"

@@ -19,6 +19,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import SpanKind
 
 from netbox_opentelemetry_plugin import bootstrap, otel
+from tests.otel_helpers import RecordingMetricExporter, all_batches_points
 
 pytestmark = [
     pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork"),
@@ -531,3 +532,165 @@ def test_external_tracer_provider_is_not_rebuilt(exporters, monkeypatch):
     ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
     result = _run_in_child(lambda: {"same": ctx.tracer_provider is external})
     assert result == {"same": True}
+
+
+METRICS_USER = {**USER, "metrics": {"enabled": True, "export_interval": 3600}}
+
+
+@pytest.fixture
+def metric_exporters(monkeypatch):
+    created = []
+
+    def factory(cfg):
+        exporter = RecordingMetricExporter()
+        created.append(exporter)
+        return exporter
+
+    monkeypatch.setattr(otel, "build_metric_exporter", factory)
+    return created
+
+
+def test_child_rebuilds_the_metrics_pipeline_and_keeps_the_switchable(exporters, metric_exporters):
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+    switchable = ctx.meter_provider
+    parent_pipeline = bootstrap._state.metrics_pipeline
+    counter = switchable.get_meter("t").create_counter("netbox.object_changes")
+
+    def probe():
+        state = bootstrap._state
+        counter.add(1)
+        bootstrap.force_flush(2.0)
+        child_exporter = metric_exporters[-1]
+        points = all_batches_points(child_exporter, "netbox.object_changes")
+        resource = child_exporter.batches[-1].resource_metrics[0].resource.attributes if child_exporter.batches else {}
+        return {
+            "same_switchable": state.context.meter_provider is switchable,
+            "new_pipeline": state.metrics_pipeline is not parent_pipeline and state.metrics_pipeline is not None,
+            "delegate_is_new": switchable.delegate is state.metrics_pipeline.provider,
+            "exporters": len(metric_exporters),
+            "points": [p.value for p in points],
+            "parent_exported_in_child": len(metric_exporters[0].batches),
+            "instance": resource.get("service.instance.id", ""),
+            "pid": os.getpid(),
+            "threads": [t.name for t in threading.enumerate()],
+        }
+
+    result = _run_in_child(probe)
+    assert result["same_switchable"] and result["new_pipeline"] and result["delegate_is_new"]
+    assert result["exporters"] == 2
+    assert result["points"] == [1]
+    assert result["parent_exported_in_child"] == 0
+    assert result["instance"].endswith(f"-{result['pid']}")
+    assert "otel-metrics" in result["threads"]
+
+
+def test_horse_records_into_a_noop_and_never_exports(exporters, metric_exporters):
+    user = {**METRICS_USER, "metrics": {"enabled": True, "export_interval": 0.05}}
+    ctx = bootstrap.install(user, env={}, argv=ARGV_RQ)
+    counter = ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes")
+    gauge_calls = []
+    ctx.meter_provider.get_meter("t").create_observable_gauge(
+        "netbox.rq.queue.depth", callbacks=[lambda options: gauge_calls.append(os.getpid()) or []]
+    )
+
+    def probe():
+        state = bootstrap._state
+        batches_before = len(metric_exporters[0].batches)
+        counter.add(5)
+        time.sleep(0.4)  # several parent intervals: nothing may export or collect in the child
+        flushed = bootstrap.force_flush(1.0)
+        return {
+            "role": state.context.role,
+            "pipeline": state.metrics_pipeline is None,
+            "noop": type(state.context.meter_provider.delegate).__name__,
+            "exporters": len(metric_exporters),
+            "batches_delta": len(metric_exporters[0].batches) - batches_before,
+            "flushed": flushed,
+            "threads": [t.name for t in threading.enumerate()],
+            "child_callbacks": [pid for pid in gauge_calls if pid == os.getpid()],
+        }
+
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    result = _run_in_child(probe)
+    assert result["role"] == bootstrap.ROLE_RQ_HORSE
+    assert result["pipeline"] is True
+    assert result["noop"] == "NoOpMeterProvider"
+    assert result["exporters"] == 1  # no exporter was built in the horse
+    assert result["batches_delta"] == 0
+    assert result["flushed"] is True
+    assert "otel-metrics" not in result["threads"]
+    assert "OtelPeriodicExportingMetricReader" not in result["threads"]
+    assert result["child_callbacks"] == []
+
+
+def test_horse_forked_while_the_parent_exports_does_not_deadlock(exporters, monkeypatch):
+    block = threading.Event()
+    blocked = RecordingMetricExporter(block=block)
+    monkeypatch.setattr(otel, "build_metric_exporter", lambda cfg: blocked)
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_RQ)
+    counter = ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes")
+    counter.add(1)
+    # The parent's export thread is now inside export(), holding the reader's export lock.
+    flusher = threading.Thread(target=bootstrap._state.metrics_pipeline.force_flush, daemon=True)
+    flusher.start()
+    time.sleep(0.1)
+
+    def probe():
+        counter.add(1)
+        return {"flushed": bootstrap.force_flush(1.0)}
+
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    try:
+        result = _run_in_child(probe)
+    finally:
+        block.set()
+        flusher.join(2)
+    assert result["flushed"] is True
+
+
+def test_parent_keeps_exporting_after_a_fork(exporters, metric_exporters):
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+    counter = ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes")
+    _run_in_child(lambda: {})
+    counter.add(3)
+    bootstrap.force_flush(2.0)
+    assert [p.value for p in all_batches_points(metric_exporters[0], "netbox.object_changes")] == [3]
+
+
+def test_metrics_rebuild_failure_switches_the_child_to_noop(exporters, monkeypatch):
+    calls = []
+
+    def factory(cfg):
+        calls.append(os.getpid())
+        if len(calls) > 1:
+            raise RuntimeError("certificate gone")
+        return RecordingMetricExporter()
+
+    monkeypatch.setattr(otel, "build_metric_exporter", factory)
+    bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+
+    def probe():
+        state = bootstrap._state
+        return {
+            "pipeline": state.metrics_pipeline is None,
+            "noop": type(state.context.meter_provider.delegate).__name__,
+        }
+
+    result = _run_in_child(probe)
+    assert result["pipeline"] is True
+    assert result["noop"] == "NoOpMeterProvider"
+
+
+def test_external_meter_provider_is_kept_in_a_web_child_and_switched_off_in_a_horse(exporters, monkeypatch):
+    from opentelemetry.sdk.metrics import MeterProvider
+
+    external = MeterProvider(shutdown_on_exit=False)
+    monkeypatch.setattr(otel, "existing_meter_provider", lambda: external)
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_RQ)
+    switchable = ctx.meter_provider
+
+    unannounced = _run_in_child(lambda: {"external": switchable.delegate is external})
+    assert unannounced["external"] is True
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    horse = _run_in_child(lambda: {"noop": type(switchable.delegate).__name__})
+    assert horse["noop"] == "NoOpMeterProvider"

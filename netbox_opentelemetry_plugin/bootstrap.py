@@ -38,6 +38,10 @@ ROLE_RUNSERVER_PARENT = "runserver_parent"
 # inherits the rqworker's provider and rebuilds it after fork.
 TRACE_ROLES = frozenset({ROLE_WEB, ROLE_RQWORKER})
 
+# Metrics run only in the long-lived web and rqworker processes (SPEC 4.1, 6.4). A forked RQ
+# work-horse records into a no-op provider and never exports; job metrics come from its parent.
+METRIC_ROLES = frozenset({ROLE_WEB, ROLE_RQWORKER})
+
 # A bulk edit or bulk import can write thousands of ObjectChange rows inside a single commit; the
 # default BatchLogRecordProcessor queue (2048) is sized for scattered log lines, not that burst.
 # Sized generously so a single bulk operation cannot overrun it and silently drop audit records.
@@ -68,6 +72,7 @@ class _State:
     modules: list[Module] = field(default_factory=list)
     owns_logger_provider: bool = False
     owns_tracer_provider: bool = False
+    metrics_pipeline: otel.MetricsPipeline | None = None
     netbox_version: str = "unknown"
 
 
@@ -128,6 +133,9 @@ def install(
         if settings.traces.enabled and role in TRACE_ROLES:
             _setup_tracer_provider(ctx, state)
 
+        if settings.metrics.enabled and role in METRIC_ROLES:
+            _setup_meter_provider(ctx, state)
+
         for module in _candidate_modules(ctx):
             if not module.enabled(settings):
                 continue
@@ -176,6 +184,16 @@ def shutdown() -> None:
                 module.shutdown()
             except Exception as exc:
                 logger.warning("OpenTelemetry: %s module shutdown failed: %s", module.name, type(exc).__name__)
+        if state.metrics_pipeline is not None:
+            pipeline, state.metrics_pipeline = state.metrics_pipeline, None
+            try:
+                pipeline.shutdown(ctx.settings.metrics.exporter.timeout)
+            except Exception as exc:
+                logger.warning("OpenTelemetry: meter provider shutdown failed: %s", type(exc).__name__)
+        if ctx is not None and ctx.meter_provider is not None:
+            # Later measurements (for example from a request racing the shutdown) go nowhere.
+            with contextlib.suppress(Exception):
+                ctx.meter_provider.set_delegate(otel.noop_meter_provider())
         if state.owns_tracer_provider and ctx is not None and ctx.tracer_provider is not None:
             try:
                 ctx.tracer_provider.shutdown()
@@ -225,6 +243,12 @@ def reinit_after_fork() -> None:
                 state.owns_tracer_provider = False
                 with contextlib.suppress(Exception):
                     ctx.tracer_provider.set_delegate(otel.noop_tracer_provider())
+            role = role_hint or ctx.role
+            if ctx.meter_provider is not None and (state.metrics_pipeline is not None or role not in METRIC_ROLES):
+                # No exporter of our own in this process: record nowhere rather than into inherited state.
+                state.metrics_pipeline = None
+                with contextlib.suppress(Exception):
+                    ctx.meter_provider.set_delegate(otel.noop_meter_provider())
             if state.owns_logger_provider:
                 # This process could not build its own provider. The inherited one shares the parent's
                 # exporter connection, so stop exporting from this process instead of using it.
@@ -247,8 +271,8 @@ def set_next_fork_role(role: str | None) -> None:
 
 
 def force_flush(timeout: float) -> bool:
-    """Flush every provider of this process (logs and traces) in parallel, waiting at most
-    `timeout` seconds in total. Never raises.
+    """Flush every provider of this process (logs, traces and, where this process owns one, the
+    metrics pipeline) in parallel, waiting at most `timeout` seconds in total. Never raises.
 
     True means every flush call returned within the deadline, or there was nothing to flush: no
     installed state, a process whose PID does not match the installed state (treated as nothing
@@ -264,17 +288,20 @@ def force_flush(timeout: float) -> bool:
     if state is None or state.pid != os.getpid() or state.context is None:
         return True
     ctx = state.context
-    providers = [p for p in (ctx.logger_provider, ctx.tracer_provider) if p is not None]
-    if not providers:
+    flushables = [p for p in (ctx.logger_provider, ctx.tracer_provider) if p is not None]
+    if state.metrics_pipeline is not None:
+        # Never in a work-horse: it has no pipeline (SPEC 6.4).
+        flushables.append(state.metrics_pipeline)
+    if not flushables:
         return True
     deadline = time.monotonic() + timeout
     done_events = []
-    for provider in providers:
+    for flushable in flushables:
         done = threading.Event()
 
-        def run(provider=provider, done=done) -> None:
+        def run(flushable=flushable, done=done) -> None:
             try:
-                provider.force_flush(timeout_millis=int(timeout * 1000))
+                flushable.force_flush(timeout_millis=int(timeout * 1000))
             except Exception:
                 pass
             finally:
@@ -291,7 +318,9 @@ def force_flush(timeout: float) -> bool:
 
 
 def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> None:
-    """Build a new role, Resource and (if we own them) LoggerProvider/tracer SDK provider for this process.
+    """Build a new role, Resource and (if we own them) LoggerProvider, tracer SDK provider and metrics
+    pipeline for this process. The metrics pipeline is rebuilt only in the web and rqworker roles; a
+    work-horse gets a no-op meter provider instead.
 
     Nothing is assigned onto ctx until every new provider has been built successfully, so a
     failure here (for example the exporter config referencing a now-unreadable certificate file)
@@ -307,7 +336,9 @@ def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> No
     why. The tracer provider is different: we own the SwitchableTracerProvider handed to
     instrumentors for the process lifetime, and only replace the SDK provider behind it, so there
     is nothing of ours to shut down; the old SDK provider is simply dropped, for the same
-    never-touch-inherited-state reason.
+    never-touch-inherited-state reason. The metrics pipeline is handled the same way: the inherited
+    one (export thread gone, locks copied) is dropped, never flushed or shut down, and only the
+    delegate of the SwitchableMeterProvider changes.
     """
     role = role_hint or ctx.role
     resource = _build_resource(ctx.settings, role, state.netbox_version)
@@ -319,23 +350,39 @@ def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> No
         exporter = otel.build_log_exporter(ctx.settings.log_exporter)
         max_queue_size = AUDIT_QUEUE_SIZE if ctx.settings.audit.enabled else None
         new_logger_provider = otel.build_logger_provider(resource, exporter, max_queue_size=max_queue_size)
+    # Child-owned objects not yet referenced anywhere else: shut them down if a later build fails or
+    # they leak silently, unlike the inherited providers still on ctx, which this function never touches.
+    built = []
+    if new_logger_provider is not None:
+        built.append(new_logger_provider)
     new_tracer_provider = None
-    if state.owns_tracer_provider and ctx.tracer_provider is not None:
-        try:
+    new_pipeline = None
+    try:
+        if state.owns_tracer_provider and ctx.tracer_provider is not None:
             new_tracer_provider = _build_tracer_provider(ctx.settings, resource)
-        except Exception:
-            # new_logger_provider (if built above) is child-owned and not referenced anywhere else:
-            # shut it down here or it leaks silently, unlike ctx.logger_provider (still the
-            # inherited one at this point), which this function never touches.
-            if new_logger_provider is not None:
-                with contextlib.suppress(Exception):
-                    new_logger_provider.shutdown()
-            raise
+            built.append(new_tracer_provider)
+        if state.metrics_pipeline is not None and role in METRIC_ROLES:
+            new_pipeline = _build_metrics_pipeline(ctx.settings, resource)
+    except Exception:
+        for obj in built:
+            with contextlib.suppress(Exception):
+                obj.shutdown()
+        raise
     if new_logger_provider is not None:
         ctx.logger_provider = new_logger_provider
     if new_tracer_provider is not None:
         # Instrumentors hold the switchable provider; only the SDK provider behind it changes.
         ctx.tracer_provider.set_delegate(new_tracer_provider)
+    if ctx.meter_provider is not None:
+        if role not in METRIC_ROLES:
+            # An RQ work-horse exports no metrics (SPEC 6.4). It must not record into the inherited
+            # SDK provider either: the parent's export thread may have held its locks at fork time.
+            state.metrics_pipeline = None
+            ctx.meter_provider.set_delegate(otel.noop_meter_provider())
+        elif new_pipeline is not None:
+            # The inherited pipeline (thread gone, locks copied) is dropped, never shut down.
+            state.metrics_pipeline = new_pipeline
+            ctx.meter_provider.set_delegate(new_pipeline.provider)
     ctx.role = role
     ctx.resource = resource
     for module in state.modules:
@@ -417,12 +464,40 @@ def _setup_tracer_provider(ctx: Context, state: _State) -> None:
     state.owns_tracer_provider = True
 
 
+def _build_metrics_pipeline(settings: conf.Settings, resource) -> otel.MetricsPipeline:
+    cfg = settings.metrics
+    return otel.MetricsPipeline(
+        resource, otel.build_metric_exporter(cfg.exporter), interval=cfg.export_interval, timeout=cfg.exporter.timeout
+    )
+
+
+def _setup_meter_provider(ctx: Context, state: _State) -> None:
+    existing = otel.existing_meter_provider()
+    if existing is not None:
+        logger.info("OpenTelemetry: reusing the MeterProvider configured outside the plugin")
+        # Wrapped all the same, so the plugin's instruments can be switched off in a forked work-horse.
+        ctx.meter_provider = otel.SwitchableMeterProvider(existing)
+        return
+    try:
+        pipeline = _build_metrics_pipeline(ctx.settings, ctx.resource)
+    except Exception as exc:
+        logger.warning(
+            "OpenTelemetry: metric export disabled: could not build exporter: %s", _describe(exc, ctx.settings)
+        )
+        return
+    ctx.meter_provider = otel.SwitchableMeterProvider(pipeline.provider)
+    state.metrics_pipeline = pipeline
+
+
 def _candidate_modules(ctx: Context) -> list[Module]:
     modules: list[Module] = []
     if ctx.logger_provider is not None:
         modules.append(LogsModule())
+    # The audit receiver also counts changes, which works without a log pipeline.
+    if ctx.logger_provider is not None or ctx.meter_provider is not None:
         modules.append(AuditModule())
-    if ctx.tracer_provider is not None:
+    # One set of instrumentors serves spans and HTTP metrics.
+    if ctx.tracer_provider is not None or ctx.meter_provider is not None:
         modules.append(TracesModule())
     # RQ: worker wraps in the rqworker process; the enqueue wrap wherever spans are recorded.
     if ctx.role == ROLE_RQWORKER or ctx.tracer_provider is not None:

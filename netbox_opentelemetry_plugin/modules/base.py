@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Protocol
 from ..conf import Settings
 
 if TYPE_CHECKING:
+    from opentelemetry.metrics import MeterProvider
     from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.trace import TracerProvider
@@ -20,6 +21,7 @@ class Context:
     resource: Resource
     logger_provider: LoggerProvider | None = None
     tracer_provider: TracerProvider | None = None
+    meter_provider: MeterProvider | None = None
 
 
 class Module(Protocol):

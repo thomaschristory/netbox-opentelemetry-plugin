@@ -8,6 +8,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from netbox_opentelemetry_plugin import bootstrap, conf, otel
 from netbox_opentelemetry_plugin.conf import Settings
+from tests.otel_helpers import RecordingMetricExporter, all_batches_points
 
 USER = {"exporter": {"endpoint": "http://collector:4318"}, "logs": {"loggers": ["t.boot"]}}
 ARGV_WEB = ["granian", "netbox.granian:application"]
@@ -435,3 +436,128 @@ def test_rebuild_shuts_down_the_new_child_logger_provider_when_tracer_rebuild_fa
     # The inherited (parent-owned-in-this-child) provider is never assigned away by _rebuild_for_child
     # itself; reinit_after_fork's own except-handler is what stops using it (see test_fork.py).
     assert ctx.logger_provider is None
+
+
+METRICS_USER = {**USER, "metrics": {"enabled": True, "export_interval": 3600}}
+
+
+@pytest.fixture
+def metric_exporter(monkeypatch):
+    exp = RecordingMetricExporter()
+    monkeypatch.setattr(otel, "build_metric_exporter", lambda cfg: exp)
+    return exp
+
+
+def test_metrics_install_builds_an_owned_pipeline_behind_a_switchable(exporter, metric_exporter):
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+    assert isinstance(ctx.meter_provider, otel.SwitchableMeterProvider)
+    state = bootstrap._state
+    assert state.metrics_pipeline is not None
+    assert ctx.meter_provider.delegate is state.metrics_pipeline.provider
+
+
+def test_metrics_off_by_default_installs_no_meter_provider(exporter):
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    assert ctx.meter_provider is None
+    assert bootstrap._state.metrics_pipeline is None
+
+
+@pytest.mark.parametrize("argv", [["manage.py", "migrate"], ["manage.py", "nbshell"]])
+def test_management_commands_get_no_metrics(exporter, metric_exporter, argv):
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=argv)
+    assert ctx.meter_provider is None
+
+
+def test_rqworker_gets_metrics(exporter, metric_exporter):
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=["/opt/netbox/netbox/manage.py", "rqworker"])
+    assert ctx.meter_provider is not None
+
+
+def test_external_meter_provider_is_reused_and_wrapped(exporter, monkeypatch):
+    from opentelemetry.sdk.metrics import MeterProvider
+
+    external = MeterProvider(shutdown_on_exit=False)
+    monkeypatch.setattr(otel, "existing_meter_provider", lambda: external)
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+    assert isinstance(ctx.meter_provider, otel.SwitchableMeterProvider)
+    assert ctx.meter_provider.delegate is external
+    assert bootstrap._state.metrics_pipeline is None
+    bootstrap.shutdown()
+    external.get_meter("t").create_counter("still.works").add(1)  # not shut down by the plugin
+
+
+def test_metric_exporter_failure_disables_metrics_only(exporter, monkeypatch, caplog):
+    def boom(cfg):
+        raise RuntimeError("bad cert")
+
+    monkeypatch.setattr(otel, "build_metric_exporter", boom)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+    assert ctx.meter_provider is None and ctx.logger_provider is not None
+    assert any("metric export disabled" in r.getMessage() for r in caplog.records)
+
+
+def test_force_flush_exports_owned_metrics(exporter, metric_exporter):
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+    ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes").add(2)
+    assert bootstrap.force_flush(2.0) is True
+    assert [p.value for p in all_batches_points(metric_exporter, "netbox.object_changes")] == [2]
+
+
+def test_force_flush_runs_providers_in_parallel(exporter, metric_exporter, monkeypatch):
+    ctx = bootstrap.install({**METRICS_USER, "traces": {"enabled": True, "instrument": []}}, env={}, argv=ARGV_WEB)
+    started = []
+    barrier = threading.Barrier(3, timeout=2)
+
+    def slow_flush(name):
+        def flush(timeout_millis=0):
+            started.append(name)
+            barrier.wait()  # only returns if all three flushes run at the same time
+            return True
+
+        return flush
+
+    monkeypatch.setattr(ctx.logger_provider, "force_flush", slow_flush("logs"))
+    monkeypatch.setattr(ctx.tracer_provider, "force_flush", slow_flush("traces"))
+    monkeypatch.setattr(bootstrap._state.metrics_pipeline, "force_flush", slow_flush("metrics"))
+    assert bootstrap.force_flush(3.0) is True
+    assert sorted(started) == ["logs", "metrics", "traces"]
+
+
+def test_shutdown_order_modules_metrics_traces_logs(exporter, metric_exporter, monkeypatch):
+    ctx = bootstrap.install({**METRICS_USER, "traces": {"enabled": True, "instrument": []}}, env={}, argv=ARGV_WEB)
+    order = []
+    state = bootstrap._state
+
+    def recording(name, original):
+        def wrapper(*args, **kwargs):
+            order.append(name)
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    for module in state.modules:
+        monkeypatch.setattr(module, "shutdown", recording(module.name, module.shutdown))
+    # Provider labels differ from the module names ("logs", "traces", ...) recorded above.
+    monkeypatch.setattr(state.metrics_pipeline, "shutdown", recording("p:metrics", state.metrics_pipeline.shutdown))
+    monkeypatch.setattr(ctx.tracer_provider, "shutdown", recording("p:traces", ctx.tracer_provider.shutdown))
+    monkeypatch.setattr(ctx.logger_provider, "shutdown", recording("p:logs", ctx.logger_provider.shutdown))
+    bootstrap.shutdown()
+    providers = [name for name in order if name.startswith("p:")]
+    assert providers == ["p:metrics", "p:traces", "p:logs"]
+    assert order.index("p:metrics") > max(order.index(m.name) for m in state.modules)
+    assert isinstance(ctx.meter_provider.delegate, type(otel.noop_meter_provider()))
+
+
+def test_shutdown_exports_pending_metrics_once(exporter, metric_exporter):
+    ctx = bootstrap.install(METRICS_USER, env={}, argv=ARGV_WEB)
+    ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes").add(1)
+    bootstrap.shutdown()
+    assert [p.value for p in all_batches_points(metric_exporter, "netbox.object_changes")] == [1]
+    assert metric_exporter.shutdown_called
+
+
+def test_describe_redacts_metric_exporter_headers():
+    user = {"exporter": {"endpoint": "http://c:4318", "headers": {"k": "s3cret-metrics"}}, "metrics": {"enabled": True}}
+    settings = conf.resolve(user, {})
+    assert "s3cret-metrics" not in bootstrap._describe(RuntimeError("header s3cret-metrics rejected"), settings)

@@ -272,16 +272,29 @@ def test_job_span_is_a_child_of_the_enqueuing_span(stubs, spans):
 
 def test_job_span_is_ended_before_the_horse_flush(stubs, spans, monkeypatch):
     bootstrap.install(TRACES, env={}, argv=ARGV_RQ)
-    seen = []
+    order = []
+    recording_during_flush = []
+
+    real_exit = rq_module._JobSpan.__exit__
+
+    def exit_(self, exc_type, exc_value, traceback):
+        result = real_exit(self, exc_type, exc_value, traceback)
+        order.append("end")
+        return result
+
+    monkeypatch.setattr(rq_module._JobSpan, "__exit__", exit_)
+
     real_flush = bootstrap.force_flush
 
     def flush(timeout):
-        seen.append(len(spans.get_finished_spans()))
+        order.append("flush")
+        recording_during_flush.append(otel.current_span_is_recording())
         return real_flush(timeout)
 
     monkeypatch.setattr(bootstrap, "force_flush", flush)
     BaseWorker.perform_job(FakeWorker(), FakeJob(), SimpleNamespace(name="default"))
-    assert seen and spans.get_finished_spans()
+    assert order == ["end", "flush"]
+    assert recording_during_flush == [False]
 
 
 def test_failed_job_records_exception_via_the_exc_handler(stubs, spans):

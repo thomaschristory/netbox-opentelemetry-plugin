@@ -68,12 +68,14 @@ def test_timeout_from_env():
     assert conf.resolve({}, env).logs.exporter.timeout == 2.5
 
 
-def test_missing_endpoint_disables_logs_with_one_warning():
+def test_missing_endpoint_disables_logs_and_audit_with_one_warning():
     s = conf.resolve({}, {})
     assert s.enabled is True
     assert s.logs.enabled is False
+    assert s.audit.enabled is False
+    assert s.log_exporter is None
     assert len(s.warnings) == 1
-    assert "logs disabled" in s.warnings[0]
+    assert s.warnings[0].startswith("logs and audit disabled:")
     assert "no endpoint" in s.warnings[0]
 
 
@@ -113,9 +115,11 @@ def test_enabled_false():
     assert s.logs.enabled is False
 
 
-def test_logs_enabled_false_needs_no_endpoint():
-    s = conf.resolve({"logs": {"enabled": False}}, {})
+def test_logs_and_audit_disabled_need_no_endpoint():
+    s = conf.resolve({"logs": {"enabled": False}, "audit": {"enabled": False}}, {})
     assert s.logs.enabled is False
+    assert s.audit.enabled is False
+    assert s.log_exporter is None
     assert s.warnings == ()
 
 
@@ -278,3 +282,60 @@ def test_rq_disabled_skips_validation():
     s = conf.resolve({"rq": {"enabled": False, "flush_timeout": -1}}, ENDPOINT_ENV)
     assert s.rq == conf.RQ_OFF
     assert not any(w.startswith("rq disabled:") for w in s.warnings)
+
+
+def test_audit_defaults():
+    s = conf.resolve({}, ENDPOINT_ENV)
+    assert s.audit == conf.AuditConfig(
+        enabled=True, include_data=False, exclude_fields=("password", "secret", "token", "key")
+    )
+    assert s.log_exporter is not None
+    assert s.log_exporter.endpoint == "http://collector:4318/v1/logs"
+    assert s.logs.exporter is s.log_exporter
+    assert s.redacted()["audit"] == {
+        "enabled": True,
+        "include_data": False,
+        "exclude_fields": ["password", "secret", "token", "key"],
+    }
+
+
+def test_audit_only_resolves_the_log_exporter():
+    s = conf.resolve({"logs": {"enabled": False}}, ENDPOINT_ENV)
+    assert s.logs.enabled is False
+    assert s.logs.exporter is None
+    assert s.audit.enabled is True
+    assert s.log_exporter.endpoint == "http://collector:4318/v1/logs"
+
+
+def test_audit_uses_the_logs_endpoint():
+    s = conf.resolve({"logs": {"enabled": False, "endpoint": "http://logs:4318/custom"}}, ENDPOINT_ENV)
+    assert s.log_exporter.endpoint == "http://logs:4318/custom"
+
+
+def test_audit_explicit_values():
+    s = conf.resolve({"audit": {"include_data": True, "exclude_fields": ["Comments"]}}, ENDPOINT_ENV)
+    assert s.audit.include_data is True
+    assert s.audit.exclude_fields == ("Comments",)
+
+
+@pytest.mark.parametrize(
+    "bad", [{"include_data": "yes"}, {"exclude_fields": "password"}, {"exclude_fields": [1]}, "on"]
+)
+def test_bad_audit_value_disables_only_audit(bad):
+    s = conf.resolve({"audit": bad}, ENDPOINT_ENV)
+    assert s.audit.enabled is False
+    assert s.logs.enabled is True
+    assert any(w.startswith("audit disabled:") for w in s.warnings)
+
+
+def test_missing_endpoint_with_logs_disabled_names_only_audit():
+    s = conf.resolve({"logs": {"enabled": False}}, {})
+    assert s.audit.enabled is False
+    assert s.warnings == (s.warnings[0],)
+    assert s.warnings[0].startswith("audit disabled:")
+
+
+def test_audit_disabled_skips_validation():
+    s = conf.resolve({"audit": {"enabled": False, "include_data": "yes"}}, ENDPOINT_ENV)
+    assert s.audit == conf.AUDIT_OFF
+    assert not any(w.startswith("audit disabled:") for w in s.warnings)

@@ -109,7 +109,7 @@ def install(
         ctx = Context(settings=settings, role=role, resource=resource)
         state = _State(pid=os.getpid(), context=ctx, netbox_version=netbox_version)
 
-        if settings.logs.enabled:
+        if settings.log_exporter is not None:
             _setup_logger_provider(ctx, state)
 
         for module in _candidate_modules(ctx):
@@ -276,7 +276,7 @@ def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> No
     if state.owns_logger_provider and ctx.logger_provider is not None:
         # A fresh exporter gives the child its own HTTP session or gRPC channel instead of
         # sharing the parent's keep-alive connections.
-        exporter = otel.build_log_exporter(ctx.settings.logs.exporter)
+        exporter = otel.build_log_exporter(ctx.settings.log_exporter)
         ctx.logger_provider = otel.build_logger_provider(resource, exporter)
     ctx.role = role
     ctx.resource = resource
@@ -327,11 +327,11 @@ def _setup_logger_provider(ctx: Context, state: _State) -> None:
         ctx.logger_provider = existing
         return
     try:
-        exporter = otel.build_log_exporter(ctx.settings.logs.exporter)
+        exporter = otel.build_log_exporter(ctx.settings.log_exporter)
         ctx.logger_provider = otel.build_logger_provider(ctx.resource, exporter)
         state.owns_logger_provider = True
     except Exception as exc:
-        logger.warning("OpenTelemetry: logs disabled: could not build exporter: %s", _describe(exc, ctx.settings))
+        logger.warning("OpenTelemetry: log export disabled: could not build exporter: %s", _describe(exc, ctx.settings))
 
 
 def _candidate_modules(ctx: Context) -> list[Module]:
@@ -355,7 +355,7 @@ def _describe(exc: BaseException, settings: conf.Settings) -> str:
         # Run the known-literal replacements on the FULL message first: str.replace is linear, so
         # this is safe on arbitrarily long input, and it means a secret that would straddle the
         # truncation cut below is still matched and redacted in full.
-        exporter = settings.logs.exporter
+        exporter = settings.log_exporter
         if exporter is not None:
             message = message.replace(exporter.endpoint, conf._redact_userinfo(exporter.endpoint))
             for value in exporter.headers.values():

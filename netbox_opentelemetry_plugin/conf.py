@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -133,6 +133,23 @@ LOGS_OFF = LogsConfig(enabled=False)
 
 
 @dataclass(frozen=True)
+class AuditConfig:
+    enabled: bool = True
+    include_data: bool = False
+    exclude_fields: tuple[str, ...] = ("password", "secret", "token", "key")
+
+    def redacted(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "include_data": self.include_data,
+            "exclude_fields": list(self.exclude_fields),
+        }
+
+
+AUDIT_OFF = AuditConfig(enabled=False)
+
+
+@dataclass(frozen=True)
 class RqConfig:
     enabled: bool = True
     patch_worker: bool = True
@@ -151,6 +168,8 @@ class Settings:
     service_name: str = "netbox"
     resource_attributes: Mapping[str, str | bool | int | float] = field(default_factory=dict)
     logs: LogsConfig = LOGS_OFF
+    audit: AuditConfig = AUDIT_OFF
+    log_exporter: ExporterConfig | None = None
     rq: RqConfig = field(default_factory=RqConfig)
     warnings: tuple[str, ...] = ()
 
@@ -160,6 +179,8 @@ class Settings:
             "service_name": self.service_name,
             "resource_attributes": dict(self.resource_attributes),
             "logs": self.logs.redacted(),
+            "audit": self.audit.redacted(),
+            "log_exporter": self.log_exporter.redacted() if self.log_exporter else None,
             "rq": self.rq.redacted(),
         }
 
@@ -193,10 +214,33 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         return Settings(enabled=False, warnings=tuple(warnings))
 
     try:
-        logs = _resolve_logs(_section(user, "logs"), exporter_section, env)
+        logs_section = _section(user, "logs")
     except ConfigError as exc:
         warnings.append(f"logs disabled: {exc}")
-        logs = LOGS_OFF
+        logs_section, logs = {}, LOGS_OFF
+    else:
+        try:
+            logs = _resolve_logs(logs_section)
+        except ConfigError as exc:
+            warnings.append(f"logs disabled: {exc}")
+            logs = LOGS_OFF
+
+    try:
+        audit = _resolve_audit(_section(user, "audit"))
+    except ConfigError as exc:
+        warnings.append(f"audit disabled: {exc}")
+        audit = AUDIT_OFF
+
+    log_exporter = None
+    users = [name for name, cfg in (("logs", logs), ("audit", audit)) if cfg.enabled]
+    if users:
+        try:
+            log_exporter = resolve_exporter("logs", logs_section, exporter_section, env)
+        except ConfigError as exc:
+            warnings.append(f"{' and '.join(users)} disabled: {exc}")
+            logs, audit = LOGS_OFF, AUDIT_OFF
+    if log_exporter is not None and logs.enabled:
+        logs = replace(logs, exporter=log_exporter)
 
     try:
         rq = _resolve_rq(_section(user, "rq"))
@@ -209,6 +253,8 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         service_name=service_name,
         resource_attributes=resource_attributes,
         logs=logs,
+        audit=audit,
+        log_exporter=log_exporter,
         rq=rq,
         warnings=tuple(warnings),
     )
@@ -259,9 +305,7 @@ def resolve_exporter(
     )
 
 
-def _resolve_logs(
-    section: Mapping[str, Any], exporter_section: Mapping[str, Any], env: Mapping[str, str]
-) -> LogsConfig:
+def _resolve_logs(section: Mapping[str, Any]) -> LogsConfig:
     defaults = DEFAULTS["logs"]
     if not _typed(section.get("enabled", defaults["enabled"]), bool, "logs.enabled"):
         return LOGS_OFF
@@ -270,14 +314,24 @@ def _resolve_logs(
         raise ConfigError("logs.loggers must be a list of logger names")
     level = _level(section.get("level", defaults["level"]), "logs.level")
     set_levels = _typed(section.get("set_logger_levels", defaults["set_logger_levels"]), bool, "logs.set_logger_levels")
-    exporter = resolve_exporter("logs", section, exporter_section, env)
     return LogsConfig(
         enabled=True,
-        exporter=exporter,
+        exporter=None,
         loggers=tuple(loggers),
         level=level,
         set_logger_levels=set_levels,
     )
+
+
+def _resolve_audit(section: Mapping[str, Any]) -> AuditConfig:
+    defaults = DEFAULTS["audit"]
+    if not _typed(section.get("enabled", defaults["enabled"]), bool, "audit.enabled"):
+        return AUDIT_OFF
+    include_data = _typed(section.get("include_data", defaults["include_data"]), bool, "audit.include_data")
+    exclude = section.get("exclude_fields", defaults["exclude_fields"])
+    if not isinstance(exclude, list | tuple) or not all(isinstance(name, str) for name in exclude):
+        raise ConfigError("audit.exclude_fields must be a list of field name fragments")
+    return AuditConfig(enabled=True, include_data=include_data, exclude_fields=tuple(exclude))
 
 
 def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:

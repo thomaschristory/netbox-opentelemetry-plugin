@@ -98,7 +98,7 @@ def test_exporter_failure_warns_and_continues(monkeypatch, caplog):
     assert ctx is not None
     assert ctx.logger_provider is None
     assert _otel_handlers("t.boot") == []
-    assert any("logs disabled" in r.getMessage() for r in caplog.records)
+    assert any("log export disabled" in r.getMessage() for r in caplog.records)
 
 
 def test_runserver_parent_installs_nothing(exporter):

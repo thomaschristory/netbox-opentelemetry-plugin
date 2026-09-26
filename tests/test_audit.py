@@ -230,6 +230,99 @@ def test_include_data_loads_are_scoped_to_the_database_alias():
     assert set(by_alias) == {"default", "branch-1"}
 
 
+def test_load_does_not_load_another_aliass_pending_keys_on_commit():
+    # A branch alias's transaction can still be open, in the same thread, when a transaction on
+    # the default alias commits (NetBox-branching's branch and the default database are separate
+    # connections that can be interleaved). Loading the branch's pending key at that point would
+    # read it before its own transaction is done, missing a later, same-transaction update to it
+    # (the M2M case) and caching stale data.
+    ctx, exporter = _ctx(include_data=True, exclude=())
+    db = {"default": {1: (None, {"v": "d1"})}, "branch": {7: (None, {"v": "b7-initial"})}}
+    calls = []
+
+    def load_data(alias, pks):
+        calls.append((alias, sorted(pks)))
+        return {pk: db[alias][pk] for pk in pks if pk in db[alias]}
+
+    callbacks = {"default": [], "branch": []}
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks[using].append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    # The branch transaction opens and writes change 7; the default transaction writes change 1
+    # and commits while the branch transaction is still open.
+    receiver(sender=None, instance=_change(pk=7), created=True, using="branch")
+    receiver(sender=None, instance=_change(pk=1), created=True, using="default")
+    for callback in callbacks["default"]:
+        callback()
+
+    # The default commit must not have touched the branch alias at all.
+    assert calls == [("default", [1])]
+
+    # The branch transaction updates its postchange_data (the M2M case) before it finally commits.
+    db["branch"][7] = (None, {"v": "b7-final"})
+    for callback in callbacks["branch"]:
+        callback()
+
+    assert calls == [("default", [1]), ("branch", [7])]
+    records = {r.log_record.attributes["netbox.change.id"]: r for r in exporter.get_finished_logs()}
+    assert json.loads(records[1].log_record.attributes["netbox.change.postchange_data"]) == {"v": "d1"}
+    assert json.loads(records[7].log_record.attributes["netbox.change.postchange_data"]) == {"v": "b7-final"}
+
+
+def test_rolled_back_alias_keys_do_not_accumulate_in_cache_via_another_aliass_commits():
+    # If the branch transaction above instead rolls back, its pending key must never be pulled
+    # into the cache by the default alias's commits (only load() calls for the branch alias
+    # itself may do that); it must stay in `pending` alone. Before the fix, every default commit
+    # batch-loaded every pending key regardless of alias, so a repeatedly rolled-back branch key
+    # was re-cached on every default commit and never popped, growing the cache without bound.
+    ctx, exporter = _ctx(include_data=True, exclude=())
+    calls = []
+
+    def load_data(alias, pks):
+        calls.append((alias, sorted(pks)))
+        return {pk: (None, {"n": pk}) for pk in pks}
+
+    callbacks = {"default": [], "branch": []}
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks[using].append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    # Kept under LOAD_CHUNK_SIZE (1000) on purpose: the final branch commit below must batch
+    # every rolled-back branch key plus the new one in a single load_data call, not split across
+    # chunks, so calls[-1] alone can be checked against the whole accumulated set.
+    iterations = 500
+    for i in range(iterations):
+        receiver(sender=None, instance=_change(pk=10000 + i), created=True, using="branch")
+        receiver(sender=None, instance=_change(pk=1), created=True, using="default")
+        for callback in callbacks["default"]:
+            callback()
+        callbacks["default"].clear()
+        callbacks["branch"].clear()  # the branch transaction rolled back: its callback is discarded
+
+    # Every default commit loaded only its own single pending key; the branch alias was never
+    # queried, so none of its rolled-back keys were ever loaded into the cache.
+    # (Checked as length/membership, not full-list equality: a failing equality assertion between
+    # two large lists makes pytest's diff prohibitively slow.)
+    assert len(calls) == iterations
+    assert all(alias == "default" and pks == [1] for alias, pks in calls)
+
+    # A real branch commit afterwards loads exactly the branch keys still pending (all the
+    # rolled-back ones plus this new one, since none of them were ever popped by a load), proving
+    # they sat only in `pending`, never in `cache`, the whole time.
+    receiver(sender=None, instance=_change(pk=99999), created=True, using="branch")
+    for callback in callbacks["branch"]:
+        callback()
+    last_alias, last_pks = calls[-1]
+    assert last_alias == "branch"
+    assert len(last_pks) == iterations + 1
+    assert set(last_pks) == set(range(10000, 10000 + iterations)) | {99999}
+
+
 def test_missing_pk_in_loaded_data_yields_no_data_attributes():
     ctx, exporter = _ctx(include_data=True, exclude=())
 

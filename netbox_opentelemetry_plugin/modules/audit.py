@@ -159,27 +159,31 @@ def make_receiver(ctx: Context, *, on_commit, label_for, load_data):
         return loaded
 
     def load(alias: str, pk: int):
-        """Return this (alias, pk)'s (pre, post) data, batch-loading every pending key on first use.
+        """Return this (alias, pk)'s (pre, post) data, batch-loading every pending key for this
+        same alias on first use.
 
-        The first commit callback in a transaction pays for one batched load of everything
-        already pending (every change saved earlier in the same transaction, grouped by the
-        database alias each was written to); later callbacks in that same transaction find their
-        data already cached. A key left over from a transaction that rolled back (its post_save
-        ran, but on_commit never called back) is requested again here, found missing, and dropped
-        from `pending` regardless, so it cannot accumulate. Keying on (alias, pk) rather than pk
-        alone keeps a pk that exists on two aliases (for example a NetBox-branching branch and the
-        default database) from picking up the wrong alias's data.
+        Only keys for `alias` are loaded here, never another alias's. A transaction on another
+        alias can still be open in this thread when `alias` commits (a NetBox-branching branch's
+        transaction can be interleaved with, or nested inside, a commit on the default alias);
+        loading its pending key early would read it before that transaction is done, missing a
+        later same-transaction update to it (the M2M case) and caching data that is already
+        stale. A key for another alias is left alone in `pending` until that alias's own commit
+        calls `load` and batches it.
+
+        The first commit callback for a given alias pays for one batched load of everything
+        already pending for that alias (every change on that alias saved earlier in the same
+        transaction); later callbacks for that alias in that same transaction find their data
+        already cached. A key left over from a transaction that rolled back (its post_save ran,
+        but on_commit never called back) is requested again on that alias's next commit, found
+        missing, and dropped from `pending` at that point, so it cannot accumulate in `cache`.
         """
-        keys = list(pending())
+        keys = [key for key in pending() if key[0] == alias]
         if keys:
-            by_alias: dict[str, list[int]] = {}
-            for key_alias, key_pk in keys:
-                by_alias.setdefault(key_alias, []).append(key_pk)
+            pks = [key_pk for _, key_pk in keys]
             found: dict[tuple[str, int], tuple] = {}
-            for key_alias, pks in by_alias.items():
-                for chunk in _chunks(pks, LOAD_CHUNK_SIZE):
-                    for loaded_pk, data in load_data(key_alias, chunk).items():
-                        found[(key_alias, loaded_pk)] = data
+            for chunk in _chunks(pks, LOAD_CHUNK_SIZE):
+                for loaded_pk, data in load_data(alias, chunk).items():
+                    found[(alias, loaded_pk)] = data
             cache().update(found)
             pending().difference_update(keys)
         return cache().pop((alias, pk), None)

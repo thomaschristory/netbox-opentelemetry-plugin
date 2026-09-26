@@ -107,11 +107,19 @@ def build_log_exporter(cfg: ExporterConfig) -> LogRecordExporter:
 
 
 def build_logger_provider(
-    resource: Resource, exporter: LogRecordExporter, *, synchronous: bool = False
+    resource: Resource,
+    exporter: LogRecordExporter,
+    *,
+    synchronous: bool = False,
+    max_queue_size: int | None = None,
 ) -> LoggerProvider:
     # shutdown_on_exit=False: bootstrap owns shutdown ordering (remove handlers first, then flush).
     provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
-    processor = SimpleLogRecordProcessor(exporter) if synchronous else BatchLogRecordProcessor(exporter)
+    if synchronous:
+        processor = SimpleLogRecordProcessor(exporter)
+    else:
+        kwargs = {} if max_queue_size is None else {"max_queue_size": max_queue_size}
+        processor = BatchLogRecordProcessor(exporter, **kwargs)
     provider.add_log_record_processor(processor)
     return provider
 

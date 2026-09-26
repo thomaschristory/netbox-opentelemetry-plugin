@@ -32,6 +32,11 @@ ROLE_RQ_HORSE = "rq_horse"
 ROLE_MANAGEMENT = "management"
 ROLE_RUNSERVER_PARENT = "runserver_parent"
 
+# A bulk edit or bulk import can write thousands of ObjectChange rows inside a single commit; the
+# default BatchLogRecordProcessor queue (2048) is sized for scattered log lines, not that burst.
+# Sized generously so a single bulk operation cannot overrun it and silently drop audit records.
+AUDIT_QUEUE_SIZE = 20_000
+
 # user:password@ in URLs or host strings, including percent-encoded credentials. Deliberately
 # favours false positives: any "word:word@" shape is masked, not just valid userinfo. Only ever
 # applied to a message already bounded by _MESSAGE_LIMIT (see _describe) because this pattern can
@@ -278,7 +283,8 @@ def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> No
         # A fresh exporter gives the child its own HTTP session or gRPC channel instead of
         # sharing the parent's keep-alive connections.
         exporter = otel.build_log_exporter(ctx.settings.log_exporter)
-        ctx.logger_provider = otel.build_logger_provider(resource, exporter)
+        max_queue_size = AUDIT_QUEUE_SIZE if ctx.settings.audit.enabled else None
+        ctx.logger_provider = otel.build_logger_provider(resource, exporter, max_queue_size=max_queue_size)
     ctx.role = role
     ctx.resource = resource
     for module in state.modules:
@@ -329,7 +335,8 @@ def _setup_logger_provider(ctx: Context, state: _State) -> None:
         return
     try:
         exporter = otel.build_log_exporter(ctx.settings.log_exporter)
-        ctx.logger_provider = otel.build_logger_provider(ctx.resource, exporter)
+        max_queue_size = AUDIT_QUEUE_SIZE if ctx.settings.audit.enabled else None
+        ctx.logger_provider = otel.build_logger_provider(ctx.resource, exporter, max_queue_size=max_queue_size)
         state.owns_logger_provider = True
     except Exception as exc:
         logger.warning("OpenTelemetry: log export disabled: could not build exporter: %s", _describe(exc, ctx.settings))

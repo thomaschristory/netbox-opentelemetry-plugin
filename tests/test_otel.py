@@ -252,3 +252,14 @@ def test_emit_event_sets_event_name_scope_and_attributes(resource):
     assert record.log_record.timestamp == 1_700_000_000_000_000_000
     assert dict(record.log_record.attributes) == {"netbox.change.id": 7}
     provider.shutdown()
+
+
+def test_build_logger_provider_sets_max_queue_size(resource):
+    exporter = InMemoryLogRecordExporter()
+    provider = otel.build_logger_provider(resource, exporter, max_queue_size=12345)
+    # No public accessor exists for this; the SDK's BatchLogRecordProcessor stores it on a nested
+    # BatchProcessor. If this internal shape ever changes, replace with a behavioural test that
+    # fills the queue past the default (2048) and checks records beyond it are not dropped.
+    processor = provider._multi_log_record_processor._log_record_processors[0]
+    assert processor._batch_processor._max_queue_size == 12345
+    provider.shutdown()

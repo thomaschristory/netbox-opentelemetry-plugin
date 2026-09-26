@@ -1,12 +1,13 @@
 import datetime
 import json
 import logging
+import time
 import uuid
 from types import SimpleNamespace
 
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 
-from netbox_opentelemetry_plugin import otel
+from netbox_opentelemetry_plugin import bootstrap, otel
 from netbox_opentelemetry_plugin.conf import AuditConfig, Settings
 from netbox_opentelemetry_plugin.modules import audit
 from netbox_opentelemetry_plugin.modules.base import Context
@@ -64,7 +65,8 @@ def test_snapshot_and_body():
     snap = audit.snapshot(_change(), LABELS.__getitem__)
     assert snap.object_type == "ipam.prefix"
     assert snap.request_id == str(REQUEST_ID)
-    assert snap.time_ns == int(datetime.datetime(2026, 9, 26, 12, 0, tzinfo=datetime.UTC).timestamp() * 1e9)
+    # 2026-09-26T12:00:00Z, verified with calendar.timegm(...).
+    assert snap.time_ns == 1790424000 * 10**9
     assert snap.related_object_type is None
     assert audit.body_for(snap) == "update ipam.prefix 10.0.0.0/24"
 
@@ -91,6 +93,16 @@ def test_build_attributes_optional_fields():
     assert attrs["netbox.change.related_object_type"] == "dcim.device"
     assert attrs["netbox.change.related_object_id"] == 9
     assert "enduser.id" not in attrs
+
+
+def test_related_object_omitted_unless_both_type_and_id_are_set():
+    # related_object_id can be null even when related_object_type_id is set; neither should be
+    # emitted unless both are present, and no attribute is ever emitted with a None value.
+    snap = audit.snapshot(_change(related_object_type_id=2, related_object_id=None), LABELS.__getitem__)
+    attrs = audit.build_attributes(snap, None, ())
+    assert "netbox.change.related_object_type" not in attrs
+    assert "netbox.change.related_object_id" not in attrs
+    assert None not in attrs.values()
 
 
 def test_build_attributes_with_data_filters_and_skips_nulls():
@@ -136,11 +148,13 @@ def test_discarded_callbacks_emit_nothing():
 
 def test_include_data_loads_at_commit_time_and_filters():
     ctx, exporter = _ctx(include_data=True, exclude=("description",))
-    loaded = []
+    loaded_calls = []
 
-    def load_data(pk):
-        loaded.append(pk)
-        return ({"description": "old", "status": "active"}, {"description": "new", "status": "reserved"})
+    def load_data(pks):
+        loaded_calls.append(sorted(pks))
+        return {
+            pk: ({"description": "old", "status": "active"}, {"description": "new", "status": "reserved"}) for pk in pks
+        }
 
     callbacks = []
     receiver = audit.make_receiver(
@@ -150,12 +164,165 @@ def test_include_data_loads_at_commit_time_and_filters():
         load_data=load_data,
     )
     receiver(sender=None, instance=_change(), created=True)
-    assert loaded == []
+    assert loaded_calls == []
     callbacks[0]()
     attrs = exporter.get_finished_logs()[0].log_record.attributes
-    assert loaded == [42]
+    assert loaded_calls == [[42]]
     assert json.loads(attrs["netbox.change.prechange_data"]) == {"status": "active"}
     assert json.loads(attrs["netbox.change.postchange_data"]) == {"status": "reserved"}
+
+
+def test_batched_load_data_is_called_once_for_all_pending_pks_in_one_commit():
+    ctx, exporter = _ctx(include_data=True, exclude=())
+    calls = []
+
+    def load_data(pks):
+        calls.append(sorted(pks))
+        return {pk: (None, {"n": pk}) for pk in pks}
+
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks.append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    pks = list(range(10))
+    for pk in pks:
+        receiver(sender=None, instance=_change(pk=pk), created=True)
+    for callback in callbacks:
+        callback()
+
+    assert calls == [pks]
+    records = exporter.get_finished_logs()
+    assert len(records) == 10
+    seen = {json.loads(r.log_record.attributes["netbox.change.postchange_data"])["n"] for r in records}
+    assert seen == set(pks)
+
+
+def test_missing_pk_in_loaded_data_yields_no_data_attributes():
+    ctx, exporter = _ctx(include_data=True, exclude=())
+
+    def load_data(pks):
+        return {}  # the row is gone (for example a concurrent delete)
+
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks.append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    receiver(sender=None, instance=_change(), created=True)
+    callbacks[0]()
+    attrs = exporter.get_finished_logs()[0].log_record.attributes
+    assert "netbox.change.prechange_data" not in attrs
+    assert "netbox.change.postchange_data" not in attrs
+
+
+def test_rolled_back_pks_are_cleared_from_pending_on_the_next_load():
+    # pk 999 stands in for a change whose transaction rolled back: the receiver ran (adding it to
+    # the thread's pending set) but Django never calls its on_commit callback, so callbacks[0] is
+    # simply never invoked here.
+    ctx, exporter = _ctx(include_data=True, exclude=())
+    calls = []
+
+    def load_data(pks):
+        calls.append(sorted(pks))
+        return {pk: (None, {"n": pk}) for pk in pks if pk != 999}
+
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks.append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    receiver(sender=None, instance=_change(pk=999), created=True)
+    receiver(sender=None, instance=_change(pk=5), created=True)
+    callbacks[1]()  # only pk 5 commits; callbacks[0] (pk 999) is discarded, as on a rollback
+    assert calls == [[5, 999]]
+
+    receiver(sender=None, instance=_change(pk=6), created=True)
+    callbacks[2]()
+    assert calls == [[5, 999], [6]]
+
+
+def test_raw_save_is_ignored():
+    ctx, exporter = _ctx()
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx, on_commit=lambda func, using=None: callbacks.append(func), label_for=LABELS.__getitem__, load_data=None
+    )
+    receiver(sender=None, instance=_change(), created=True, raw=True)
+    assert callbacks == []
+
+
+def test_non_json_serializable_data_warns_and_emits_nothing(caplog):
+    ctx, exporter = _ctx(include_data=True, exclude=())
+
+    class Unserializable:
+        pass
+
+    def load_data(pks):
+        return {pk: (None, {"bad": Unserializable()}) for pk in pks}
+
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks.append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    receiver(sender=None, instance=_change(), created=True)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        callbacks[0]()
+    assert len(exporter.get_finished_logs()) == 0
+    warnings = [r for r in caplog.records if r.name == "netbox_opentelemetry_plugin"]
+    assert len(warnings) == 1
+
+
+def test_full_attribute_set_with_include_data_for_update():
+    ctx, exporter = _ctx(include_data=True, exclude=())
+
+    def load_data(pks):
+        return {pk: ({"status": "active"}, {"status": "reserved"}) for pk in pks}
+
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks.append(func),
+        label_for=LABELS.__getitem__,
+        load_data=load_data,
+    )
+    receiver(sender=None, instance=_change(), created=True)
+    callbacks[0]()
+    attrs = dict(exporter.get_finished_logs()[0].log_record.attributes)
+    assert attrs == {
+        "netbox.change.id": 42,
+        "netbox.change.action": "update",
+        "netbox.change.object_type": "ipam.prefix",
+        "netbox.change.object_id": 7,
+        "netbox.change.object_repr": "10.0.0.0/24",
+        "netbox.change.request_id": str(REQUEST_ID),
+        "enduser.id": "admin",
+        "netbox.change.prechange_data": json.dumps({"status": "active"}, sort_keys=True),
+        "netbox.change.postchange_data": json.dumps({"status": "reserved"}, sort_keys=True),
+    }
+
+
+def test_receiver_emits_record_with_correct_timestamp_severity_and_body():
+    ctx, exporter = _ctx()
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx, on_commit=lambda func, using=None: callbacks.append(func), label_for=LABELS.__getitem__, load_data=None
+    )
+    receiver(sender=None, instance=_change(), created=True)
+    callbacks[0]()
+    record = exporter.get_finished_logs()[0].log_record
+    assert record.timestamp == 1790424000 * 10**9
+    assert record.severity_text == "INFO"
+    assert record.body == "update ipam.prefix 10.0.0.0/24"
 
 
 def test_receiver_uses_the_current_provider_at_commit_time():
@@ -187,6 +354,90 @@ def test_failures_never_raise_and_warn_once(caplog):
     warnings = [r for r in caplog.records if r.name == "netbox_opentelemetry_plugin"]
     assert len(warnings) == 1
     assert "RuntimeError" in warnings[0].getMessage()
+    assert "boom" not in warnings[0].getMessage()
+
+
+def test_commit_time_failure_never_raises_and_warns_once(caplog):
+    ctx, exporter = _ctx(include_data=True)
+
+    def broken_load(pks):
+        raise RuntimeError("db down")
+
+    callbacks = []
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: callbacks.append(func),
+        label_for=LABELS.__getitem__,
+        load_data=broken_load,
+    )
+    receiver(sender=None, instance=_change(), created=True)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        callbacks[0]()  # must not raise
+    warnings = [r for r in caplog.records if r.name == "netbox_opentelemetry_plugin"]
+    assert len(warnings) == 1
+    assert len(exporter.get_finished_logs()) == 0
+
+
+def test_using_kwarg_is_forwarded_to_on_commit():
+    ctx, exporter = _ctx()
+    received = {}
+    receiver = audit.make_receiver(
+        ctx,
+        on_commit=lambda func, using=None: received.setdefault("using", using),
+        label_for=LABELS.__getitem__,
+        load_data=None,
+    )
+    receiver(sender=None, instance=_change(), created=True, using="replica")
+    assert received["using"] == "replica"
+
+
+def test_warn_once_is_keyed_on_pid(monkeypatch, caplog):
+    ctx, exporter = _ctx()
+
+    def broken_label(_):
+        raise RuntimeError("boom")
+
+    receiver = audit.make_receiver(
+        ctx, on_commit=lambda func, using=None: func(), label_for=broken_label, load_data=None
+    )
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        monkeypatch.setattr(audit, "_getpid", lambda: 111)
+        receiver(sender=None, instance=_change(), created=True)
+        receiver(sender=None, instance=_change(), created=True)
+        # A fork gives the child a new PID; it must be able to warn once on its own.
+        monkeypatch.setattr(audit, "_getpid", lambda: 222)
+        receiver(sender=None, instance=_change(), created=True)
+    warnings = [r for r in caplog.records if r.name == "netbox_opentelemetry_plugin"]
+    assert len(warnings) == 2
+
+
+def test_bulk_commit_does_not_drop_audit_records(monkeypatch):
+    class SlowExporter(InMemoryLogRecordExporter):
+        def export(self, batch):
+            time.sleep(0.005)
+            return super().export(batch)
+
+    exp = SlowExporter()
+    monkeypatch.setattr(otel, "build_log_exporter", lambda cfg: exp)
+    bootstrap.shutdown()
+    bootstrap._state = None
+    try:
+        ctx = bootstrap.install(
+            {"exporter": {"endpoint": "http://collector:4318"}},
+            env={},
+            argv=["granian", "netbox.granian:application"],
+        )
+        assert ctx is not None
+        receiver = audit.make_receiver(
+            ctx, on_commit=lambda func, using=None: func(), label_for=LABELS.__getitem__, load_data=None
+        )
+        for pk in range(5000):
+            receiver(sender=None, instance=_change(pk=pk), created=True)
+        ctx.logger_provider.force_flush()
+        assert len(exp.get_finished_logs()) == 5000
+    finally:
+        bootstrap.shutdown()
+        bootstrap._state = None
 
 
 def test_audit_disabled_at_commit_time_emits_nothing():

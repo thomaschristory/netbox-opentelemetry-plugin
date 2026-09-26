@@ -233,3 +233,27 @@ def build_logging_handler(provider: LoggerProvider, level: int) -> AllowlistLogg
     handler = AllowlistLoggingHandler(level, provider)
     handler.addFilter(ExcludeLoggersFilter())
     return handler
+
+
+def emit_event(
+    provider: LoggerProvider,
+    scope: str,
+    *,
+    event_name: str,
+    body: str,
+    attributes: Mapping[str, object],
+    timestamp_ns: int | None = None,
+) -> None:
+    now = time.time_ns()
+    provider.get_logger(scope).emit(
+        LogRecord(
+            timestamp=timestamp_ns if timestamp_ns is not None else now,
+            observed_timestamp=now,
+            context=opentelemetry.context.get_current(),
+            severity_number=SeverityNumber.INFO,
+            severity_text="INFO",
+            body=body,
+            attributes=dict(attributes),
+            event_name=event_name,
+        )
+    )

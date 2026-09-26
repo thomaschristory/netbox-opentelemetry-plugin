@@ -231,3 +231,24 @@ def test_flush_swallows_provider_errors():
     handler = otel.AllowlistLoggingHandler(logging.INFO, BrokenProvider())
     handler.flush()
     assert done.wait(2)
+
+
+def test_emit_event_sets_event_name_scope_and_attributes(resource):
+    exporter = InMemoryLogRecordExporter()
+    provider = otel.build_logger_provider(resource, exporter, synchronous=True)
+    otel.emit_event(
+        provider,
+        "netbox_opentelemetry_plugin.audit",
+        event_name="netbox.object_change",
+        body="create ipam.prefix 10.0.0.0/24",
+        attributes={"netbox.change.id": 7},
+        timestamp_ns=1_700_000_000_000_000_000,
+    )
+    record = exporter.get_finished_logs()[0]
+    assert record.instrumentation_scope.name == "netbox_opentelemetry_plugin.audit"
+    assert record.log_record.event_name == "netbox.object_change"
+    assert record.log_record.body == "create ipam.prefix 10.0.0.0/24"
+    assert record.log_record.severity_text == "INFO"
+    assert record.log_record.timestamp == 1_700_000_000_000_000_000
+    assert dict(record.log_record.attributes) == {"netbox.change.id": 7}
+    provider.shutdown()

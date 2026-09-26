@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from . import conf, otel
+from .modules.audit import AuditModule
 from .modules.base import Context, Module
 from .modules.logs import LogsModule
 from .modules.rq import RqModule
@@ -338,6 +339,7 @@ def _candidate_modules(ctx: Context) -> list[Module]:
     modules: list[Module] = []
     if ctx.logger_provider is not None:
         modules.append(LogsModule())
+        modules.append(AuditModule())
     if ctx.role == ROLE_RQWORKER:
         modules.append(RqModule())
     return modules

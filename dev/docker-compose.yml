@@ -11,6 +11,8 @@ x-netbox: &netbox
     - ./configuration/plugins.py:/etc/netbox/config/plugins.py:ro
     - ../netbox_opentelemetry_plugin:/plugin/netbox_opentelemetry_plugin:ro
     - ../tests_netbox:/plugin/tests_netbox:ro
+    # tests/otel_helpers.py is shared between the unit and NetBox integration test suites.
+    - ../tests:/plugin/tests:ro
     # Shared across all server processes: a script uploaded via one process (netbox) must be
     # readable by the process that runs it (netbox-worker), since SCRIPTS_ROOT is local disk.
     - netbox-scripts-files:/opt/netbox/netbox/scripts

@@ -1,4 +1,4 @@
-"""Job functions for the traces integration tests, imported by rq by dotted path."""
+"""Job functions for the traces and metrics integration tests, imported by rq by dotted path."""
 
 import requests
 
@@ -9,3 +9,7 @@ def fetch(url):
 
 def noop(**kwargs):
     return None
+
+
+def boom(**kwargs):
+    raise RuntimeError("integration test failure")

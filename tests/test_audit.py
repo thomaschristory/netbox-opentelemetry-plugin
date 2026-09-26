@@ -6,11 +6,13 @@ import uuid
 from types import SimpleNamespace
 
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
 from netbox_opentelemetry_plugin import bootstrap, otel
-from netbox_opentelemetry_plugin.conf import AuditConfig, Settings
+from netbox_opentelemetry_plugin.conf import AuditConfig, MetricsConfig, Settings
 from netbox_opentelemetry_plugin.modules import audit
 from netbox_opentelemetry_plugin.modules.base import Context
+from tests.otel_helpers import data_points
 
 LABELS = {1: "ipam.prefix", 2: "dcim.device"}
 REQUEST_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
@@ -585,3 +587,119 @@ def test_module_install_without_netbox_is_inert():
 def test_module_enabled_follows_settings():
     assert audit.AuditModule().enabled(Settings(enabled=True, audit=AuditConfig(enabled=True))) is True
     assert audit.AuditModule().enabled(Settings(enabled=True)) is False
+
+
+def _metrics_ctx(audit_on=True, change_counters=True):
+    ctx, exporter = _ctx()
+    reader = InMemoryMetricReader()
+    ctx.meter_provider = otel.SwitchableMeterProvider(otel.build_meter_provider(ctx.resource, [reader]))
+    ctx.settings = Settings(
+        enabled=True,
+        audit=AuditConfig(enabled=audit_on),
+        metrics=MetricsConfig(enabled=True, change_counters=change_counters),
+    )
+    return ctx, exporter, reader
+
+
+def _receiver(ctx, callbacks):
+    return audit.make_receiver(
+        ctx, on_commit=lambda func, using=None: callbacks.append(func), label_for=LABELS.__getitem__, load_data=None
+    )
+
+
+def _counts(reader):
+    return {
+        (p.attributes["netbox.change.action"], p.attributes["netbox.change.object_type"]): p.value
+        for p in data_points(reader.get_metrics_data(), audit.CHANGE_COUNTER)
+    }
+
+
+def test_committed_changes_are_counted_by_action_and_type():
+    ctx, _, reader = _metrics_ctx()
+    callbacks = []
+    receiver = _receiver(ctx, callbacks)
+    receiver(sender=None, instance=_change(action="create"), created=True)
+    receiver(sender=None, instance=_change(pk=43, action="create"), created=True)
+    receiver(sender=None, instance=_change(pk=44, action="delete", changed_object_type_id=2), created=True)
+    assert _counts(reader) == {}  # nothing before commit
+    for callback in callbacks:
+        callback()
+    assert _counts(reader) == {("create", "ipam.prefix"): 2, ("delete", "dcim.device"): 1}
+
+
+def test_rolled_back_changes_are_not_counted():
+    ctx, _, reader = _metrics_ctx()
+    receiver = audit.make_receiver(
+        ctx, on_commit=lambda func, using=None: None, label_for=LABELS.__getitem__, load_data=None
+    )
+    receiver(sender=None, instance=_change(), created=True)
+    assert _counts(reader) == {}
+
+
+def test_changes_are_counted_with_audit_records_off():
+    ctx, exporter, reader = _metrics_ctx(audit_on=False)
+    callbacks = []
+    _receiver(ctx, callbacks)(sender=None, instance=_change(), created=True)
+    callbacks[0]()
+    assert _counts(reader) == {("update", "ipam.prefix"): 1}
+    assert len(exporter.get_finished_logs()) == 0
+
+
+def test_change_counters_off_counts_nothing():
+    ctx, _, reader = _metrics_ctx(change_counters=False)
+    callbacks = []
+    _receiver(ctx, callbacks)(sender=None, instance=_change(), created=True)
+    callbacks[0]()
+    assert _counts(reader) == {}
+
+
+def test_no_meter_provider_counts_nothing_and_still_emits_the_record():
+    ctx, exporter = _ctx()
+    callbacks = []
+    _receiver(ctx, callbacks)(sender=None, instance=_change(), created=True)
+    callbacks[0]()
+    assert len(exporter.get_finished_logs()) == 1
+
+
+def test_counter_follows_a_replaced_meter_provider():
+    ctx, _, first = _metrics_ctx()
+    callbacks = []
+    receiver = _receiver(ctx, callbacks)
+    receiver(sender=None, instance=_change(), created=True)
+    callbacks.pop()()
+    second = InMemoryMetricReader()
+    ctx.meter_provider = otel.SwitchableMeterProvider(otel.build_meter_provider(ctx.resource, [second]))
+    receiver(sender=None, instance=_change(pk=50), created=True)
+    callbacks.pop()()
+    assert _counts(first) == {("update", "ipam.prefix"): 1}
+    assert _counts(second) == {("update", "ipam.prefix"): 1}
+
+
+def test_counting_failure_never_raises_and_warns_once(caplog):
+    ctx, exporter, _ = _metrics_ctx()
+
+    class Broken:
+        def get_meter(self, *args, **kwargs):
+            raise RuntimeError("meter broken")
+
+    ctx.meter_provider = Broken()
+    callbacks = []
+    receiver = _receiver(ctx, callbacks)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        for pk in (1, 2):
+            receiver(sender=None, instance=_change(pk=pk), created=True)
+        for callback in callbacks:
+            callback()
+    assert len(exporter.get_finished_logs()) == 2  # audit records unaffected
+    assert len([r for r in caplog.records if "audit record failed" in r.getMessage()]) == 1
+
+
+def test_module_enabled_with_change_counters_only():
+    settings = Settings(enabled=True, metrics=MetricsConfig(enabled=True))
+    assert audit.AuditModule().enabled(settings) is True
+    settings = Settings(enabled=True, metrics=MetricsConfig(enabled=True, change_counters=False))
+    assert audit.AuditModule().enabled(settings) is False
+
+
+def test_change_counter_name_is_allowlisted():
+    assert audit.CHANGE_COUNTER in otel.METRIC_ALLOWLIST

@@ -1,4 +1,5 @@
-"""Audit records: one OTel log record per committed NetBox ObjectChange.
+"""Audit records and change counters: one OTel log record per committed NetBox ObjectChange, and
+the netbox.object_changes counter, both from one post_save receiver (SPEC 4).
 
 The pure functions and make_receiver() take their NetBox/Django dependencies as parameters, so
 they can be tested without Django. AuditModule.install() wires the real post_save signal and
@@ -18,11 +19,13 @@ from dataclasses import dataclass
 
 from .. import otel
 from ..conf import Settings
+from ..version import __version__
 from .base import Context
 
 AUDIT_SCOPE = "netbox_opentelemetry_plugin.audit"
 EVENT_NAME = "netbox.object_change"
 DISPATCH_UID = "netbox_opentelemetry_plugin.audit"
+CHANGE_COUNTER = "netbox.object_changes"
 
 # include_data batches its SELECT: one query for every LOAD_CHUNK_SIZE pending changes rather
 # than one query per change, so a large bulk edit does not turn into thousands of queries.
@@ -144,6 +147,25 @@ def make_receiver(ctx: Context, *, on_commit, label_for, load_data):
             # Type name only: exception text could contain object data.
             logger.warning("OpenTelemetry: audit record failed: %s", type(exc).__name__)
 
+    counter_cache: tuple[object, object] = (None, None)
+
+    def count(snap: ChangeSnapshot) -> None:
+        nonlocal counter_cache
+        try:
+            cfg = ctx.settings.metrics
+            provider = ctx.meter_provider
+            if provider is None or not cfg.enabled or not cfg.change_counters:
+                return
+            cached_for, counter = counter_cache
+            if cached_for is not provider:
+                counter = provider.get_meter(AUDIT_SCOPE, __version__).create_counter(
+                    CHANGE_COUNTER, unit="{change}", description="Committed NetBox object changes."
+                )
+                counter_cache = (provider, counter)
+            counter.add(1, {"netbox.change.action": snap.action, "netbox.change.object_type": snap.object_type})
+        except Exception as exc:
+            warn_once(exc)
+
     def pending() -> set[tuple[str, int]]:
         keys = getattr(local, "pending", None)
         if keys is None:
@@ -206,6 +228,11 @@ def make_receiver(ctx: Context, *, on_commit, label_for, load_data):
         except Exception as exc:
             warn_once(exc)
 
+    def commit(snap: ChangeSnapshot, alias: str) -> None:
+        # Runs only once the change is committed, so a rolled back change is neither recorded nor counted.
+        emit(snap, alias)
+        count(snap)
+
     def receiver(sender, instance, created, **kwargs) -> None:
         if not created or kwargs.get("raw"):
             # A later save of an existing record is NetBox updating an M2M change within the same
@@ -215,9 +242,9 @@ def make_receiver(ctx: Context, *, on_commit, label_for, load_data):
         try:
             alias = kwargs.get("using") or "default"
             snap = snapshot(instance, label_for)
-            if ctx.settings.audit.include_data:
+            if ctx.settings.audit.enabled and ctx.settings.audit.include_data:
                 pending().add((alias, snap.pk))
-            on_commit(lambda: emit(snap, alias), using=kwargs.get("using"))
+            on_commit(lambda: commit(snap, alias), using=kwargs.get("using"))
         except Exception as exc:
             warn_once(exc)
 
@@ -231,9 +258,15 @@ class AuditModule:
         self._disconnect: Callable[[], None] | None = None
 
     def enabled(self, settings: Settings) -> bool:
-        return settings.audit.enabled
+        return settings.audit.enabled or (settings.metrics.enabled and settings.metrics.change_counters)
 
     def install(self, ctx: Context) -> None:
+        records = ctx.settings.audit.enabled and ctx.logger_provider is not None
+        counts = (
+            ctx.settings.metrics.enabled and ctx.settings.metrics.change_counters and ctx.meter_provider is not None
+        )
+        if not (records or counts):
+            return
         try:
             from core.models import ObjectChange
             from django.contrib.contenttypes.models import ContentType
@@ -263,7 +296,8 @@ class AuditModule:
         self._disconnect = lambda: post_save.disconnect(sender=ObjectChange, dispatch_uid=DISPATCH_UID)
 
     def after_fork(self, ctx: Context) -> None:
-        # The receiver reads ctx.logger_provider at commit time, so it follows the rebuilt provider.
+        # The receiver reads ctx.logger_provider and ctx.meter_provider at commit time, so it
+        # follows the rebuilt providers.
         pass
 
     def shutdown(self) -> None:

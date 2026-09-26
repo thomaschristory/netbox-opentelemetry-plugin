@@ -108,6 +108,28 @@ def test_pipeline_shutdown_does_a_final_export():
     assert point.value == 3
 
 
+def test_shutdown_is_bounded_even_when_the_exporter_is_stuck():
+    # The reader serializes exports through one lock, held for the duration of an export() call.
+    # A synchronous force_flush during shutdown would otherwise block on that lock for as long as
+    # the stuck export runs, regardless of the timeout passed to it.
+    event = threading.Event()
+    exporter = RecordingMetricExporter(block=event)
+    pipeline = otel.MetricsPipeline(RESOURCE, exporter, interval=3600, timeout=1.0)
+    # A measurement is required: collect() exports nothing (and never touches the lock) when there
+    # is no data, so an empty flush would not reproduce the stuck-exporter scenario at all.
+    pipeline.provider.get_meter("t").create_counter("netbox.object_changes").add(1)
+    blocker = threading.Thread(target=pipeline.force_flush, args=(60_000,), daemon=True)
+    try:
+        blocker.start()
+        time.sleep(0.1)  # give the blocker's export a chance to take the reader's lock
+        started = time.monotonic()
+        pipeline.shutdown(0.2)
+        assert time.monotonic() - started < 1.0
+    finally:
+        event.set()
+        blocker.join(5)
+
+
 def test_pipeline_interval_thread_stops_promptly_on_shutdown():
     pipeline = otel.MetricsPipeline(RESOURCE, RecordingMetricExporter(), interval=3600, timeout=1.0)
     started = time.monotonic()

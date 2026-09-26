@@ -791,14 +791,32 @@ class MetricsPipeline:
         return self.provider.force_flush(timeout_millis)
 
     def shutdown(self, timeout: float) -> None:
-        """Stop the thread, export once more (the reader has no thread of its own to do it), shut down."""
+        """Stop the thread, export once more (the reader has no thread of its own to do it), shut down.
+
+        The reader serializes every export through one lock (SPEC: "The configured exporter's
+        export method will not be called concurrently"), held for as long as the exporter's own
+        export() call takes. If some export is stuck there (a hung exporter or an unresponsive
+        Collector), a synchronous force_flush would block on that same lock for as long as the
+        hang lasts, regardless of the timeout passed to it. The final flush therefore runs on its
+        own thread and is only waited on for up to `timeout`; a still-blocked flush is left
+        running (it is a daemon thread) and the method moves on to provider.shutdown() regardless.
+        provider.shutdown() does not need that lock: this reader keeps no daemon thread of its own
+        (export_interval_millis=inf), so PeriodicExportingMetricReader.shutdown calls the
+        exporter's shutdown() directly rather than waiting on anything the stuck export holds,
+        which keeps the whole call bounded by roughly `2 * timeout`.
+        """
         self._stop.set()
         self._thread.join(timeout)
-        try:
+        flushed = threading.Event()
+
+        def _flush() -> None:
             with contextlib.suppress(Exception):
                 self.provider.force_flush(timeout * 1000)
-        finally:
-            self.provider.shutdown(timeout * 1000)
+            flushed.set()
+
+        threading.Thread(target=_flush, name="otel-metrics-flush", daemon=True).start()
+        flushed.wait(timeout)
+        self.provider.shutdown(timeout * 1000)
 
 
 class _SwitchableInstrument:

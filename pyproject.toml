@@ -33,6 +33,9 @@ dev = [
     "ruff>=0.12",
     "requests>=2.32",
     "rq==2.12.0",
+    "django==6.1.1",
+    "redis==8.1.0",
+    "psycopg[binary]==3.3.5",
 ]
 
 [tool.hatch.version]

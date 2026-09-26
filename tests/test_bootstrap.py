@@ -403,3 +403,35 @@ def test_shutdown_shuts_down_the_owned_tracer_provider(exporter, span_exporter, 
     monkeypatch.setattr(ctx.tracer_provider, "shutdown", lambda: calls.append("tracer"))
     bootstrap.shutdown()
     assert calls == ["tracer"]
+
+
+def test_rebuild_shuts_down_the_new_child_logger_provider_when_tracer_rebuild_fails(
+    exporter, span_exporter, monkeypatch
+):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    inherited_provider = ctx.logger_provider
+    inherited_calls = []
+    monkeypatch.setattr(inherited_provider, "shutdown", lambda: inherited_calls.append("inherited"))
+
+    new_provider_calls = []
+
+    class _FakeChildProvider:
+        def shutdown(self) -> None:
+            new_provider_calls.append("new")
+
+    monkeypatch.setattr(otel, "build_logger_provider", lambda *a, **k: _FakeChildProvider())
+
+    def boom(cfg):
+        raise OSError("certificate unreadable")
+
+    monkeypatch.setattr(otel, "build_span_exporter", boom)
+
+    # Force the next reinit_after_fork() call to actually rebuild, as if this process had forked.
+    bootstrap._state.pid = -1
+    bootstrap.reinit_after_fork()
+
+    assert new_provider_calls == ["new"]
+    assert inherited_calls == []
+    # The inherited (parent-owned-in-this-child) provider is never assigned away by _rebuild_for_child
+    # itself; reinit_after_fork's own except-handler is what stops using it (see test_fork.py).
+    assert ctx.logger_provider is None

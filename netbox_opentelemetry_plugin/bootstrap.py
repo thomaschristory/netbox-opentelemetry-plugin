@@ -321,7 +321,16 @@ def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> No
         new_logger_provider = otel.build_logger_provider(resource, exporter, max_queue_size=max_queue_size)
     new_tracer_provider = None
     if state.owns_tracer_provider and ctx.tracer_provider is not None:
-        new_tracer_provider = _build_tracer_provider(ctx.settings, resource)
+        try:
+            new_tracer_provider = _build_tracer_provider(ctx.settings, resource)
+        except Exception:
+            # new_logger_provider (if built above) is child-owned and not referenced anywhere else:
+            # shut it down here or it leaks silently, unlike ctx.logger_provider (still the
+            # inherited one at this point), which this function never touches.
+            if new_logger_provider is not None:
+                with contextlib.suppress(Exception):
+                    new_logger_provider.shutdown()
+            raise
     if new_logger_provider is not None:
         ctx.logger_provider = new_logger_provider
     if new_tracer_provider is not None:

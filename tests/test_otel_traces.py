@@ -153,6 +153,82 @@ def test_redact_span_returns_the_same_object_when_clean():
     assert otel.redact_span(span) is span
 
 
+def test_redact_span_reduces_db_error_to_exception_type():
+    secret_message = (
+        'duplicate key value violates unique constraint "users_name_key"\n'
+        "DETAIL: Key (name)=(secret-value) already exists."
+    )
+    span = _span(
+        {"db.system": "postgresql", "db.statement": "INSERT INTO users ..."},
+        status=Status(StatusCode.ERROR, f"UniqueViolation: {secret_message}"),
+        events=[
+            Event(
+                "exception",
+                {
+                    "exception.type": "UniqueViolation",
+                    "exception.message": secret_message,
+                    "exception.stacktrace": f"Traceback (most recent call last):\n...\n{secret_message}",
+                    "exception.escaped": "True",
+                },
+                3,
+            )
+        ],
+    )
+    red = otel.redact_span(span)
+    assert red.status.status_code is StatusCode.ERROR
+    assert red.status.description == "UniqueViolation"
+    dumped = repr(dict(red.attributes)) + repr(red.status.description) + repr(red.events)
+    assert "secret-value" not in dumped
+    (event,) = red.events
+    assert dict(event.attributes) == {"exception.type": "UniqueViolation", "exception.escaped": "True"}
+    assert event.timestamp == 3
+    # db.system and other non-header/query attributes are left alone.
+    assert dict(red.attributes) == {"db.system": "postgresql", "db.statement": "INSERT INTO users ..."}
+
+
+def test_redact_db_span_status_description_without_colon_becomes_empty():
+    span = _span({"db.system": "postgresql"}, status=Status(StatusCode.ERROR, "connection lost"))
+    red = otel.redact_span(span)
+    assert red.status.status_code is StatusCode.ERROR
+    assert red.status.description == ""
+
+
+def test_redact_span_leaves_non_db_exception_events_alone():
+    # Regression guard: only spans carrying db.system get the exception-message/stacktrace drop.
+    span = _span(
+        {"http.request.method": "GET"},
+        status=Status(StatusCode.ERROR, "RuntimeError: boom"),
+        events=[Event("exception", {"exception.type": "RuntimeError", "exception.message": "boom"}, 3)],
+    )
+    red = otel.redact_span(span)
+    assert red.status.description == "RuntimeError: boom"
+    assert dict(red.events[0].attributes) == {"exception.type": "RuntimeError", "exception.message": "boom"}
+
+
+def test_db_span_error_drops_message_and_stacktrace_end_to_end():
+    exporter = InMemorySpanExporter()
+    tracer = _provider(exporter).get_tracer("t")
+    secret = "secret-value"
+    with tracer.start_as_current_span("parent", kind=SpanKind.SERVER):
+        try:
+            with tracer.start_as_current_span("SELECT", kind=SpanKind.CLIENT, attributes={"db.system": "postgresql"}):
+                raise RuntimeError(
+                    f'duplicate key value violates unique constraint "users_name_key"\n'
+                    f"DETAIL: Key (name)=({secret}) already exists."
+                )
+        except RuntimeError:
+            pass
+    db_span = next(s for s in exporter.get_finished_spans() if s.name == "SELECT")
+    dumped = repr(db_span.status.description) + repr(db_span.events)
+    assert secret not in dumped
+    assert db_span.status.description == "RuntimeError"
+    (event,) = db_span.events
+    assert event.name == "exception"
+    assert "exception.message" not in event.attributes
+    assert "exception.stacktrace" not in event.attributes
+    assert event.attributes["exception.type"] == "RuntimeError"
+
+
 class _Recorder:
     def __init__(self):
         self.ended = []
@@ -182,6 +258,23 @@ def test_processor_drops_a_span_it_cannot_redact(monkeypatch):
     assert recorder.ended == []
 
 
+def test_processor_warns_once_when_redaction_fails(monkeypatch, caplog):
+    recorder = _Recorder()
+    processor = otel.RedactingSpanProcessor(recorder)
+
+    def boom(span):
+        raise RuntimeError("redaction failed: secret-value")
+
+    monkeypatch.setattr(otel, "redact_span", boom)
+    with caplog.at_level("WARNING", logger=otel.PLUGIN_LOGGER):
+        processor.on_end(_span({"url.query": "a=1"}))
+        processor.on_end(_span({"url.query": "a=2"}))
+    warnings = [r for r in caplog.records if r.name == otel.PLUGIN_LOGGER]
+    assert len(warnings) == 1
+    assert "RuntimeError" in warnings[0].getMessage()
+    assert "secret-value" not in warnings[0].getMessage()
+
+
 def test_provider_exports_redacted_spans_with_header_env_set(monkeypatch):
     monkeypatch.setenv("OTEL_INSTRUMENTATION_HTTP_CAPTURE_HEADERS_SERVER_REQUEST", ".*")
     exporter = InMemorySpanExporter()
@@ -192,6 +285,17 @@ def test_provider_exports_redacted_spans_with_header_env_set(monkeypatch):
     (exported,) = exporter.get_finished_spans()
     assert "http.request.header.cookie" not in exported.attributes
     assert exported.attributes["url.query"] == "REDACTED"
+
+
+def test_switchable_provider_shutdown_makes_future_spans_non_recording():
+    exporter = InMemorySpanExporter()
+    switchable = otel.SwitchableTracerProvider(_provider(exporter))
+    tracer = switchable.get_tracer("t")
+    switchable.shutdown()
+    span = tracer.start_span("after-shutdown", kind=SpanKind.SERVER)
+    assert span.is_recording() is False
+    span.end()
+    assert exporter.get_finished_spans() == ()
 
 
 def test_switchable_provider_follows_its_delegate():

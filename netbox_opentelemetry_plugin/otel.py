@@ -44,6 +44,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from .conf import ExporterConfig
 
 PLUGIN_LOGGER = "netbox_opentelemetry_plugin"
+logger = logging.getLogger(PLUGIN_LOGGER)
 
 # Records from these loggers are never exported: the plugin's own warnings, the OTel SDK, and the
 # HTTP/gRPC client libraries used by the exporters. Exporting them could loop back into the exporter.
@@ -272,6 +273,13 @@ _URL_ATTRIBUTES = frozenset({"url.full", "http.url", "http.target"})
 # "why? because" still does not match since a space follows the "?". Linear: no nested quantifiers.
 _QUERY_IN_TEXT = re.compile(r"\?\S+")
 
+# psycopg query spans (db.system set by the instrumentor) can end with a status description and an
+# "exception" event whose message/stacktrace carry the offending values straight from PostgreSQL
+# (for example "DETAIL: Key (name)=(...) already exists." or an invalid inet literal). Only the
+# exception type is safe to keep for these spans; see SPEC 7.
+_DB_SYSTEM_ATTRIBUTE = "db.system"
+_DB_EXCEPTION_DROP_ATTRIBUTES = frozenset({"exception.message", "exception.stacktrace"})
+
 
 def build_span_exporter(cfg: ExporterConfig) -> SpanExporter:
     if cfg.protocol == "grpc":
@@ -373,20 +381,61 @@ def _scrub_event(event: Event) -> Event | None:
     return Event(event.name, scrubbed, event.timestamp)
 
 
+def _drop_db_exception_details(event: Event) -> Event | None:
+    """For an "exception" event, drop exception.message/exception.stacktrace, keep the rest."""
+    if event.name != "exception":
+        return None
+    attributes = event.attributes or {}
+    if not any(key in attributes for key in _DB_EXCEPTION_DROP_ATTRIBUTES):
+        return None
+    kept = {k: v for k, v in attributes.items() if k not in _DB_EXCEPTION_DROP_ATTRIBUTES}
+    return Event(event.name, kept, event.timestamp)
+
+
+def _reduce_db_status_to_exception_type(status: Status) -> Status | None:
+    """Replace a db span's status description with only the text before its first ":", or "" when there is none."""
+    if not status.description:
+        return None
+    exception_type, sep, _ = status.description.partition(":")
+    new_description = exception_type if sep else ""
+    if new_description == status.description:
+        return None
+    return Status(status.status_code, new_description)
+
+
 def redact_span(span: ReadableSpan) -> ReadableSpan:
     """Return span with headers, query strings and URL queries in free text removed (see SPEC 7).
+
+    A span carrying db.system (a psycopg query span) additionally has its status description
+    reduced to the bare exception type, and exception.message/exception.stacktrace dropped from
+    any "exception" event: PostgreSQL error messages carry the offending values.
 
     Returns the same object when nothing needs to change, so clean spans cost one attribute scan.
     """
     attributes = _redact_attributes(span.attributes or {})
+    is_db_span = _DB_SYSTEM_ATTRIBUTE in (span.attributes or {})
     events = list(span.events)
     events_changed = False
     for index, event in enumerate(events):
-        scrubbed = _scrub_event(event)
+        working = event
+        changed = False
+        if is_db_span:
+            db_scrubbed = _drop_db_exception_details(working)
+            if db_scrubbed is not None:
+                working = db_scrubbed
+                changed = True
+        scrubbed = _scrub_event(working)
         if scrubbed is not None:
-            events[index] = scrubbed
+            working = scrubbed
+            changed = True
+        if changed:
+            events[index] = working
             events_changed = True
     status = span.status
+    if is_db_span:
+        db_status = _reduce_db_status_to_exception_type(status)
+        if db_status is not None:
+            status = db_status
     if status.description:
         description = scrub_query_strings(status.description)
         if description != status.description:
@@ -418,6 +467,7 @@ class RedactingSpanProcessor(SpanProcessor):
 
     def __init__(self, delegate: SpanProcessor) -> None:
         self._delegate = delegate
+        self._warned = False
 
     def on_start(self, span, parent_context=None) -> None:
         self._delegate.on_start(span, parent_context=parent_context)
@@ -425,7 +475,11 @@ class RedactingSpanProcessor(SpanProcessor):
     def on_end(self, span: ReadableSpan) -> None:
         try:
             span = redact_span(span)
-        except Exception:
+        except Exception as exc:
+            if not self._warned:
+                self._warned = True
+                # Exception type only: redact_span operates on span data that may itself be sensitive.
+                logger.warning("OpenTelemetry: could not redact a span; it was dropped: %s", type(exc).__name__)
             return
         self._delegate.on_end(span)
 
@@ -500,6 +554,9 @@ class SwitchableTracerProvider(trace.TracerProvider):
         shutdown = getattr(self._delegate, "shutdown", None)
         if shutdown is not None:
             shutdown()
+        # Later spans (for example from a request that races the shutdown) resolve a fresh,
+        # non-recording tracer instead of calling into a delegate that has already shut down.
+        self._delegate = noop_tracer_provider()
 
 
 def noop_tracer_provider() -> trace.TracerProvider:

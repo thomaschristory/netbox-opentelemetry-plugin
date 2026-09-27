@@ -103,7 +103,7 @@ The plugin wraps rq's internals in place; no change to `RQ["WORKER_CLASS"]` is n
 
 ## Management commands
 
-Commands other than `rqworker` (`migrate`, `nbshell`, custom management commands, and so on) export logs and audit records only. No traces and no metrics are set up for them, so a short-lived command does not start any exporter background thread.
+Commands other than `rqworker` (`migrate`, `nbshell`, custom management commands, and so on) export logs and audit records only. No traces and no metrics are set up for them, so a short-lived command does not start a trace or metric exporter thread; it still gets a log exporter thread for whatever it logs or writes as an audit record while it runs.
 
 ## Checking it works
 

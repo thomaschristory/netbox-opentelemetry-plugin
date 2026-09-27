@@ -8,11 +8,11 @@ Every NetBox process the plugin runs in is assigned one role, and what gets set 
 |---|---|---|---|
 | `web` | A process serving HTTP requests (Granian, gunicorn or uWSGI worker, or the `runserver` serving child) | Yes | Yes |
 | `rqworker` | The long-lived `manage.py rqworker` process | Yes | Yes |
-| `rq_horse` | The forked child that runs one job, then exits | Yes, inherited | No |
+| `rq_horse` | The forked child that runs one job, then exits | Yes, rebuilt | No |
 | `management` | Any other management command (`migrate`, `nbshell`, and so on) | No | No |
 | `runserver_parent` | The `runserver` autoreloader's parent process | Nothing at all | Nothing at all |
 
-Logs and audit records are set up in every role except `runserver_parent`, which installs nothing. Traces and metrics are built fresh only in `web` and `rqworker`: a short management command should not start an exporter background thread just to run for a few seconds. A work-horse never goes through this initial setup itself; it is a fork of an already running `rqworker` process (see Forking web servers and RQ work-horses, below). It rebuilds and keeps its own working tracer provider after fork, since it needs one for the job span and for any instrumented database or Redis call made while that span is active, but its meter provider is switched to a no-op, so it records no metrics at all; job duration and outcome are recorded by the worker parent instead.
+Logs and audit records are set up in every role except `runserver_parent`, which installs nothing. Traces and metrics are built fresh only in `web` and `rqworker`: a short management command should not start a trace or metric exporter thread just to run for a few seconds, though it still gets a log exporter thread for its logs and audit records, same as every other role. A work-horse never goes through this initial setup itself; it is a fork of an already running `rqworker` process (see Forking web servers and RQ work-horses, below). It rebuilds its own working tracer provider after fork, since it needs one for the job span and for any instrumented database or Redis call made while that span is active, but its meter provider is switched to a no-op, so it records no metrics at all; job duration and outcome are recorded by the worker parent instead.
 
 Roles are assigned by `bootstrap.detect_role`, which looks at `sys.argv` and the environment (SPEC 4.1): `manage.py rqworker` gives `rqworker`; `manage.py runserver` gives `runserver_parent`, unless `--noreload` was passed or `RUN_MAIN=true` is already set in the environment, in which case it is the reloader's serving child and gets `web`; any other `manage.py <command>` gives `management`; anything else (Granian, gunicorn, uWSGI) gives `web`. The `rq_horse` role is not assigned by `detect_role` at all: it is applied only to a child of an announced fork, when the RQ integration's wrap around `fork_work_horse` runs (see RQ work-horses, below). An unannounced fork of an `rqworker` process, such as the RQ scheduler forking its own child, keeps the `rqworker` role instead.
 
@@ -20,14 +20,14 @@ Roles are assigned by `bootstrap.detect_role`, which looks at `sys.argv` and the
 
 Every span, log record and metric point the plugin exports carries a Resource with:
 
-- `service.name`, the configured `service_name` (default `netbox`).
+- `service.name`, the configured `service_name`, which falls back to the environment variable `OTEL_SERVICE_NAME` if unset, and to `netbox` if neither is set.
 - `service.version`, the running NetBox version.
 - `service.instance.id`, `<hostname>-<pid>`, rebuilt with the new PID whenever the process forks.
 - `netbox.plugin.version`, this plugin's own version.
 - `netbox.process.role`, the role above.
 - Whatever is set in `resource_attributes` in `PLUGINS_CONFIG`.
 
-The OpenTelemetry SDK also merges in `OTEL_RESOURCE_ATTRIBUTES` (and `OTEL_SERVICE_NAME`) from the environment underneath all of this: the plugin's own keys and `resource_attributes` always win over an environment attribute of the same name. For example, `OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,service.name=x` adds `deployment.environment=prod` but leaves `service.name` as `netbox`, since the plugin sets `service.name` itself.
+The OpenTelemetry SDK also merges in `OTEL_RESOURCE_ATTRIBUTES` from the environment underneath all of this: the plugin's own keys and `resource_attributes` always win over an environment attribute of the same name. For example, with neither `service_name` nor `OTEL_SERVICE_NAME` set, `OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,service.name=x` adds `deployment.environment=prod` but leaves `service.name` as `netbox`, not `x`, since the plugin always sets `service.name` itself from its own resolved `service_name` (see above).
 
 ## Instance identity across restarts
 
@@ -35,7 +35,7 @@ A restarted container very often gets the same hostname and reuses low process I
 
 ## Forking web servers
 
-Every worker process forked from a preloaded parent (gunicorn with `preload_app`, uWSGI's `master` mode) rebuilds its Resource, its exporters and the providers built on top of them right after the fork, through Python's `os.register_at_fork` hooks (or, under uWSGI, the chained `uwsgi.post_fork_hook`). Nothing is inherited except the OpenTelemetry SDK's own batch processors, which the SDK itself already resets after fork with a fresh worker thread and an empty queue. The result is that each worker process exports under its own `service.instance.id`, distinct from its parent's and from every sibling worker's.
+Every worker process forked from a preloaded parent (gunicorn with `preload_app`, uWSGI's `master` mode) rebuilds its Resource, a fresh exporter and a new provider right after the fork, through Python's `os.register_at_fork` hooks (or, under uWSGI, the chained `uwsgi.post_fork_hook`). The parent's own provider and exporter connection are never touched from the child: they are simply dropped and left running unused, since any lock inside them (a `requests.Session`, a gRPC channel, an SDK batch processor's own lock) was copied by `fork()` in whatever state it happened to be in, and touching or shutting down an object in that state can deadlock the child. The result is that each worker process exports under its own `service.instance.id`, distinct from its parent's and from every sibling worker's.
 
 This means the data from a fleet of forked workers arrives as one series per worker process, not one series per host or per container. A manual check during development (`--max-requests=20`, recycling workers quickly) saw `http.server.request.duration` reported under 6 distinct worker identities for gunicorn and 5 for uWSGI over the check's duration, because every worker gunicorn or uWSGI recycles is a new process with a new PID, and therefore a new identity, even though the container itself never restarted. Any aggregation across a worker fleet (dashboards, alerts) needs to sum or average across these per-process series rather than expect a single series per container.
 
@@ -54,7 +54,9 @@ Whatever the horse had buffered and not yet flushed at that point is lost. Keepi
 
 Because the worker only picks up its next job once the current horse has exited, a slow flush delays the worker's next job rather than the running job's own completion. During a Collector outage the exporter cannot succeed, so every horse pays the full `flush_timeout` before it exits, capping that worker at roughly one job per `flush_timeout` for as long as the outage lasts.
 
-Setting `rq.patch_worker = False` removes this flush wrap entirely (and the `fork_work_horse` wrap that labels the child `rq_horse`, and the wrap around `perform_job` that opens the job's span): with it off, a work-horse keeps the `rqworker` role, gets no job span, and whatever it buffers before exiting is never flushed. A work-horse exports no metrics either way; job duration and outcome counters are recorded by the worker parent around the whole job, including the fork and the horse's run.
+Setting `rq.patch_worker = False` removes this flush wrap entirely (and the `fork_work_horse` wrap that labels the child `rq_horse`, and the wrap around `perform_job` that opens the job's span, and the `execute_job` wraps that record job duration and outcome): with it off, a work-horse keeps the `rqworker` role, gets no job span, whatever it buffers before exiting is never flushed, and job duration and outcome are no longer recorded either. The queue depth gauge is unaffected, since it is registered before `rq.patch_worker` is checked.
+
+This also changes what happens to metrics in the forked child itself. Normally a work-horse is labelled `rq_horse`, a role metrics are not set up for, so its meter provider is switched to a no-op after fork and it exports nothing. With `patch_worker = False`, the fork is never announced, so the forked child keeps the `rqworker` role, which metrics *are* set up for: if metrics are enabled, `bootstrap` rebuilds this now-unlabelled fork a full metrics pipeline of its own, resource and all. Should that fork happen to run longer than one `metrics.export_interval` before exiting, for example a slow job, it can itself export metrics (such as the queue depth gauge) under its own freshly built `service.instance.id`, indistinguishable in the data from a second, genuine `rqworker` process.
 
 ## An SDK configured outside the plugin
 

@@ -1,6 +1,6 @@
 COMPOSE = docker compose -f dev/docker-compose.yml
 
-.PHONY: test test-netbox lint format dev dev-gunicorn dev-uwsgi down logs-collector e2e
+.PHONY: test test-netbox lint format dev dev-gunicorn dev-uwsgi down logs-collector e2e dist docs docs-serve
 
 test:
 	uv run pytest -W error::DeprecationWarning
@@ -15,6 +15,12 @@ lint:
 format:
 	uv run ruff check --fix .
 	uv run ruff format .
+
+dist:
+	rm -rf dist
+	uv build
+	uvx twine check --strict dist/*
+	python3 dev/scripts/check_dist.py dist
 
 dev:
 	$(COMPOSE) up -d --build

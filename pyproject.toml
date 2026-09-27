@@ -9,12 +9,20 @@ description = "Export NetBox logs, audit records, traces and metrics over OTLP."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
+authors = [{ name = "Thomas Christory" }]
+keywords = ["netbox", "netbox-plugin", "opentelemetry", "otlp", "observability"]
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Framework :: Django",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Monitoring",
 ]
 dependencies = [
     "opentelemetry-api~=1.44.0",
@@ -27,6 +35,13 @@ dependencies = [
     "opentelemetry-instrumentation-requests==0.65b0",
     "opentelemetry-instrumentation-system-metrics==0.65b0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/thomaschristory/netbox-opentelemetry-plugin"
+Documentation = "https://thomaschristory.github.io/netbox-opentelemetry-plugin/"
+Repository = "https://github.com/thomaschristory/netbox-opentelemetry-plugin"
+Changelog = "https://github.com/thomaschristory/netbox-opentelemetry-plugin/blob/main/CHANGELOG.md"
+Issues = "https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues"
 
 [dependency-groups]
 dev = [
@@ -44,6 +59,11 @@ path = "netbox_opentelemetry_plugin/version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["netbox_opentelemetry_plugin"]
+
+[tool.hatch.build.targets.sdist]
+# Allowlist: hatchling honours .gitignore but not .git/info/exclude, so local-only files would
+# otherwise end up in the sdist.
+only-include = ["netbox_opentelemetry_plugin", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [tool.ruff]
 line-length = 120

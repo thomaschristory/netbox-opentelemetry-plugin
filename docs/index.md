@@ -32,13 +32,13 @@ Restart NetBox and the RQ workers to pick up the change.
 |---|---|---|
 | 0.1.x | 4.7.x | 3.12, 3.13, 3.14 |
 
-## What stays on stdout
+## What stays outside the exporters
 
-Some things never go through the plugin's exporters and stay on stdout, where platform log collection can still pick them up:
+Some things never go through the plugin's exporters, and are left to stdout, stderr and platform log collection instead:
 
-- Web server access logs.
-- Startup errors and crashes.
-- The plugin's own warnings, on the `netbox_opentelemetry_plugin` logger, which is never exported.
+- Web server access logs, typically on stdout.
+- Startup errors and crashes, typically on stderr.
+- The plugin's own warnings, on the `netbox_opentelemetry_plugin` logger, which is never exported; with NetBox's default `LOGGING = {}` these reach stderr through Python's last-resort handler.
 
 ## Related work
 

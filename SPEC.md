@@ -81,6 +81,7 @@ ready()  -> super().ready()
 - The `runserver` autoreloader parent installs nothing; the serving child does.
 - Provider detection: if a non-default global TracerProvider, MeterProvider or LoggerProvider is already set, reuse it and do not install instrumentors that report `is_instrumented_by_opentelemetry`. A reused MeterProvider is wrapped (so the plugin's own instruments record into a no-op in a forked work-horse) but not filtered: the plugin's metric allowlist (6.4) applies only to the MeterProvider it builds itself.
 - The plugin's own Resource: `service.name`, `service.version` (NetBox version), `service.instance.id` (hostname + PID, regenerated after fork), `netbox.plugin.version`, `netbox.process.role`, plus configured resource attributes.
+- A restarted container often gets the same hostname and PID, so it reuses `service.instance.id`; a cumulative metric series then restarts under the same identity, told apart only by its start time.
 
 ### 4.2 Fork handling
 
@@ -114,7 +115,7 @@ ready()  -> super().ready()
 - Each wrap first checks the target's signature (`self, job, queue`). On mismatch: one warning, that wrap is skipped, everything else continues. Wraps are marked and never applied twice.
 - `Worker.execute_job` and `SimpleWorker.execute_job` are wrapped in the worker parent when metrics are on, to record job metrics around the whole job (with `Worker`: the parent's wall time around `execute_job`, that is preparing the job, the fork, the horse's run including its flush, until the horse exits). Same signature check (`self, job, queue`), same marker; `rq.patch_worker = False` skips them too. The horse flush does not flush metrics: a horse exports none (4.2).
 - `rq.patch_worker = False` disables the `perform_job` and `fork_work_horse` wraps; nothing is flushed in the horse then, it keeps the `rqworker` role instead of being labelled `rq_horse`, and no job span is created (the `perform_job` wrap is what creates the span, see 6.3).
-- Not covered: a horse killed by the parent (SIGKILL after `job.timeout + 60` s) cannot flush. `SpawnWorker` (not used by NetBox) starts a fresh interpreter and is not detected as a horse.
+- Not covered: a horse killed by the worker with SIGKILL cannot flush. rq does this when the job runs longer than `job.timeout + 60` s, on a stop-job or kill-horse command, and on a cold shutdown (a second SIGINT or SIGTERM). `rq.flush_timeout` must stay well below that 60 s margin; this is not enforced. `SpawnWorker` (not used by NetBox) starts a fresh interpreter and is not detected as a horse.
 - `Queue.enqueue_job` is wrapped (web and worker processes alike) to store the current span's W3C trace context in `job.meta["netbox_otel_context"]`, gated by `rq.propagate_context`. `BaseWorker.perform_job` runs each job inside a CONSUMER span (see 6.3), parented on that stored context when present. The horse flush (above) flushes the log provider and the tracer provider in parallel, still bounded by the single `rq.flush_timeout`.
 
 ## 5. Configuration
@@ -195,11 +196,11 @@ Validation:
 - NetBox's default `LOGGING` is empty, so the `netbox` logger inherits the root level (WARNING). INFO records only reach the handler if `LOGGING` sets a lower level or `set_logger_levels` is true.
 - Providers are passed explicitly to handlers and instrumentors; the plugin does not set the global OTel providers.
 - Inside an active span, records carry `trace_id` and `span_id`.
-- Feedback-loop filter: records from `netbox_opentelemetry_plugin` and `opentelemetry.*` loggers are rejected by the handler. The plugin's own logger writes to stdout only.
+- Feedback-loop filter: records from `netbox_opentelemetry_plugin` and `opentelemetry.*` loggers are rejected by the handler. The plugin's own logger is never exported and goes wherever NetBox's logging configuration sends it (stderr by default, under NetBox's default `LOGGING = {}`).
 
 ### 6.2 Audit
 - Receiver: `post_save` on `core.models.ObjectChange`, `created=True` only (a later `created=False` save of the same record, which NetBox uses to fold an M2M change into the record made earlier in the same request, is ignored by the receiver itself); a raw save (for example loading a fixture) is also ignored. Emission is deferred with `transaction.on_commit`, so a rolled back change produces nothing.
-- Emitted through the OTel Logger API directly (independent of the logs module and of stdout). Uses the logs exporter settings (`logs.endpoint`, then `exporter.*`); the LoggerProvider is built when either `logs` or `audit` is enabled, so audit works with `logs.enabled = False`.
+- Emitted through the OTel Logger API directly (independent of the logs module and of local log output). Uses the logs exporter settings (`logs.endpoint`, then `exporter.*`); the LoggerProvider is built when either `logs` or `audit` is enabled, so audit works with `logs.enabled = False`.
 - Instrumentation scope `netbox_opentelemetry_plugin.audit`. Event name `netbox.object_change`. Severity INFO. Timestamp: the `ObjectChange` row's `time` (the change's own time, not when the record is emitted).
 - Body: `"<action> <app_label>.<model> <object_repr>"`, for example `"update dcim.device edge-rtr-01"`.
 - Attributes, only these and only when noted:
@@ -215,7 +216,7 @@ Validation:
 Known limitations:
 - If NetBox updates an M2M change record in a later transaction than the one that created it, the data sent with the first record does not include that later update. This only matters with `include_data`; same-transaction M2M updates are covered above.
 - The log pipeline buffers up to 20,000 records per process while audit is on. A single commit larger than that can drop records, and the SDK reports this only on its own logger, which the plugin does not export.
-- When a `LoggerProvider` configured outside the plugin is reused (4.1's provider detection), its queue is not resized; the 20,000 figure above applies only to a provider the plugin builds itself.
+- When a `LoggerProvider` configured outside the plugin is reused (provider detection (section 4.1)), its queue is not resized; the 20,000 figure above applies only to a provider the plugin builds itself.
 - With `include_data`, a record can grow large for an object with big JSON fields. Most Collectors reject a request above their configured body size limit, dropping the whole batch that record was in, not just that record. Keep `include_data` off, or exclude large fields such as `config_context` and `local_context_data` in `audit.exclude_fields`.
 
 ### 6.3 Traces
@@ -229,14 +230,14 @@ Known limitations:
 - The Django and requests instrumentors also export the standard HTTP semantic-convention attributes they normally add (`client.address`, `user_agent.original`, `server.address`, `server.port`, `network.*`, `url.scheme`, `url.path`, `http.route`, `http.request.method`, `http.response.status_code`, `error.type`, and similarly for psycopg's DB attributes): only headers, query strings and bind parameters are redacted, everything else the instrumentors set is exported as is.
 - A CLIENT span with no parent (a psycopg or redis call outside a request or job, for example a startup query, or an RQ worker's own poll and heartbeat commands) is dropped before the configured sampler runs, so it does not start a trace of its own.
 - Redaction runs at export, in a `SpanProcessor` ahead of the exporting one, and covers every exported span kind (including SERVER and CONSUMER, not only the outbound CLIENT spans instrumentors add attributes to): `http.request.header.*` / `http.response.header.*` are removed; `url.query` becomes `REDACTED`; `url.full`, `http.url` and `http.target` end in `?REDACTED` when they had a query; status descriptions and exception event attributes have any `path?query` replaced with `path?REDACTED`. Every span, regardless of kind or attributes, also has its status description reduced to the text before the first `:` (a description with no `:`, such as a bare exception type name or a plugin-set description like "job failed", is left unchanged), and `exception.message`/`exception.stacktrace` dropped from any `exception` event, keeping `exception.type`, `exception.escaped` and any other event attributes. This applies whether the error surfaces on a psycopg query span, or unhandled on the request's SERVER span (Django's middleware exits its span activation with the exception still propagating) or a job's CONSUMER span (`modules/rq.py`), since a PostgreSQL error message can carry the offending values (for example a unique constraint violation's `DETAIL`). The full text is still available in log records. A span that fails to redact is dropped rather than exported as is.
-- Only the W3C trace context (`traceparent`) is written to `job.meta["netbox_otel_context"]`; baggage is not copied, so a job never receives arbitrary request-scoped data through this channel.
+- Only the W3C trace context (`traceparent`, and `tracestate` when present) is written to `job.meta["netbox_otel_context"]`; baggage is not copied, so a job never receives arbitrary request-scoped data through this channel.
 - An inbound `traceparent` header is honoured, as with any OTel SDK using a `parentbased_*` sampler (the default): a client can force sampling and choose the trace id for its own request. An operator for whom this matters should use a non-parentbased sampler, or strip the header at a proxy in front of NetBox.
 
 Known limitations:
 - A psycopg connection opened before the plugin's `ready()` (for example by startup code) is not traced until Django closes and reopens it (`CONN_MAX_AGE`).
 - Only a job enqueued through rq's `Queue.enqueue_job` (the method `Queue.enqueue()` itself calls) carries the enqueuing trace's context. `enqueue_at`, `enqueue_in` and `enqueue_many` reach rq internals (`schedule_job`, `_enqueue_job`) that never call `enqueue_job`, so those jobs start their own trace, including one scheduled by `enqueue_at` from inside a request. A retried job, a requeued job, and a job the rq scheduler moves from scheduled back onto its queue all reuse the same `Job` and its `meta` rather than being enqueued through `enqueue_job` again, so they keep whatever context was stored at the original enqueue: a retry can therefore appear in the original request's trace, possibly much later.
 - With django-rq `COMMIT_MODE = "request_finished"`, the enqueue happens after the request's span has already ended, so the job is not linked to the request's trace.
-- With a `TracerProvider` configured outside the plugin (4.1's provider detection), the plugin's redaction and the parentless-CLIENT-span filter do not apply: that provider's own configuration governs what is exported.
+- With a `TracerProvider` configured outside the plugin (provider detection (section 4.1)), the plugin's redaction and the parentless-CLIENT-span filter do not apply: that provider's own configuration governs what is exported.
 - If an rq exception handler registered before the plugin's own returns `False` (telling rq to stop walking the handler stack), the job span still gets status ERROR, but without an exception event, since the plugin's handler was not reached.
 - The `exception.message` attribute of a log record (logs module) is not scrubbed for URL query strings; only span attributes, status descriptions and span exception events are.
 
@@ -266,7 +267,7 @@ Known limitations:
 
 Known limitations:
 - Outbound HTTP calls and object changes made inside a job (in the horse) or in a management command are not counted, since neither exports metrics.
-- With a MeterProvider configured outside the plugin (4.1's provider detection), web and worker children keep recording into it, as with traces, and the plugin's allowlist does not apply. Its own reader keeps running in each forked horse.
+- With a MeterProvider configured outside the plugin (provider detection (section 4.1)), web and worker children keep recording into it, as with traces, and the plugin's allowlist does not apply. Its own reader keeps running in each forked horse.
 - A job whose hash is gone when the parent looks (for example `result_ttl=0`) is counted with outcome `unknown`.
 
 ## 7. Data safety

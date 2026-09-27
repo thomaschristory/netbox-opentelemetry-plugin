@@ -6,7 +6,7 @@ With `audit.enabled` (default `True`), the plugin exports one OpenTelemetry log 
 
 The plugin connects to `post_save` on `core.models.ObjectChange`, and only acts when `created` is `True`: a later `created=False` save of the same row, which NetBox uses to fold an M2M change into the record it already created earlier in the same request, is ignored by the receiver itself, as is a raw save (for example loading a fixture). Emission is deferred with `transaction.on_commit`, so a change that is rolled back produces nothing.
 
-Records are emitted through the OTel Logger API directly, independently of the logs module and of stdout, using the shared logs exporter settings (`logs.endpoint`, then `exporter.*`). The underlying `LoggerProvider` is built whenever either `logs` or `audit` is enabled and an endpoint resolves for it, so audit records still export with `logs.enabled = False`.
+Records are emitted through the OTel Logger API directly, independently of the logs module and of local log output, using the shared logs exporter settings (`logs.endpoint`, then `exporter.*`). The underlying `LoggerProvider` is built whenever either `logs` or `audit` is enabled and an endpoint resolves for it, so audit records still export with `logs.enabled = False`.
 
 ## Scope, event, severity, timestamp
 

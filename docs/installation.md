@@ -107,7 +107,7 @@ Commands other than `rqworker` (`migrate`, `nbshell`, custom management commands
 
 ## Checking it works
 
-The plugin logs its own messages to the `netbox_opentelemetry_plugin` logger, on stdout, and never exports them. If a signal has no endpoint configured, that module logs one warning and disables itself; the rest of NetBox, and the rest of the plugin, keep running.
+The plugin logs its own messages to the `netbox_opentelemetry_plugin` logger and never exports them. With NetBox's default `LOGGING = {}`, these reach stderr through Python's last-resort handler. If a signal has no endpoint configured, that module logs one warning and disables itself; the rest of NetBox, and the rest of the plugin, keep running.
 
 In the Collector (a `debug` exporter is enough to start with), look for the resource attributes `service.name=netbox`, `netbox.process.role` (`web`, `rqworker`, `rq_horse` or `management`) and `service.instance.id`, to confirm data is arriving and to tell processes apart.
 

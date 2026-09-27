@@ -88,7 +88,7 @@ The plugin resolves `PLUGINS_CONFIG` once per process, and a bad value never sto
 - A signal with no endpoint that resolves at all logs one warning and disables itself; the other signals are unaffected.
 - The resolved configuration is logged once at `DEBUG` level, with every header value replaced and any URL credentials in an endpoint replaced by `***`.
 
-Every one of these warnings goes to the `netbox_opentelemetry_plugin` logger, on stdout, and is never exported: nothing about a misconfiguration leaves the process. See [Failure behaviour](failure-behaviour.md) and [Data safety](data-safety.md).
+Every one of these warnings goes to the `netbox_opentelemetry_plugin` logger and is never exported: nothing about a misconfiguration leaves the process. With NetBox's default `LOGGING = {}`, that logger has no handler of its own, so a warning falls through to Python's last-resort handler, which writes to stderr; configure `LOGGING` to send it elsewhere. See [Failure behaviour](failure-behaviour.md) and [Data safety](data-safety.md).
 
 ## Examples
 

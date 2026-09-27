@@ -569,6 +569,29 @@ def noop_tracer_provider() -> trace.TracerProvider:
     return trace.NoOpTracerProvider()
 
 
+class _DetachedTracer(trace.NoOpTracer):
+    """A tracer whose spans are always INVALID_SPAN, whatever the parent.
+
+    The API NoOpTracer returns a non-recording span carrying the parent's span context, so an
+    instrumentor using it would still make an inbound traceparent current (log records would carry
+    its ids) and forward it on outbound calls. With INVALID_SPAN current, neither happens.
+    start_as_current_span is inherited and activates the span returned here.
+    """
+
+    def start_span(self, *args, **kwargs) -> trace.Span:
+        return trace.INVALID_SPAN
+
+
+class _DetachedTracerProvider(trace.NoOpTracerProvider):
+    def get_tracer(self, *args, **kwargs) -> trace.Tracer:
+        return _DetachedTracer()
+
+
+def detached_tracer_provider() -> trace.TracerProvider:
+    """For instrumentors applied for metrics only: no spans, no trace context continued or forwarded."""
+    return _DetachedTracerProvider()
+
+
 def noop_meter_provider() -> MeterProvider:
     return NoOpMeterProvider()
 

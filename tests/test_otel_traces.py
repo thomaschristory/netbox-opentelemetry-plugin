@@ -540,3 +540,33 @@ def test_clean_error_span_is_returned_unchanged():
         events=[Event("exception", {"exception.type": "X"}, 3)],
     )
     assert otel.redact_span(span) is span
+
+
+def _remote_parent_context():
+    parent = trace.SpanContext(
+        trace_id=0x1234, span_id=0x5678, is_remote=True, trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED)
+    )
+    return trace.set_span_in_context(trace.NonRecordingSpan(parent))
+
+
+def test_detached_tracer_provider_ignores_any_parent():
+    from opentelemetry import context
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    tracer = otel.detached_tracer_provider().get_tracer("t")
+    parent_ctx = _remote_parent_context()
+    assert tracer.start_span("s", context=parent_ctx) is trace.INVALID_SPAN
+    token = context.attach(parent_ctx)
+    try:
+        assert tracer.start_span("s") is trace.INVALID_SPAN
+        with tracer.start_as_current_span("s", kind=SpanKind.SERVER) as span:
+            assert span is trace.INVALID_SPAN
+            assert trace.get_current_span() is trace.INVALID_SPAN
+            assert not trace.get_current_span().get_span_context().is_valid
+            carrier: dict = {}
+            TraceContextTextMapPropagator().inject(carrier)
+            assert carrier == {}
+        # The parent is current again after the block.
+        assert trace.get_current_span().get_span_context().trace_id == 0x1234
+    finally:
+        context.detach(token)

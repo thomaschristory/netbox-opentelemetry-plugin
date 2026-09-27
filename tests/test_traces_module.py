@@ -5,6 +5,7 @@ import threading
 
 import pytest
 import requests
+from opentelemetry import context, trace
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.resources import Resource
@@ -221,7 +222,10 @@ def test_real_requests_instrumentation_records_client_duration_with_allowlisted_
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
+    received_headers: list = []
+
     def do_GET(self):
+        self.received_headers.append({k.lower(): v for k, v in self.headers.items()})
         self.send_response(204)
         self.end_headers()
 
@@ -234,8 +238,40 @@ def local_server():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    _Handler.received_headers.clear()
     yield f"http://127.0.0.1:{server.server_address[1]}"
     server.shutdown()
+
+
+def _remote_parent():
+    parent = trace.SpanContext(
+        trace_id=0xABC, span_id=0xDEF, is_remote=True, trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED)
+    )
+    return trace.set_span_in_context(trace.NonRecordingSpan(parent))
+
+
+def test_metrics_only_requests_neither_continues_nor_forwards_an_inbound_trace(local_server, monkeypatch):
+    monkeypatch.setattr(traces_module, "HTTP_METRIC_INSTRUMENTATIONS", ("requests",))
+    meter, reader = _meter()
+    ctx, _ = _ctx(instrument=(), traces_on=False, meter_provider=meter)
+    module = TracesModule()
+    module.install(ctx)
+    token = context.attach(_remote_parent())
+    try:
+        requests.get(f"{local_server}/hook", timeout=5)
+    finally:
+        context.detach(token)
+        module.shutdown()
+    assert len(_Handler.received_headers) == 1
+    assert "traceparent" not in _Handler.received_headers[0]
+    assert data_points(reader.get_metrics_data(), "http.client.request.duration")
+
+
+def test_an_untraced_instrumentor_gets_the_detached_tracer_while_traces_are_on():
+    meter, _ = _meter()
+    ctx, _ = _ctx(instrument=("psycopg",), meter_provider=meter)
+    tracer = instrument_kwargs("django", ctx)["tracer_provider"].get_tracer("t")
+    assert tracer.start_span("s", context=_remote_parent()) is trace.INVALID_SPAN
 
 
 def _all_text(spans):

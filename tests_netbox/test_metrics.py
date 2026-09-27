@@ -7,6 +7,7 @@ job metrics from a real rq SimpleWorker, change counts from the plugin's install
 """
 
 import dataclasses
+import logging
 import uuid
 
 import django_rq
@@ -17,6 +18,7 @@ from django.test import RequestFactory, TestCase
 from django.urls import reverse
 from ipam.models import Prefix
 from netbox.context_managers import event_tracking
+from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from rest_framework import status
 from rq import Queue, SimpleWorker
@@ -82,6 +84,43 @@ class HttpServerMetricsTest(MetricsMixin, APITestCase):
         self.assertEqual(set(points[0].attributes), {"http.request.method", "http.route", "http.response.status_code"})
         self.assertNotIn("http.server.active_requests", metric_names(data))
         self.assertNotIn("s3cret", repr(data))
+
+    def test_inbound_traceparent_is_not_continued_with_traces_off(self):
+        # Traces are off here: the Django instrumentor runs for metrics only and must not make the
+        # client's trace context current, so log records written in the view carry no trace id.
+        inbound_trace_id = 0x0AF7651916CD43DD8448EB211C80319C
+        self.add_permissions("ipam.add_prefix")
+        exporter = InMemoryLogRecordExporter()
+        handler = otel.build_logging_handler(
+            otel.build_logger_provider(self.base.resource, exporter, synchronous=True), logging.INFO
+        )
+        views_logger = logging.getLogger("netbox.api.views")
+        previous = views_logger.level
+        views_logger.addHandler(handler)
+        views_logger.setLevel(logging.INFO)
+        try:
+            response = self.client.post(
+                reverse("ipam-api:prefix-list"),
+                {"prefix": "10.97.0.0/24"},
+                format="json",
+                HTTP_TRACEPARENT=f"00-{inbound_trace_id:032x}-b7ad6b7169203331-01",
+                **self.header,
+            )
+        finally:
+            views_logger.removeHandler(handler)
+            views_logger.setLevel(previous)
+        self.assertHttpStatus(response, status.HTTP_201_CREATED)
+        points = [
+            p
+            for p in data_points(self.collect(), "http.server.request.duration")
+            if "ipam/prefixes" in p.attributes.get("http.route", "")
+        ]
+        self.assertEqual(len(points), 1)
+        records = [r for r in exporter.get_finished_logs() if "Creating new prefix" in str(r.log_record.body)]
+        self.assertEqual(len(records), 1)
+        self.assertNotEqual(records[0].log_record.trace_id, inbound_trace_id)
+        self.assertFalse(records[0].log_record.trace_id)
+        self.assertFalse(records[0].log_record.span_id)
 
     def test_excluded_url_records_no_duration(self):
         self.client.get("/api/status/", **self.header)

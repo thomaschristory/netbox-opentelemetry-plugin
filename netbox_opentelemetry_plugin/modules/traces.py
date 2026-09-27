@@ -31,8 +31,9 @@ def instrumentations(ctx: Context) -> tuple[str, ...]:
 def instrument_kwargs(name: str, ctx: Context) -> dict:
     cfg = ctx.settings.traces
     traced = ctx.tracer_provider is not None and name in cfg.instrument
-    # An instrumentor applied for metrics only gets a no-op tracer: no spans from it.
-    kwargs: dict = {"tracer_provider": ctx.tracer_provider if traced else otel.noop_tracer_provider()}
+    # An instrumentor applied for metrics only gets a detached tracer: no spans from it, and an
+    # inbound trace context is neither made current nor forwarded on outbound calls.
+    kwargs: dict = {"tracer_provider": ctx.tracer_provider if traced else otel.detached_tracer_provider()}
     meter_provider = ctx.meter_provider if ctx.meter_provider is not None else otel.noop_meter_provider()
     if name == "django":
         # Excluded URLs get neither a span nor a duration measurement.

@@ -214,7 +214,7 @@ def reinit_after_fork() -> None:
     shares the parent's exporter connection. This gives the child its own Resource, exporter and
     LoggerProvider. Idempotent: a second call in the same process does nothing. If this process
     owned its LoggerProvider and the rebuild fails, it detaches the logging handler and points the
-    tracer provider at a no-op provider rather than keep using the inherited, now-orphaned
+    tracer provider at a detached provider rather than keep using the inherited, now-orphaned
     providers.
 
     This never calls shutdown() (or anything else) on an object inherited from the parent: any
@@ -243,7 +243,7 @@ def reinit_after_fork() -> None:
                 # Same reason as below: never export through the inherited exporter connection.
                 state.owns_tracer_provider = False
                 with contextlib.suppress(Exception):
-                    ctx.tracer_provider.set_delegate(otel.noop_tracer_provider())
+                    ctx.tracer_provider.set_delegate(otel.detached_tracer_provider())
             role = role_hint or ctx.role
             if ctx.meter_provider is not None and (state.metrics_pipeline is not None or role not in METRIC_ROLES):
                 # No exporter of our own in this process: record nowhere rather than into inherited state.

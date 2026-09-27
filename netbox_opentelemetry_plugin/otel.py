@@ -560,13 +560,9 @@ class SwitchableTracerProvider(trace.TracerProvider):
         shutdown = getattr(self._delegate, "shutdown", None)
         if shutdown is not None:
             shutdown()
-        # Later spans (for example from a request that races the shutdown) resolve a fresh,
-        # non-recording tracer instead of calling into a delegate that has already shut down.
-        self._delegate = noop_tracer_provider()
-
-
-def noop_tracer_provider() -> trace.TracerProvider:
-    return trace.NoOpTracerProvider()
+        # Later spans (for example from a request that races the shutdown) get a detached tracer:
+        # no span, and an inbound trace context is neither continued nor forwarded.
+        self._delegate = detached_tracer_provider()
 
 
 class _DetachedTracer(trace.NoOpTracer):

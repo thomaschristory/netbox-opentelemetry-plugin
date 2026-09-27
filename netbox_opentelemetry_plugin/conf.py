@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
 
@@ -128,7 +128,6 @@ def _redact_userinfo(endpoint: str) -> str:
 @dataclass(frozen=True)
 class LogsConfig:
     enabled: bool
-    exporter: ExporterConfig | None = None
     loggers: tuple[str, ...] = ()
     level: int = logging.INFO
     set_logger_levels: bool = False
@@ -136,7 +135,6 @@ class LogsConfig:
     def redacted(self) -> dict[str, Any]:
         return {
             "enabled": self.enabled,
-            "exporter": self.exporter.redacted() if self.exporter else None,
             "loggers": list(self.loggers),
             "level": logging.getLevelName(self.level),
             "set_logger_levels": self.set_logger_levels,
@@ -311,8 +309,6 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         except ConfigError as exc:
             warnings.append(f"{' and '.join(users)} disabled: {exc}")
             logs, audit = LOGS_OFF, AUDIT_OFF
-    if log_exporter is not None and logs.enabled:
-        logs = replace(logs, exporter=log_exporter)
 
     try:
         traces = _resolve_traces(_section(user, "traces"), exporter_section, env)
@@ -402,7 +398,6 @@ def _resolve_logs(section: Mapping[str, Any]) -> LogsConfig:
     set_levels = _typed(section.get("set_logger_levels", defaults["set_logger_levels"]), bool, "logs.set_logger_levels")
     return LogsConfig(
         enabled=True,
-        exporter=None,
         loggers=tuple(loggers),
         level=level,
         set_logger_levels=set_levels,

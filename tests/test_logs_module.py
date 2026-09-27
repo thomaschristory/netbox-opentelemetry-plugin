@@ -4,7 +4,7 @@ import pytest
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 
 from netbox_opentelemetry_plugin import otel
-from netbox_opentelemetry_plugin.conf import ExporterConfig, LogsConfig, Settings
+from netbox_opentelemetry_plugin.conf import LogsConfig, Settings
 from netbox_opentelemetry_plugin.modules.base import Context
 from netbox_opentelemetry_plugin.modules.logs import LogsModule
 
@@ -12,7 +12,6 @@ from netbox_opentelemetry_plugin.modules.logs import LogsModule
 def _settings(loggers, level=logging.INFO, set_levels=False):
     logs = LogsConfig(
         enabled=True,
-        exporter=ExporterConfig("http://collector:4318/v1/logs", "http/protobuf"),
         loggers=tuple(loggers),
         level=level,
         set_logger_levels=set_levels,

@@ -13,9 +13,9 @@ def test_defaults_with_generic_env_endpoint():
     assert s.enabled is True
     assert s.service_name == "netbox"
     assert s.logs.enabled is True
-    assert s.logs.exporter.endpoint == "http://collector:4318/v1/logs"
-    assert s.logs.exporter.protocol == "http/protobuf"
-    assert s.logs.exporter.timeout == 10.0
+    assert s.log_exporter.endpoint == "http://collector:4318/v1/logs"
+    assert s.log_exporter.protocol == "http/protobuf"
+    assert s.log_exporter.timeout == 10.0
     assert s.logs.loggers == ("netbox", "django", "rq")
     assert s.logs.level == logging.INFO
     assert s.logs.set_logger_levels is False
@@ -24,31 +24,31 @@ def test_defaults_with_generic_env_endpoint():
 
 def test_signal_specific_env_endpoint_is_used_as_is():
     env = {"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://logs:4318/custom", **ENDPOINT_ENV}
-    assert conf.resolve({}, env).logs.exporter.endpoint == "http://logs:4318/custom"
+    assert conf.resolve({}, env).log_exporter.endpoint == "http://logs:4318/custom"
 
 
 def test_explicit_signal_endpoint_wins_over_everything():
     user = {"exporter": {"endpoint": "http://base:4318"}, "logs": {"endpoint": "http://explicit/v1/logs"}}
     env = {"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://env-logs", **ENDPOINT_ENV}
-    assert conf.resolve(user, env).logs.exporter.endpoint == "http://explicit/v1/logs"
+    assert conf.resolve(user, env).log_exporter.endpoint == "http://explicit/v1/logs"
 
 
 def test_explicit_base_endpoint_wins_over_env_and_gets_signal_path():
     user = {"exporter": {"endpoint": "http://base:4318/"}}
     env = {"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://env-logs", **ENDPOINT_ENV}
-    assert conf.resolve(user, env).logs.exporter.endpoint == "http://base:4318/v1/logs"
+    assert conf.resolve(user, env).log_exporter.endpoint == "http://base:4318/v1/logs"
 
 
 def test_grpc_endpoint_gets_no_path():
     user = {"exporter": {"endpoint": "http://collector:4317", "protocol": "grpc"}}
     s = conf.resolve(user, {})
-    assert s.logs.exporter.protocol == "grpc"
-    assert s.logs.exporter.endpoint == "http://collector:4317"
+    assert s.log_exporter.protocol == "grpc"
+    assert s.log_exporter.endpoint == "http://collector:4317"
 
 
 def test_protocol_from_signal_env_before_generic_env():
     env = {"OTEL_EXPORTER_OTLP_LOGS_PROTOCOL": "grpc", "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf", **ENDPOINT_ENV}
-    assert conf.resolve({}, env).logs.exporter.protocol == "grpc"
+    assert conf.resolve({}, env).log_exporter.protocol == "grpc"
 
 
 def test_service_name_env_fallback_and_explicit_precedence():
@@ -59,14 +59,14 @@ def test_service_name_env_fallback_and_explicit_precedence():
 
 def test_headers_from_env_are_url_decoded_and_explicit_wins():
     env = {"OTEL_EXPORTER_OTLP_HEADERS": "authorization=Bearer%20abc,x-tenant=t1", **ENDPOINT_ENV}
-    assert conf.resolve({}, env).logs.exporter.headers == {"authorization": "Bearer abc", "x-tenant": "t1"}
+    assert conf.resolve({}, env).log_exporter.headers == {"authorization": "Bearer abc", "x-tenant": "t1"}
     user = {"exporter": {"headers": {"x-only": "cfg"}}}
-    assert conf.resolve(user, env).logs.exporter.headers == {"x-only": "cfg"}
+    assert conf.resolve(user, env).log_exporter.headers == {"x-only": "cfg"}
 
 
 def test_timeout_from_env():
     env = {"OTEL_EXPORTER_OTLP_TIMEOUT": "2.5", **ENDPOINT_ENV}
-    assert conf.resolve({}, env).logs.exporter.timeout == 2.5
+    assert conf.resolve({}, env).log_exporter.timeout == 2.5
 
 
 def test_missing_endpoint_disables_logs_and_audit_with_one_warning():
@@ -151,12 +151,12 @@ def test_redacted_masks_header_values():
     user = {"exporter": {"headers": {"authorization": "Bearer SECRET-VALUE"}}}
     s = conf.resolve(user, ENDPOINT_ENV)
     redacted = s.redacted()
-    assert redacted["logs"]["exporter"]["headers"] == {"authorization": "***"}
+    assert redacted["log_exporter"]["headers"] == {"authorization": "***"}
     assert "SECRET-VALUE" not in repr(redacted)
 
 
 def test_redacted_log_exporter_masks_header_values():
-    # log_exporter is resolved independently of logs.exporter (audit needs it even with logs
+    # log_exporter is resolved independently of LogsConfig (audit needs it even with logs
     # disabled), so its own redacted() must mask headers the same way.
     user = {"exporter": {"headers": {"authorization": "Bearer SECRET-VALUE"}}, "logs": {"enabled": False}}
     s = conf.resolve(user, ENDPOINT_ENV)
@@ -182,7 +182,7 @@ def test_non_dict_plugin_config():
 def test_redacted_endpoint_strips_userinfo():
     user = {"exporter": {"endpoint": "https://user:pass@host:4318"}}
     s = conf.resolve(user, {})
-    redacted_endpoint = s.logs.exporter.redacted()["endpoint"]
+    redacted_endpoint = s.log_exporter.redacted()["endpoint"]
     # endpoint resolution appends /v1/logs for http/protobuf; userinfo must be stripped regardless
     assert redacted_endpoint == "https://***@host:4318/v1/logs"
     assert "user:pass" not in redacted_endpoint
@@ -190,32 +190,32 @@ def test_redacted_endpoint_strips_userinfo():
 
 def test_insecure_defaults_to_none():
     s = conf.resolve({}, ENDPOINT_ENV)
-    assert s.logs.exporter.insecure is None
+    assert s.log_exporter.insecure is None
 
 
 def test_insecure_explicit_false_is_respected():
     user = {"exporter": {"insecure": False}}
     s = conf.resolve(user, ENDPOINT_ENV)
-    assert s.logs.exporter.insecure is False
+    assert s.log_exporter.insecure is False
 
 
 def test_insecure_env_false_is_respected():
     env = {"OTEL_EXPORTER_OTLP_INSECURE": "false", **ENDPOINT_ENV}
     s = conf.resolve({}, env)
-    assert s.logs.exporter.insecure is False
+    assert s.log_exporter.insecure is False
 
 
 def test_insecure_env_true_is_respected():
     env = {"OTEL_EXPORTER_OTLP_LOGS_INSECURE": "true", **ENDPOINT_ENV}
     s = conf.resolve({}, env)
-    assert s.logs.exporter.insecure is True
+    assert s.log_exporter.insecure is True
 
 
 def test_header_values_not_in_exporter_config_repr():
     user = {"exporter": {"headers": {"authorization": "TOPSECRET"}}}
     s = conf.resolve(user, ENDPOINT_ENV)
     assert "TOPSECRET" not in repr(s)
-    assert "TOPSECRET" not in repr(s.logs.exporter)
+    assert "TOPSECRET" not in repr(s.log_exporter)
 
 
 def test_redact_userinfo_keeps_malformed_port_and_ipv6_intact():
@@ -240,7 +240,7 @@ def test_exporter_repr_hides_credentials_and_headers():
 
 def test_malformed_port_does_not_break_redacted_output():
     s = conf.resolve({"exporter": {"endpoint": "https://u:p@collector:bad"}}, {})
-    assert s.redacted()["logs"]["exporter"]["endpoint"] == "https://***@collector:bad/v1/logs"
+    assert s.redacted()["log_exporter"]["endpoint"] == "https://***@collector:bad/v1/logs"
 
 
 def test_rq_defaults():
@@ -307,7 +307,6 @@ def test_audit_defaults():
     )
     assert s.log_exporter is not None
     assert s.log_exporter.endpoint == "http://collector:4318/v1/logs"
-    assert s.logs.exporter is s.log_exporter
     assert s.redacted()["audit"] == {
         "enabled": True,
         "include_data": False,
@@ -318,7 +317,7 @@ def test_audit_defaults():
 def test_audit_only_resolves_the_log_exporter():
     s = conf.resolve({"logs": {"enabled": False}}, ENDPOINT_ENV)
     assert s.logs.enabled is False
-    assert s.logs.exporter is None
+    assert not hasattr(s.logs, "exporter")
     assert s.audit.enabled is True
     assert s.log_exporter.endpoint == "http://collector:4318/v1/logs"
 
@@ -546,3 +545,10 @@ def test_excluded_urls_are_resolved_with_traces_off():
 
 def test_plugin_logger_name_lives_in_conf():
     assert conf.PLUGIN_LOGGER == "netbox_opentelemetry_plugin"
+
+
+def test_logs_config_has_no_exporter_alias():
+    s = conf.resolve({"exporter": {"endpoint": "http://collector:4318"}}, {})
+    assert not hasattr(s.logs, "exporter")
+    assert "exporter" not in s.logs.redacted()
+    assert s.redacted()["log_exporter"]["endpoint"] == "http://collector:4318/v1/logs"

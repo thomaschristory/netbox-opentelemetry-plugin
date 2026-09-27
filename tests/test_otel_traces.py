@@ -6,7 +6,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Event, ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, Status, StatusCode, TraceFlags
 
 from netbox_opentelemetry_plugin import otel
 from netbox_opentelemetry_plugin.conf import ExporterConfig
@@ -408,7 +408,7 @@ def test_switchable_provider_follows_its_delegate():
     switchable.set_delegate(_provider(second))
     with tracer.start_as_current_span("two", kind=SpanKind.SERVER):
         pass
-    switchable.set_delegate(otel.noop_tracer_provider())
+    switchable.set_delegate(trace.NoOpTracerProvider())
     with tracer.start_as_current_span("three", kind=SpanKind.SERVER) as span:
         assert not span.is_recording()
     assert [s.name for s in first.get_finished_spans()] == ["one"]
@@ -419,7 +419,7 @@ def test_switchable_provider_follows_its_delegate():
 
 def test_switchable_tracer_start_span_uses_current_delegate():
     exporter = InMemorySpanExporter()
-    switchable = otel.SwitchableTracerProvider(otel.noop_tracer_provider())
+    switchable = otel.SwitchableTracerProvider(trace.NoOpTracerProvider())
     tracer = switchable.get_tracer("t")
     switchable.set_delegate(_provider(exporter))
     tracer.start_span("late", kind=SpanKind.SERVER).end()
@@ -428,6 +428,19 @@ def test_switchable_tracer_start_span_uses_current_delegate():
 
 def test_existing_tracer_provider_ignores_the_default_proxy():
     assert otel.existing_tracer_provider() is None or isinstance(otel.existing_tracer_provider(), TracerProvider)
+
+
+def _remote_parent():
+    parent = SpanContext(trace_id=0x1234, span_id=0x5678, is_remote=True, trace_flags=TraceFlags(TraceFlags.SAMPLED))
+    return trace.set_span_in_context(NonRecordingSpan(parent))
+
+
+def test_shutdown_switches_to_a_detached_provider():
+    switchable = otel.SwitchableTracerProvider(otel.detached_tracer_provider())
+    switchable.shutdown()
+    span = switchable.get_tracer("t").start_span("x", context=_remote_parent())
+    # A detached tracer neither continues nor forwards the inbound context.
+    assert span is trace.INVALID_SPAN
 
 
 def test_inject_and_extract_round_trip_without_baggage():

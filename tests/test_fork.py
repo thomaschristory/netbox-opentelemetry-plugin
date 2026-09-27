@@ -14,9 +14,10 @@ import threading
 import time
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import SpanKind
+from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, TraceFlags
 
 from netbox_opentelemetry_plugin import bootstrap, conf, otel
 from tests.otel_helpers import RecordingMetricExporter, all_batches_points
@@ -59,6 +60,11 @@ def exporters(monkeypatch):
 
 def _otel_handlers(name):
     return [h for h in logging.getLogger(name).handlers if isinstance(h, otel.AllowlistLoggingHandler)]
+
+
+def _remote_parent():
+    parent = SpanContext(trace_id=0x1234, span_id=0x5678, is_remote=True, trace_flags=TraceFlags(TraceFlags.SAMPLED))
+    return trace.set_span_in_context(NonRecordingSpan(parent))
 
 
 CHILD_TIMEOUT = 30
@@ -513,15 +519,23 @@ def test_tracer_rebuild_failure_stops_span_export_in_the_child(exporters, span_e
     def probe():
         with tracer.start_as_current_span("child", kind=SpanKind.SERVER) as span:
             recording = span.is_recording()
+        detached_span = ctx.tracer_provider.get_tracer("t").start_span("y", context=_remote_parent())
         return {
             "recording": recording,
             "owns": bootstrap._state.owns_tracer_provider,
             "parent_exporter_spans": len(span_exporters[0].get_finished_spans()),
             "logger_provider": ctx.logger_provider is None,
+            "detached": detached_span is trace.INVALID_SPAN,
         }
 
     result = _run_in_child(probe)
-    assert result == {"recording": False, "owns": False, "parent_exporter_spans": 0, "logger_provider": True}
+    assert result == {
+        "recording": False,
+        "owns": False,
+        "parent_exporter_spans": 0,
+        "logger_provider": True,
+        "detached": True,
+    }
 
 
 def test_external_tracer_provider_is_not_rebuilt(exporters, monkeypatch):

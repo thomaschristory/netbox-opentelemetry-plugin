@@ -39,3 +39,10 @@ logs-collector:
 
 e2e:
 	uv run pytest -m e2e tests/e2e -v
+
+docs:
+	uv run --group docs mkdocs build --strict
+	@if find site -path '*superpowers*' | grep -q .; then echo "site/ contains superpowers files"; exit 1; fi
+
+docs-serve:
+	uv run --group docs mkdocs serve

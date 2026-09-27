@@ -1,0 +1,65 @@
+site_name: netbox-opentelemetry-plugin
+site_description: Export NetBox logs, audit records, traces and metrics over OTLP.
+site_url: https://thomaschristory.github.io/netbox-opentelemetry-plugin/
+repo_url: https://github.com/thomaschristory/netbox-opentelemetry-plugin
+repo_name: netbox-opentelemetry-plugin
+edit_uri: ""
+docs_dir: docs
+strict: true
+
+exclude_docs: |
+  superpowers/
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Configuration: configuration.md
+  - Signals:
+      - Logs: signals/logs.md
+      - Audit records: signals/audit.md
+      - Traces: signals/traces.md
+      - Metrics: signals/metrics.md
+  - How it works: how-it-works.md
+  - Data safety: data-safety.md
+  - Failure behaviour: failure-behaviour.md
+  - Collector on Kubernetes: collector.md
+  - Limitations: limitations.md
+  - Development: development.md
+  - Changelog: changelog.md

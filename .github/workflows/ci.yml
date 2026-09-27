@@ -45,7 +45,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
-      - run: uv run --group docs mkdocs build --strict
+      - run: uv run --locked --group docs mkdocs build --strict
 
   netbox-load:
     name: loads in NetBox ${{ matrix.netbox }}

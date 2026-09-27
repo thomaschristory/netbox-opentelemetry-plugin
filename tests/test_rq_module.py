@@ -745,3 +745,17 @@ def test_job_span_ends_even_when_handler_removal_fails(stubs, spans):
     with rq_module._JobSpan(bootstrap._state.context, worker, FakeJob(), SimpleNamespace(name="q")):
         pass
     assert len(_flush(spans)) == 1
+
+
+def test_warn_once_is_per_process(monkeypatch, caplog):
+    # A forked child (for example the rq scheduler) inherits the parent's set of warned keys; it
+    # must still get its own first warning.
+    rq_module._warned.clear()
+    monkeypatch.setattr(rq_module.os, "getpid", lambda: 1000)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        rq_module._warn_once("queue-depth", "warned %s", "a")
+        rq_module._warn_once("queue-depth", "warned %s", "b")
+        monkeypatch.setattr(rq_module.os, "getpid", lambda: 1001)
+        rq_module._warn_once("queue-depth", "warned %s", "c")
+        rq_module._warn_once("queue-depth", "warned %s", "d")
+    assert [r.getMessage() for r in caplog.records] == ["warned a", "warned c"]

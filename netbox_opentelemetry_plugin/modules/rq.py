@@ -49,10 +49,18 @@ OUTCOMES = {
 }
 
 logger = logging.getLogger(otel.PLUGIN_LOGGER)
+# One warning per key per process: a forked child (for example the rq scheduler) inherits the
+# parent's set, so the set is reset when the PID changes.
 _warned: set[str] = set()
+_warned_pid: int | None = None
 
 
 def _warn_once(key: str, message: str, *args) -> None:
+    global _warned_pid
+    pid = os.getpid()
+    if pid != _warned_pid:
+        _warned.clear()
+        _warned_pid = pid
     if key in _warned:
         return
     _warned.add(key)

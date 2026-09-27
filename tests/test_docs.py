@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -79,3 +80,20 @@ def test_otel_names_are_read():
 def test_mkdocs_config_excludes_superpowers():
     text = (ROOT / "mkdocs.yml").read_text()
     assert re.search(r"^exclude_docs: \|\n\s+superpowers/", text, flags=re.M)
+
+
+ROW = re.compile(r"^\| `([a-z_]+(?:\.[a-z_]+)*)` \| `([^`]*)` \|", flags=re.M)
+
+
+def _flatten(defaults: dict, prefix: str = ""):
+    for key, value in defaults.items():
+        if isinstance(value, dict) and value:
+            yield from _flatten(value, f"{prefix}{key}.")
+        else:
+            yield f"{prefix}{key}", value
+
+
+def test_configuration_reference_matches_defaults():
+    text = (DOCS / "configuration.md").read_text()
+    documented = {key: ast.literal_eval(default) for key, default in ROW.findall(text)}
+    assert documented == dict(_flatten(conf.DEFAULTS))

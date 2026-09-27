@@ -37,7 +37,9 @@ services:
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev,netbox.dev.server=granian
     healthcheck:
       test: /opt/netbox/health.sh
-      start_period: 120s
+      # A fresh database runs every migration first, which takes several minutes on a CI runner.
+      # The first passing check still marks the container healthy at once.
+      start_period: 900s
       timeout: 3s
       interval: 15s
 

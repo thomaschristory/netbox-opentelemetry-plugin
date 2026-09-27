@@ -185,7 +185,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
       - run: uv sync --locked
       - name: Start the dev stack
-        run: $COMPOSE up -d --build --wait --wait-timeout 600
+        run: $COMPOSE up -d --build --wait --wait-timeout 1200
       - name: End-to-end tests
         run: uv run pytest -m e2e tests/e2e -v
       - name: Collect compose logs

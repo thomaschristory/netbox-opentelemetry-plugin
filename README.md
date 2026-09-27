@@ -2,7 +2,7 @@
 
 NetBox plugin that exports NetBox telemetry over OTLP to an OpenTelemetry Collector, from inside the NetBox processes. Each signal is a module that can be enabled or disabled in configuration.
 
-Status: under development. Currently implemented: application logs, audit records and traces, with support for forking web servers and RQ work-horses.
+Status: under development. Currently implemented: application logs, audit records, traces and metrics, with support for forking web servers and RQ work-horses.
 
 ## Web servers
 
@@ -54,6 +54,46 @@ Known limitations:
 - If a `TracerProvider` is already configured outside the plugin (for example by `opentelemetry-instrument`) and reused, the plugin's redaction and its filter for parentless database and redis spans do not apply; that provider's own configuration decides what is exported.
 - If another rq exception handler registered before the plugin's own returns `False`, the job span still gets an ERROR status but no exception event, since the plugin's handler is never reached.
 - The `exception.message` attribute of a log record (application logs, not spans) is not scrubbed for URL query strings.
+
+## Metrics
+
+```python
+PLUGINS_CONFIG = {
+    "netbox_opentelemetry_plugin": {
+        "metrics": {"enabled": True},
+    },
+}
+```
+
+With `metrics.enabled`, the web processes and the RQ worker processes export these metrics:
+
+| Name | Instrument | Unit | Attributes | Recorded in |
+|---|---|---|---|---|
+| `http.server.request.duration` | histogram | s | `http.request.method`, `http.route`, `http.response.status_code`, `error.type` | web |
+| `http.client.request.duration` | histogram | s | `http.request.method`, `server.address`, `http.response.status_code`, `error.type` | web, RQ worker |
+| `netbox.rq.job.duration` | histogram | s | `messaging.destination.name`, `code.function.name`, `netbox.rq.job.outcome` | RQ worker |
+| `netbox.rq.jobs` | counter | `{job}` | same as above | RQ worker |
+| `netbox.rq.queue.depth` | observable gauge | `{job}` | `messaging.destination.name` | RQ worker |
+| `netbox.object_changes` | counter | `{change}` | `netbox.change.action`, `netbox.change.object_type` | web, RQ worker |
+| `process.*`, `cpython.gc.*` | observable | various | instrumentor's own | web, RQ worker, with `metrics.runtime` |
+
+The HTTP metrics come from the Django and `requests` instrumentors, and are recorded with traces on or off. `traces.excluded_urls` also applies to `http.server.request.duration`, whether traces are enabled or not.
+
+Metrics are exported every `metrics.export_interval` seconds (default 60). Unset, it falls back to `OTEL_METRIC_EXPORT_INTERVAL`, which is in milliseconds as in the OpenTelemetry SDK. Temporality is cumulative unless `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` says otherwise. The export runs on the plugin's own thread: a slow or unreachable Collector never blocks a request or a job.
+
+`metrics.change_counters` (default `True`) counts committed object changes in `netbox.object_changes`, whether audit records are enabled or not; a rolled back change is not counted. `metrics.runtime` (default `False`) adds process-level metrics from `opentelemetry-instrumentation-system-metrics`: CPU time and utilisation, context switches, memory, open file descriptors, threads and garbage collector counts. Host-wide `system.*` metrics are not collected, since every NetBox process on a host would report the same values; use the Collector's `hostmetrics` receiver for those.
+
+Job metrics are recorded by the long-lived RQ worker process around each job, not by the work-horse, which exports no metrics. The duration covers the fork, the job's run in the horse and the horse's flush. `netbox.rq.job.outcome` is rq's job status after the job: `finished`, `failed`, `stopped`, `canceled`, `retried` or `unknown`. NetBox catches a script's exception and marks its NetBox job as errored, so rq reports that job as `finished`. `code.function.name` is qualified with the class for NetBox jobs, for example `extras.jobs.ScriptJob.handle`; to get it, the worker reads back each job's data after the horse exits, and a job whose data cannot be read is counted with `unknown`.
+
+`netbox.rq.queue.depth` reports the length of every queue in `RQ_QUEUES`, NetBox's and plugins', with one Redis `LLEN` per queue per export. Every worker reports the same global value, and so does the rq scheduler process each worker forks, so each worker host sends more than one series per queue: aggregate with `max`, not `sum`. The lookup runs on the export thread; if Redis is unreachable and has no socket timeout configured, it can delay that export.
+
+Only the metric names and attribute keys in the table are exported. Any other instrument or attribute an instrumentation library records, such as `http.server.active_requests`, `server.port` or `url.path`, is dropped before export.
+
+Known limitations:
+
+- Outbound HTTP calls and object changes made inside a job or a custom script (in the work-horse), or in a management command, are not counted.
+- If a `MeterProvider` is already configured outside the plugin (for example by `opentelemetry-instrument`) and reused, the web and worker processes keep recording into it and the plugin's allowlist does not apply; that provider's own reader also keeps running in each forked work-horse.
+- A job whose Redis hash is already gone when the worker looks it up (for example with `result_ttl=0`) is counted with outcome `unknown`.
 
 ## Audit records
 

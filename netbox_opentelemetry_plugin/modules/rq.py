@@ -239,7 +239,7 @@ class _JobMetrics:
         self._duration = meter.create_histogram(
             JOB_DURATION,
             unit="s",
-            description="Time the RQ worker spent on a job, from fork to the work-horse's exit.",
+            description="Time the RQ worker spent on a job, including the work-horse's run.",
             explicit_bucket_boundaries_advisory=JOB_DURATION_BUCKETS,
         )
         self._jobs = meter.create_counter(JOBS, unit="{job}", description="RQ jobs run, by outcome.")
@@ -248,6 +248,7 @@ class _JobMetrics:
         queue_name = getattr(queue, "name", None)
         attributes = {
             "messaging.destination.name": queue_name if isinstance(queue_name, str) else UNKNOWN,
+            # Deserialises the job data (func_name, instance) after the horse exits; unknown if that fails.
             "code.function.name": job_function(job) or UNKNOWN,
             "netbox.rq.job.outcome": job_outcome(job),
         }

@@ -10,5 +10,7 @@ PLUGINS_CONFIG = {
             "set_logger_levels": True,
         },
         "traces": {"enabled": True},
+        # Short interval so e2e does not wait a minute for the Collector to see metrics.
+        "metrics": {"enabled": True, "export_interval": 5, "runtime": True},
     },
 }

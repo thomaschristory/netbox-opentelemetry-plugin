@@ -1,5 +1,5 @@
-"""Helpers shared by the e2e tests: log in to NetBox and read the Collector's JSON log and trace
-output."""
+"""Helpers shared by the e2e tests: log in to NetBox and read the Collector's JSON log, trace and
+metric output."""
 
 from __future__ import annotations
 
@@ -12,9 +12,15 @@ import requests
 
 LOGS_FILE = Path(__file__).resolve().parents[2] / "dev" / "data" / "collector" / "logs.json"
 TRACES_FILE = LOGS_FILE.parent / "traces.json"
+METRICS_FILE = LOGS_FILE.parent / "metrics.json"
 
 
 def login(base_url: str, username: str, password: str) -> None:
+    session_login(base_url, username, password)
+
+
+def session_login(base_url: str, username: str, password: str) -> requests.Session:
+    """Like login(), but returns the authenticated session."""
     session = requests.Session()
     # Avoid reusing keep-alive connections that a recycling worker may close: without this
     # header the POST can reuse a now-dead connection and fail with a transient
@@ -29,6 +35,7 @@ def login(base_url: str, username: str, password: str) -> None:
         timeout=10,
     )
     response.raise_for_status()
+    return session
 
 
 def log_records() -> Iterator[tuple[dict, dict, dict]]:
@@ -65,6 +72,35 @@ def spans() -> Iterator[tuple[dict, dict, dict]]:
             for scope_spans in resource_spans.get("scopeSpans", []):
                 for span in scope_spans.get("spans", []):
                     yield resource, scope_spans.get("scope", {}), span
+
+
+def metric_points() -> Iterator[tuple[dict, dict, dict, dict]]:
+    if not METRICS_FILE.exists():
+        return
+    for line in METRICS_FILE.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            # Tolerates a partially written last line (the file exporter may still be flushing it).
+            continue
+        for resource_metrics in data.get("resourceMetrics", []):
+            resource = {a["key"]: a["value"] for a in resource_metrics.get("resource", {}).get("attributes", [])}
+            for scope_metrics in resource_metrics.get("scopeMetrics", []):
+                for metric in scope_metrics.get("metrics", []):
+                    for kind in ("sum", "gauge", "histogram"):
+                        for point in metric.get(kind, {}).get("dataPoints", []):
+                            yield resource, scope_metrics.get("scope", {}), metric, point
+
+
+def point_value(point: dict) -> float:
+    """A sum or gauge point's value, or a histogram point's count (OTLP JSON encodes 64-bit ints as strings)."""
+    if "count" in point:
+        return float(point["count"])
+    if "asInt" in point:
+        return float(point["asInt"])
+    return float(point.get("asDouble", 0))
 
 
 def record_time_ns(record: dict) -> int:

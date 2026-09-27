@@ -95,5 +95,7 @@ def _flatten(defaults: dict, prefix: str = ""):
 
 def test_configuration_reference_matches_defaults():
     text = (DOCS / "configuration.md").read_text()
-    documented = {key: ast.literal_eval(default) for key, default in ROW.findall(text)}
+    rows = ROW.findall(text)
+    documented = {key: ast.literal_eval(default) for key, default in rows}
+    assert len(rows) == len(documented)
     assert documented == dict(_flatten(conf.DEFAULTS))

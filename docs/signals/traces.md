@@ -9,7 +9,7 @@ PLUGINS_CONFIG = {
 }
 ```
 
-With `traces.enabled`, the plugin instruments Django, psycopg, redis and outbound `requests` calls (`traces.instrument` selects the subset, all four by default), and wraps every RQ job in a span. `rq.patch_worker = False` removes the job spans, along with the work-horse flush (see [How it works](../how-it-works.md#rq-work-horses)); `rq.enabled = False` removes the RQ integration entirely, including enqueue-time context propagation and the job spans.
+With `traces.enabled`, the plugin instruments Django, psycopg, redis and outbound `requests` calls (`traces.instrument` selects the subset, all four by default), and wraps every RQ job in a span. `rq.patch_worker = False` removes the job spans, along with the work-horse flush (see [How it works](../how-it-works.md#rq-work-horses)); with no job span to parent them, any psycopg or redis CLIENT span made while running the job is dropped by the parentless-span filter (see Sampling below), the same as an RQ worker's own polling and heartbeat commands. `rq.enabled = False` removes the RQ integration entirely, including enqueue-time context propagation and the job spans.
 
 ## Spans
 
@@ -17,7 +17,7 @@ With `traces.enabled`, the plugin instruments Django, psycopg, redis and outboun
 - **psycopg**: one span per query, kind CLIENT. The statement is recorded as `db.statement` (the instrumentor's stable `db.query.text` attribute is a separate opt-in, under a database semantic-convention flag the plugin does not set), bind parameters never (`capture_parameters=False`, and `enable_commenter=False` so no SQL comment is appended either).
 - **redis**: one span per command, kind CLIENT, only for a command issued while `redis` is in `traces.instrument`.
 - **requests**: one span per outbound HTTP call, kind CLIENT, with a `traceparent` header injected for the receiving service to continue the trace. A query string in the recorded URL is exported as `?REDACTED` (see Redaction below).
-- No HTTP header value is captured by any instrumentor, inbound or outbound.
+- No HTTP header value is exported. An operator can turn on header capture for these instrumentors through their own environment variables (see the OpenTelemetry Python instrumentation docs); even then, the redaction below strips every captured `http.request.header.*` / `http.response.header.*` attribute before it reaches the exporter.
 - **RQ**: a CONSUMER span around each job, instrumentation scope `netbox_opentelemetry_plugin.rq`, named `rq.job <qualified function>`, for example `rq.job extras.jobs.ScriptJob.handle` (or plain `rq.job` when the job's data cannot be deserialised; see [Metrics](metrics.md) for how the qualified name is built). Attributes: `messaging.system` (`"rq"`), `messaging.destination.name` (the queue name), `messaging.message.id` (the rq job id), and, only for a NetBox `core.Job`, `netbox.job.id` (int) and `netbox.job.name` (only when non-empty). Its parent is the context stored in `job.meta["netbox_otel_context"]` when `rq.propagate_context` is on and that key is present; otherwise it starts a new trace. On failure, the span gets status ERROR with an exception event (see Known limitations below for an edge case where the exception event is missing).
 
 The instrumentors use the stable HTTP semantic conventions (`url.full`, `http.request.method`, `http.response.status_code`, and so on): the plugin sets `OTEL_SEMCONV_STABILITY_OPT_IN=http` before instrumenting, unless an operator already set that environment variable, in which case the existing value is kept. Aside from the redaction below, the Django and requests instrumentors export the standard attributes they normally add under that convention, for example `client.address`, `user_agent.original`, `server.address`, `server.port`, `url.scheme`, `url.path`, `http.route`, and the equivalent database attributes from psycopg.
@@ -25,6 +25,8 @@ The instrumentors use the stable HTTP semantic conventions (`url.full`, `http.re
 ## Selecting URLs and instrumentors
 
 `traces.instrument` is a list of instrumentor names (`django`, `psycopg`, `redis`, `requests`); a name left out is never instrumented for traces. `traces.excluded_urls` is a list of regular expressions, defaulting to `/static/`, `/metrics` and `/api/status/`; a URL matching any of them anywhere in the string (not only as a prefix) gets no Django span, and, see [Metrics](metrics.md), no HTTP server duration measurement either, whether traces are on or off.
+
+Leaving `django` out of `traces.instrument` while keeping psycopg, redis or requests in it means a web request never gets a SERVER span, so any of those CLIENT spans made while handling that request has no parent and is dropped by the same parentless-span filter (see Sampling below).
 
 ## Sampling
 
@@ -36,7 +38,7 @@ With a `parentbased_*` sampler (the default), an inbound `traceparent` header is
 
 ## Context propagation into jobs
 
-When a job is enqueued through rq's `Queue.enqueue_job` (the method `Queue.enqueue()` itself calls) while `rq.propagate_context` is on and a tracer is recording, the current trace context is written to `job.meta["netbox_otel_context"]`. Only the W3C `traceparent` is stored there, using the trace-context propagator directly; baggage is never copied into a job's `meta`, so a job cannot pick up arbitrary request-scoped data through this channel. On the other side, `perform_job` reads that key back and starts the job's span as a child of it.
+When a job is enqueued through rq's `Queue.enqueue_job` (the method `Queue.enqueue()` itself calls) while traces are enabled and `rq.propagate_context` is on, the current trace context is written to `job.meta["netbox_otel_context"]`, provided a valid span context is current at that point; this includes a span the sampler chose not to sample, not only a recording one, but nothing is stored when no span is current at all. Only the W3C trace context is stored there, using the trace-context propagator directly: `traceparent` always, and `tracestate` too when the current span context carries one. Baggage is never copied into a job's `meta`, so a job cannot pick up arbitrary request-scoped data through this channel. On the other side, `perform_job` reads that key back and starts the job's span as a child of it.
 
 Known gaps in this propagation, from rq's own code paths:
 
@@ -46,7 +48,9 @@ Known gaps in this propagation, from rq's own code paths:
 
 ## Outbound baggage
 
-Django's instrumentor extracts context from every inbound request with the global propagator, which by default is the standard pair, W3C trace context and W3C baggage: this happens before the span starts and does not depend on whether that span is later recorded or exported. So an inbound `baggage` header is attached to the active context for the duration of the request, traces on or off. If that same process then makes an outbound call through the instrumented `requests` library, the requests instrumentor injects with the same global propagator, which forwards both the current trace context and that baggage back out on the wire, unchanged. This happens whenever the requests instrumentor is active at all, including when it is only installed for its HTTP duration metric with traces off (see [Metrics](metrics.md#detached-tracer)).
+Forwarding inbound baggage onto an outbound call needs both the Django instrumentor, to extract it from the inbound request, and the requests instrumentor, to inject it on the outbound call, active in the same process; Django's extraction happens before its span starts and does not depend on whether that span is later recorded or exported, so it runs with traces on or off, as long as `django` is instrumented at all. Whenever metrics are on, the plugin always instruments Django and requests together for the HTTP duration metrics (see [Metrics, HTTP metrics](metrics.md#http-metrics)), so this pairing is guaranteed in that case; with metrics off, it depends on `traces.instrument` including both names.
+
+With that pairing active, Django's instrumentor extracts context from every inbound request with the global propagator, which by default is the standard pair, W3C trace context and W3C baggage. So an inbound `baggage` header is attached to the active context for the duration of the request. If that same process then makes an outbound call through the instrumented `requests` library, the requests instrumentor injects with the same global propagator, which forwards both the current trace context and that baggage back out on the wire, unchanged, even when it is only installed for its HTTP duration metric with traces off (see [Metrics, detached tracer](metrics.md#detached-tracer)).
 
 Baggage is arbitrary, client-supplied key-value data; the plugin does not filter or inspect it. If your deployment must not let a client's `baggage` header reach a downstream service through NetBox, strip that header at a proxy in front of NetBox.
 

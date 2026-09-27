@@ -497,6 +497,23 @@ def test_bad_export_interval_disables_metrics_only(value):
     assert any("metrics disabled" in w for w in settings.warnings)
 
 
+@pytest.mark.parametrize(
+    ("section", "env"),
+    [({"export_interval": 0.001}, {}), ({}, {"OTEL_METRIC_EXPORT_INTERVAL": "1"})],
+)
+def test_export_interval_below_one_second_is_raised_to_one_second(section, env):
+    settings = conf.resolve({**BASE, "metrics": {"enabled": True, **section}}, env)
+    assert settings.metrics.enabled
+    assert settings.metrics.export_interval == 1.0
+    assert "metrics.export_interval below 1 s; using 1 s" in settings.warnings
+
+
+def test_export_interval_of_one_second_is_kept_without_warning():
+    settings = conf.resolve({**BASE, "metrics": {"enabled": True, "export_interval": 1}}, {})
+    assert settings.metrics.export_interval == 1.0
+    assert not any("export_interval" in w for w in settings.warnings)
+
+
 def test_bad_export_interval_env_disables_metrics():
     settings = conf.resolve({**BASE, "metrics": {"enabled": True}}, {"OTEL_METRIC_EXPORT_INTERVAL": "soon"})
     assert settings.metrics is conf.METRICS_OFF

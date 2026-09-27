@@ -321,7 +321,7 @@ def resolve(user: Mapping[str, Any] | None, env: Mapping[str, str]) -> Settings:
         traces = TRACES_OFF
 
     try:
-        metrics = _resolve_metrics(_section(user, "metrics"), exporter_section, env)
+        metrics = _resolve_metrics(_section(user, "metrics"), exporter_section, env, warnings)
     except ConfigError as exc:
         warnings.append(f"metrics disabled: {exc}")
         metrics = METRICS_OFF
@@ -494,8 +494,12 @@ def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:
     )
 
 
+# Seconds; a shorter metrics.export_interval is raised to this with a warning.
+MIN_EXPORT_INTERVAL = 1.0
+
+
 def _resolve_metrics(
-    section: Mapping[str, Any], exporter_section: Mapping[str, Any], env: Mapping[str, str]
+    section: Mapping[str, Any], exporter_section: Mapping[str, Any], env: Mapping[str, str], warnings: list[str]
 ) -> MetricsConfig:
     defaults = DEFAULTS["metrics"]
     if not _typed(section.get("enabled", defaults["enabled"]), bool, "metrics.enabled"):
@@ -510,11 +514,16 @@ def _resolve_metrics(
         or not math.isfinite(interval)
     ):
         raise ConfigError("metrics.export_interval must be a positive number of seconds")
+    # A few milliseconds (for example OTEL_METRIC_EXPORT_INTERVAL=1) would keep the export thread busy.
+    raised = interval < MIN_EXPORT_INTERVAL
+    interval = max(interval, MIN_EXPORT_INTERVAL)
     change_counters = _typed(
         section.get("change_counters", defaults["change_counters"]), bool, "metrics.change_counters"
     )
     runtime = _typed(section.get("runtime", defaults["runtime"]), bool, "metrics.runtime")
     exporter = resolve_exporter("metrics", section, exporter_section, env)
+    if raised:
+        warnings.append("metrics.export_interval below 1 s; using 1 s")
     return MetricsConfig(
         enabled=True,
         exporter=exporter,

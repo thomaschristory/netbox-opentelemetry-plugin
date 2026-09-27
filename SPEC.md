@@ -176,7 +176,7 @@ PLUGINS_CONFIG = {
 }
 ```
 
-- `metrics.export_interval` is in seconds; its fallback `OTEL_METRIC_EXPORT_INTERVAL` is in milliseconds, as in the OpenTelemetry SDK.
+- `metrics.export_interval` is in seconds; its fallback `OTEL_METRIC_EXPORT_INTERVAL` is in milliseconds, as in the OpenTelemetry SDK. The minimum is 1 s: a smaller value is raised to 1 s with a warning.
 - `traces.excluded_urls` also applies to HTTP server metrics, and is honoured with `traces.enabled = False`.
 
 Validation:

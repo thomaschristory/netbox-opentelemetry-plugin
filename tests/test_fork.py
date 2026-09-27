@@ -18,7 +18,7 @@ from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind
 
-from netbox_opentelemetry_plugin import bootstrap, otel
+from netbox_opentelemetry_plugin import bootstrap, conf, otel
 from tests.otel_helpers import RecordingMetricExporter, all_batches_points
 
 pytestmark = [
@@ -584,7 +584,8 @@ def test_child_rebuilds_the_metrics_pipeline_and_keeps_the_switchable(exporters,
     assert "otel-metrics" in result["threads"]
 
 
-def test_horse_records_into_a_noop_and_never_exports(exporters, metric_exporters):
+def test_horse_records_into_a_noop_and_never_exports(exporters, metric_exporters, monkeypatch):
+    monkeypatch.setattr(conf, "MIN_EXPORT_INTERVAL", 0.01)  # a short parent interval, below the 1 s floor
     user = {**METRICS_USER, "metrics": {"enabled": True, "export_interval": 0.05}}
     ctx = bootstrap.install(user, env={}, argv=ARGV_RQ)
     counter = ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes")

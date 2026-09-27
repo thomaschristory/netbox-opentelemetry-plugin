@@ -17,7 +17,8 @@ from urllib.parse import unquote, urlsplit, urlunsplit
 PROTOCOLS = ("http/protobuf", "grpc")
 REDACTED = "***"
 
-# The plugin's own logger. Its records go to stdout only and are never exported (feedback loops).
+# The plugin's own logger. Its records are never exported (they go wherever local logging sends
+# them; stderr by default), to avoid feedback loops.
 # Defined here, not in otel.py, so code that must not import OpenTelemetry can use it.
 PLUGIN_LOGGER = "netbox_opentelemetry_plugin"
 

@@ -48,7 +48,7 @@ A change with no message or no related object omits those attributes entirely, r
 
 Setting `audit.include_data = True` adds `netbox.change.prechange_data` and `netbox.change.postchange_data`, each the change's stored value encoded with `json.dumps(..., sort_keys=True)`.
 
-Before encoding, both are filtered recursively through `audit.exclude_fields`: any key whose name contains one of the listed strings, matched case-insensitively, is dropped, together with everything nested under it. The default list is `password`, `secret`, `token`, `key`.
+Before encoding, both are filtered recursively through `audit.exclude_fields`: any key whose name contains one of the listed strings, matched case-insensitively, is dropped, together with everything nested under it. The default list is `password`, `secret`, `token`, `key`; extend it for any other sensitive field names in your NetBox instance, for example free-text `comments` fields.
 
 ```python
 PLUGINS_CONFIG = {

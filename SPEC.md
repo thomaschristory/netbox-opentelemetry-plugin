@@ -216,7 +216,7 @@ Validation:
 Known limitations:
 - If NetBox updates an M2M change record in a later transaction than the one that created it, the data sent with the first record does not include that later update. This only matters with `include_data`; same-transaction M2M updates are covered above.
 - The log pipeline buffers up to 20,000 records per process while audit is on. A single commit larger than that can drop records, and the SDK reports this only on its own logger, which the plugin does not export.
-- When a `LoggerProvider` configured outside the plugin is reused (provider detection (section 4.1)), its queue is not resized; the 20,000 figure above applies only to a provider the plugin builds itself.
+- When a `LoggerProvider` configured outside the plugin is reused (see provider detection, section 4.1), its queue is not resized; the 20,000 figure above applies only to a provider the plugin builds itself.
 - With `include_data`, a record can grow large for an object with big JSON fields. Most Collectors reject a request above their configured body size limit, dropping the whole batch that record was in, not just that record. Keep `include_data` off, or exclude large fields such as `config_context` and `local_context_data` in `audit.exclude_fields`.
 
 ### 6.3 Traces
@@ -237,7 +237,7 @@ Known limitations:
 - A psycopg connection opened before the plugin's `ready()` (for example by startup code) is not traced until Django closes and reopens it (`CONN_MAX_AGE`).
 - Only a job enqueued through rq's `Queue.enqueue_job` (the method `Queue.enqueue()` itself calls) carries the enqueuing trace's context. `enqueue_at`, `enqueue_in` and `enqueue_many` reach rq internals (`schedule_job`, `_enqueue_job`) that never call `enqueue_job`, so those jobs start their own trace, including one scheduled by `enqueue_at` from inside a request. A retried job, a requeued job, and a job the rq scheduler moves from scheduled back onto its queue all reuse the same `Job` and its `meta` rather than being enqueued through `enqueue_job` again, so they keep whatever context was stored at the original enqueue: a retry can therefore appear in the original request's trace, possibly much later.
 - With django-rq `COMMIT_MODE = "request_finished"`, the enqueue happens after the request's span has already ended, so the job is not linked to the request's trace.
-- With a `TracerProvider` configured outside the plugin (provider detection (section 4.1)), the plugin's redaction and the parentless-CLIENT-span filter do not apply: that provider's own configuration governs what is exported.
+- With a `TracerProvider` configured outside the plugin (see provider detection, section 4.1), the plugin's redaction and the parentless-CLIENT-span filter do not apply: that provider's own configuration governs what is exported.
 - If an rq exception handler registered before the plugin's own returns `False` (telling rq to stop walking the handler stack), the job span still gets status ERROR, but without an exception event, since the plugin's handler was not reached.
 - The `exception.message` attribute of a log record (logs module) is not scrubbed for URL query strings; only span attributes, status descriptions and span exception events are.
 
@@ -267,7 +267,7 @@ Known limitations:
 
 Known limitations:
 - Outbound HTTP calls and object changes made inside a job (in the horse) or in a management command are not counted, since neither exports metrics.
-- With a MeterProvider configured outside the plugin (provider detection (section 4.1)), web and worker children keep recording into it, as with traces, and the plugin's allowlist does not apply. Its own reader keeps running in each forked horse.
+- With a MeterProvider configured outside the plugin (see provider detection, section 4.1), web and worker children keep recording into it, as with traces, and the plugin's allowlist does not apply. Its own reader keeps running in each forked horse.
 - A job whose hash is gone when the parent looks (for example `result_ttl=0`) is counted with outcome `unknown`.
 
 ## 7. Data safety

@@ -30,7 +30,7 @@ Restart NetBox and the RQ workers to pick up the change.
 
 | Plugin | NetBox | Python |
 |---|---|---|
-| 0.1.x | 4.7.x | 3.12, 3.13, 3.14 |
+| 0.1.x | 4.7.0 to 4.7.x | 3.12, 3.13, 3.14 |
 
 ## What stays outside the exporters
 

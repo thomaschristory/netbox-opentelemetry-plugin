@@ -1,6 +1,6 @@
 # Failure behaviour
 
-A failing module disables only itself. The plugin never raises into NetBox: `ready()` wraps its own setup in a single `try`/`except` that logs one warning and leaves the process otherwise unaffected if setup fails outright, and every module is installed in its own `try`/`except` inside `bootstrap.install`, so one module's failure to build (a bad setting, an unreachable endpoint, a missing dependency) does not stop any other module, and does not stop NetBox from serving requests or running jobs.
+A failing module disables only itself. The plugin never raises into NetBox: `ready()` wraps its own setup in a single `try`/`except` that logs one warning and leaves the process otherwise unaffected if setup fails outright, and every module is installed in its own `try`/`except` inside `bootstrap.install`, so one module's failure to build (a bad setting, a missing dependency, an exporter that cannot be constructed at all) does not stop any other module, and does not stop NetBox from serving requests or running jobs. Building an exporter never tries to reach the endpoint: an unreachable Collector is not a build failure at all, and is instead the "Collector unreachable" row below.
 
 | Situation | Behaviour |
 |---|---|
@@ -25,6 +25,10 @@ A work-horse's flush (its log provider and its tracer provider, in parallel) is 
 
 Over gRPC, the CA certificate configured in `exporter.certificate` (or its signal-specific variant) is read from disk when the exporter is built, not on each connection: a missing or unreadable file fails that build immediately, producing the "could not build exporter" warning above, at process start or at the next fork. Over HTTP, the certificate path is instead handed to the underlying HTTP client and read when it opens a connection, so a missing file only surfaces as a failed export attempt later, not as a setup warning. See [Configuration reference](configuration.md#reference) (`exporter.certificate`) for the same distinction from the configuration side.
 
-## Failures that are silent by design
+## Body size rejections are not silent
 
-Not every failure surfaces as a warning, deliberately: a Collector that accepts and then silently drops a batch it could not fully process (for example over its own body size limit) never reports back to the exporting process, so the plugin cannot log a warning about something it does not know happened. See [Collector, body size limits](collector.md#what-a-collector-adds-that-the-plugin-does-not) and [Data safety](data-safety.md) for what this means for `audit.include_data`.
+A batch over a receiver's or backend's configured body size limit is not a silent failure: the OTLP receiver answers with an HTTP `413` (or gRPC `RESOURCE_EXHAUSTED`), the exporter treats that as non-retryable, and the OTel SDK's own exporter code logs an error about it, in the NetBox process, on its own `opentelemetry.*` logger (excluded from every plugin export path, see [Logs, feedback loop](signals/logs.md#feedback-loop), and printed locally rather than sent anywhere). What is lost is the batch itself, not the record of losing it: nothing the plugin does surfaces this as one of its own warnings, since the failure is inside the SDK's exporter, not the plugin's own code, but it is not invisible either. See [Collector, body size limits](collector.md#what-a-collector-adds-that-the-plugin-does-not) and [Data safety](data-safety.md) for what this means for `audit.include_data`.
+
+## A genuinely silent failure
+
+A Collector that accepts a batch (its receiver answers success) and only then fails to forward it to the actual backend, for example because the backend itself is unreachable or rejects it, never reports anything back to the process that sent it: the OTLP request already succeeded from the exporting process's point of view. This is the shape of failure that is actually invisible from inside NetBox; watch the Collector's own logs and metrics for it, not the plugin's.

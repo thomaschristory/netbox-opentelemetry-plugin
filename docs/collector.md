@@ -2,11 +2,11 @@
 
 ## Why a Collector
 
-The plugin exports OTLP straight from the NetBox process, but it does not talk to your logging, tracing or metrics backend directly: it sends to an OpenTelemetry Collector, which then routes, retries and forwards to wherever the data actually lives. This keeps a few things out of NetBox:
+The plugin can point `exporter.endpoint` (or `OTEL_EXPORTER_OTLP_ENDPOINT`) at any OTLP-compatible endpoint, including a backend's own native OTLP receiver directly; nothing in the plugin requires a Collector in between. Routing through an OpenTelemetry Collector instead is a recommendation, not a requirement, because it keeps a few things out of NetBox:
 
 - Backend credentials live in the Collector's own configuration (and, on Kubernetes, a Secret), not in `PLUGINS_CONFIG` or in a NetBox pod's environment.
 - Retries against a slow or unreachable backend are the Collector's problem, with its own queues and backoff, not something the plugin has to implement per signal.
-- Routing (splitting signals across backends, duplicating to more than one, adding a `sampling` or `filter` processor) is configured once, in the Collector, without touching NetBox.
+- Routing (splitting signals across backends, duplicating to more than one, sampling with a processor such as `tail_sampling` or `probabilistic_sampler`, or filtering with the `filter` processor) is configured once, in the Collector, without touching NetBox.
 
 ## The NetBox side
 
@@ -32,7 +32,7 @@ See [Configuration](configuration.md#endpoints) for how each signal resolves its
 
 ## Example files
 
-Two files: a standalone Collector configuration, and a set of Kubernetes manifests that embed the same configuration in a `ConfigMap`. Both are checked: the Collector configuration is validated against the pinned Collector image with `otelcol-contrib validate`, the manifests are validated with `kubeconform`, and a test in this repository (`tests/test_docs.py`) asserts that the `ConfigMap`'s embedded copy is byte-for-byte the same document as the standalone file, so the two cannot drift apart.
+Two files: a standalone Collector configuration, and a set of Kubernetes manifests that embed the same configuration in a `ConfigMap`. Both were validated once, manually, against the pinned Collector image and Kubernetes version: `otelcol-contrib validate --config` for the standalone configuration, `kubeconform -strict` for the manifests. Neither runs in CI (both need `docker run` against a pinned image, which the CI jobs in this repository do not do); rerun them by hand after changing either file. A test in this repository (`tests/test_docs.py`) does run in CI and asserts that the `ConfigMap`'s embedded copy parses to the same YAML document as the standalone file (structural equality after `yaml.safe_load`, not a byte-for-byte comparison, so the two can differ in comments or formatting without failing the test), so the two cannot drift apart in substance.
 
 `docs/examples/kubernetes/collector-config.yaml`:
 
@@ -50,7 +50,7 @@ Replace the placeholder backend (`https://otlp.example.com`), its header, and th
 
 ## OpenShift notes
 
-- The Deployment sets no `runAsUser`. OpenShift's restricted SCC assigns a UID from the namespace's allowed range at admission time, which this example is written to accept rather than fight; setting an explicit `runAsUser` would need a SCC that allows it. On plain Kubernetes, with no SCC involved, the container runs as whatever UID the image itself declares (root, for the upstream `otelcol-contrib` image), still confined by the rest of the `securityContext` (`allowPrivilegeEscalation: false`, every capability dropped, `seccompProfile.type: RuntimeDefault`, and `runAsNonRoot: true`, which fails the pod at admission rather than silently running as root if the image declares no non-root user of its own).
+- The Deployment sets no `runAsUser`. OpenShift's restricted SCC assigns a UID from the namespace's allowed range at admission time, which this example is written to accept rather than fight; setting an explicit `runAsUser` would need a SCC that allows it. On plain Kubernetes, with no SCC involved, the container runs as whatever UID the image itself declares: `docker image inspect otel/opentelemetry-collector-contrib:0.161.0` shows UID `10001`, not root (the dev compose stack in this repository overrides that to run as root for its own reasons; this example does not). `runAsNonRoot: true` is still worth keeping regardless of which UID ends up in effect: it fails the pod at admission if a future image change (or a different image entirely) ever declares a root user, rather than silently running as root.
 - No `Route` is included, and none is needed for this setup: NetBox reaches the Collector through the in-cluster `Service` (`otel-collector.<namespace>.svc`, ports 4317 and 4318), never from outside the cluster. Add a `Route` only if something outside the cluster, such as a second Collector forwarding to this one, needs to reach it directly.
 
 ## Sidecar alternative

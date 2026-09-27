@@ -7,11 +7,12 @@
 #
 # No runAsUser is set: on OpenShift, the restricted SCC assigns one from the namespace's allowed
 # range at admission time. On plain Kubernetes this runs as whatever UID the image's own USER
-# directive sets (root, for the upstream otelcol-contrib image), which is still confined by the
-# rest of this securityContext (no privilege escalation, all capabilities dropped, non-root
-# enforced by runAsNonRoot, which fails the pod rather than silently running as root if the image
-# does not declare a non-root user of its own; set an explicit runAsUser here if that matters for
-# your image).
+# directive sets: UID 10001 for the upstream otel/opentelemetry-collector-contrib:0.161.0 image
+# (docker image inspect shows this; it is not root, unlike this repository's own dev compose
+# stack, which deliberately overrides it to root so its file exporter can write into a bind
+# mount). runAsNonRoot is kept regardless, so the pod fails at admission instead of silently
+# running as root if a future image change ever declares one; set an explicit runAsUser here if
+# your own image needs a specific UID.
 apiVersion: v1
 kind: ConfigMap
 metadata:

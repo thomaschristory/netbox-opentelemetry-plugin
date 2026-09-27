@@ -130,6 +130,24 @@ def test_shutdown_is_bounded_even_when_the_exporter_is_stuck():
         blocker.join(5)
 
 
+def test_shutdown_shares_one_deadline_when_the_export_thread_itself_is_stuck():
+    # The export thread is inside a stuck export(): the join and the final flush both wait, and
+    # must share one deadline instead of taking `timeout` each. The exporter is still shut down.
+    event = threading.Event()
+    exporter = RecordingMetricExporter(block=event)
+    pipeline = otel.MetricsPipeline(RESOURCE, exporter, interval=0.01, timeout=1.0)
+    pipeline.provider.get_meter("t").create_counter("netbox.object_changes").add(1)
+    try:
+        time.sleep(0.1)  # the thread has collected and is now blocked in export()
+        started = time.monotonic()
+        pipeline.shutdown(0.4)
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.6
+        assert exporter.shutdown_called is True
+    finally:
+        event.set()
+
+
 def test_pipeline_interval_thread_stops_promptly_on_shutdown():
     pipeline = otel.MetricsPipeline(RESOURCE, RecordingMetricExporter(), interval=3600, timeout=1.0)
     started = time.monotonic()

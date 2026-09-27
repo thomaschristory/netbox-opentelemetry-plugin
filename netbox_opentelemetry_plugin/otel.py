@@ -768,6 +768,10 @@ def build_meter_provider(resource: Resource, readers) -> SdkMeterProvider:
     )
 
 
+# Seconds left for MeterProvider.shutdown when MetricsPipeline.shutdown's deadline is spent.
+_SHUTDOWN_FLOOR = 0.05
+
+
 class MetricsPipeline:
     """A plugin-owned MeterProvider and the thread that exports it every `interval` seconds.
 
@@ -821,25 +825,34 @@ class MetricsPipeline:
         export() call takes. If some export is stuck there (a hung exporter or an unresponsive
         Collector), a synchronous force_flush would block on that same lock for as long as the
         hang lasts, regardless of the timeout passed to it. The final flush therefore runs on its
-        own thread and is only waited on for up to `timeout`; a still-blocked flush is left
-        running (it is a daemon thread) and the method moves on to provider.shutdown() regardless.
-        provider.shutdown() does not need that lock: this reader keeps no daemon thread of its own
-        (export_interval_millis=inf), so PeriodicExportingMetricReader.shutdown calls the
-        exporter's shutdown() directly rather than waiting on anything the stuck export holds,
-        which keeps the whole call bounded by roughly `2 * timeout`.
+        own thread; a still-blocked flush is left running (it is a daemon thread) and the method
+        moves on to provider.shutdown() regardless. Joining the export thread and waiting for the
+        flush share one deadline of `timeout` seconds. provider.shutdown() does not need the export
+        lock: this reader keeps no daemon thread of its own (export_interval_millis=inf), so
+        PeriodicExportingMetricReader.shutdown calls the exporter's shutdown() directly. The whole
+        call is therefore bounded by about `timeout` plus the exporter's own shutdown() (the OTLP
+        exporters only close their session or channel there).
         """
+        deadline = time.monotonic() + timeout
+
+        def remaining() -> float:
+            return max(deadline - time.monotonic(), 0.0)
+
         self._stop.set()
-        self._thread.join(timeout)
+        self._thread.join(remaining())
         flushed = threading.Event()
+        flush_millis = remaining() * 1000
 
         def _flush() -> None:
             with contextlib.suppress(Exception):
-                self.provider.force_flush(timeout * 1000)
+                self.provider.force_flush(flush_millis)
             flushed.set()
 
         threading.Thread(target=_flush, name="otel-metrics-flush", daemon=True).start()
-        flushed.wait(timeout)
-        self.provider.shutdown(timeout * 1000)
+        flushed.wait(remaining())
+        # A small floor: with an exhausted deadline, MeterProvider.shutdown would skip the reader
+        # (and so the exporter's shutdown) altogether.
+        self.provider.shutdown(max(remaining(), _SHUTDOWN_FLOOR) * 1000)
 
 
 class _SwitchableInstrument:

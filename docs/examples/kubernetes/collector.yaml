@@ -1,0 +1,133 @@
+# Example Collector deployment for Kubernetes and OpenShift.
+#
+# Prerequisites this file does not create:
+#   - a Secret named otel-collector-backend with a key BACKEND_TOKEN, holding the credential the
+#     otlphttp exporter in collector-config.yaml sends to your backend
+#   - replacing the placeholder backend endpoint in that same file
+#
+# No runAsUser is set: on OpenShift, the restricted SCC assigns one from the namespace's allowed
+# range at admission time. On plain Kubernetes this runs as whatever UID the image's own USER
+# directive sets (root, for the upstream otelcol-contrib image), which is still confined by the
+# rest of this securityContext (no privilege escalation, all capabilities dropped, non-root
+# enforced by runAsNonRoot, which fails the pod rather than silently running as root if the image
+# does not declare a non-root user of its own; set an explicit runAsUser here if that matters for
+# your image).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: netbox-otel-collector
+data:
+  # Keep this in sync with collector-config.yaml; a test asserts the two are identical.
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      # Protects the Collector process itself from an unbounded queue if the backend is slow or down.
+      # Keep this first in every pipeline: it needs to see data before batch buffers more of it.
+      memory_limiter:
+        check_interval: 1s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      batch: {}
+
+    exporters:
+      debug:
+        verbosity: basic
+      # Replace this block with your real backend.
+      otlphttp:
+        endpoint: https://otlp.example.com
+        headers:
+          Authorization: "Bearer ${env:BACKEND_TOKEN}"
+
+    service:
+      pipelines:
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [debug, otlphttp]
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [debug, otlphttp]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [debug, otlphttp]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector-contrib:0.161.0
+          args:
+            - --config=/conf/config.yaml
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          env:
+            - name: BACKEND_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: otel-collector-backend
+                  key: BACKEND_TOKEN
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: config
+              mountPath: /conf
+      volumes:
+        - name: config
+          configMap:
+            name: netbox-otel-collector
+---
+# The NetBox web and worker Deployments point exporter.endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT)
+# at this Service, in-cluster only: http://otel-collector.<namespace>.svc:4318. A Route is not
+# needed unless something outside the cluster must reach the Collector directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http

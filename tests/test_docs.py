@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from netbox_opentelemetry_plugin import conf
 
@@ -99,3 +100,10 @@ def test_configuration_reference_matches_defaults():
     documented = {key: ast.literal_eval(default) for key, default in rows}
     assert len(rows) == len(documented)
     assert documented == dict(_flatten(conf.DEFAULTS))
+
+
+def test_collector_example_configmap_matches_standalone_config():
+    standalone = yaml.safe_load((DOCS / "examples/kubernetes/collector-config.yaml").read_text())
+    manifests = list(yaml.safe_load_all((DOCS / "examples/kubernetes/collector.yaml").read_text()))
+    configmap = next(m for m in manifests if m["kind"] == "ConfigMap")
+    assert yaml.safe_load(configmap["data"]["config.yaml"]) == standalone

@@ -1,0 +1,49 @@
+# Example OpenTelemetry Collector configuration for the netbox-opentelemetry-plugin.
+#
+# This is a starting point, not a finished deployment. Replace:
+#   - the otlphttp exporter's endpoint (https://otlp.example.com) with your actual backend
+#   - the Authorization header, or the BACKEND_TOKEN environment variable it reads from, with
+#     whatever your backend expects (some backends use a different header name entirely)
+# The debug exporter is useful while setting this up; drop it once the backend is confirmed to
+# receive data, or keep it and rely on the Collector's own logging level to control its volume.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Protects the Collector process itself from an unbounded queue if the backend is slow or down.
+  # Keep this first in every pipeline: it needs to see data before batch buffers more of it.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+  # Replace this block with your real backend.
+  otlphttp:
+    endpoint: https://otlp.example.com
+    headers:
+      Authorization: "Bearer ${env:BACKEND_TOKEN}"
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, otlphttp]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, otlphttp]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [debug, otlphttp]

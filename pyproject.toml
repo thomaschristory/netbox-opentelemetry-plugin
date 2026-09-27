@@ -52,6 +52,7 @@ dev = [
     "django==6.1.1",
     "redis==8.1.0",
     "psycopg[binary]==3.3.5",
+    "pyyaml>=6",
 ]
 docs = [
     "mkdocs>=1.6,<2",

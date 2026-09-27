@@ -1,1 +1,30 @@
 # Failure behaviour
+
+A failing module disables only itself. The plugin never raises into NetBox: `ready()` wraps its own setup in a single `try`/`except` that logs one warning and leaves the process otherwise unaffected if setup fails outright, and every module is installed in its own `try`/`except` inside `bootstrap.install`, so one module's failure to build (a bad setting, an unreachable endpoint, a missing dependency) does not stop any other module, and does not stop NetBox from serving requests or running jobs.
+
+| Situation | Behaviour |
+|---|---|
+| OTel import error, or any other unexpected failure during setup | One warning (with the exception's traceback, since this is the plugin's own catch-all in `PluginConfig.ready()`); the plugin is inactive for that process; NetBox keeps running |
+| Invalid config in one section (`logs`, `audit`, `traces`, `metrics` or `rq`) | One warning naming that section; that section is disabled; every other section resolves normally |
+| An invalid top-level value (`enabled`, `service_name`, `resource_attributes` or `exporter` not of the expected type) | One warning; the whole plugin is disabled for that process |
+| An invalid `exporter.*` value (`protocol`, `timeout`, `headers`, `insecure`, `certificate`) | Every enabled signal that resolves an exporter from it fails to resolve: logs and audit together (they share one exporter), traces, and metrics, each disabled with its own warning. A signal that is off to begin with is unaffected, since its exporter is never resolved |
+| No endpoint resolves for a module (config-time: none of `<signal>.endpoint`, `exporter.endpoint`, or the `OTEL_*` fallbacks) | One warning, that module disabled; the rest of the plugin keeps running |
+| The exporter's own construction fails at setup or after a fork (config resolved, but building the actual client fails, for example a gRPC CA certificate file that cannot be read) | One warning naming which export is disabled (log, trace or metric); the rest of the plugin keeps running. Read the note on gRPC certificates below |
+| Collector unreachable | The exporter retries in the background, then drops what it could not send, bounded by its own queue; a web request never blocks on this. Each RQ work-horse still waits up to `rq.flush_timeout` after its job before exiting, and the worker starts its next job only once that horse has exited: during an outage this caps a worker at roughly one job per `flush_timeout` for as long as the outage lasts (see below). Metrics are exported from the plugin's own thread, which retries per the exporter's own behaviour and never blocks a request or a job |
+| Horse flush slow (Collector reachable but slow, or `flush_timeout` set low) | Bounded by `rq.flush_timeout`, run on a helper thread; delays the worker's next job, never the running job's own completion |
+| Error in the audit receiver, or in its commit callback | Caught and logged (one warning per process, naming only the exception type, since the message could contain object data); the save that triggered it proceeds regardless |
+| uWSGI running without thread support (`enable-threads` not set, classic uwsgi binary) | One warning naming the fix (`enable-threads = true`); nothing is exported until it is set, since the exporter's background thread cannot run at all |
+| An RQ wrap's target has an unexpected signature (an rq internal changed shape) | One warning naming the target; that wrap alone is skipped, every other wrap and module continues |
+| An SDK (`TracerProvider`, `MeterProvider` or `LoggerProvider`) already configured outside the plugin | Reused instead of building a new one, with one informational log line; an instrumentor that reports itself as already applied is left alone rather than instrumented a second time |
+
+## Collector outage and RQ throughput
+
+A work-horse's flush (its log provider and its tracer provider, in parallel) is the only chance it gets to export what it buffered, since it exits with `os._exit` right after, which skips `atexit`. During a Collector outage the exporter cannot succeed, so every horse pays the full `rq.flush_timeout` (default 5 seconds) before it exits, and the worker only picks up its next job once that horse has exited: this caps that worker at roughly one job per `flush_timeout` for as long as the outage lasts, regardless of how fast the jobs themselves run. For a busy queue, where throughput during an outage matters more than a slightly wider chance of losing a buffered record, lower `rq.flush_timeout` to something like 1 or 2 seconds; see [How it works, RQ work-horses](how-it-works.md#rq-work-horses) for the paths that SIGKILL a horse outright (which a flush timeout has no effect on either way) and [Limitations](limitations.md) for the rest of what a low `flush_timeout` trades away.
+
+## gRPC certificates and failure timing
+
+Over gRPC, the CA certificate configured in `exporter.certificate` (or its signal-specific variant) is read from disk when the exporter is built, not on each connection: a missing or unreadable file fails that build immediately, producing the "could not build exporter" warning above, at process start or at the next fork. Over HTTP, the certificate path is instead handed to the underlying HTTP client and read when it opens a connection, so a missing file only surfaces as a failed export attempt later, not as a setup warning. See [Configuration reference](configuration.md#reference) (`exporter.certificate`) for the same distinction from the configuration side.
+
+## Failures that are silent by design
+
+Not every failure surfaces as a warning, deliberately: a Collector that accepts and then silently drops a batch it could not fully process (for example over its own body size limit) never reports back to the exporting process, so the plugin cannot log a warning about something it does not know happened. See [Collector, body size limits](collector.md#what-a-collector-adds-that-the-plugin-does-not) and [Data safety](data-safety.md) for what this means for `audit.include_data`.

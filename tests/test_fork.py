@@ -731,3 +731,25 @@ def test_external_meter_provider_is_kept_in_a_web_child_and_switched_off_in_a_ho
     bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
     horse = _run_in_child(lambda: {"noop": type(switchable.delegate).__name__})
     assert horse["noop"] == "NoOpMeterProvider"
+
+
+def test_a_failed_delegate_swap_shuts_down_the_new_metrics_pipeline(
+    exporters, span_exporters, metric_exporters, monkeypatch
+):
+    # Called directly (no fork): the swap of the tracer delegate fails after the child's metrics
+    # pipeline was built. That pipeline's export thread must not be left running.
+    user = {**TRACES_USER, "metrics": {"enabled": True, "export_interval": 3600}}
+    ctx = bootstrap.install(user, env={}, argv=ARGV_WEB)
+    state = bootstrap._state
+    parent_pipeline = state.metrics_pipeline
+
+    def fail(self, provider):
+        raise RuntimeError("swap failed")
+
+    monkeypatch.setattr(otel.SwitchableTracerProvider, "set_delegate", fail)
+    with pytest.raises(RuntimeError):
+        bootstrap._rebuild_for_child(ctx, state, None)
+    assert len(metric_exporters) == 2  # the new pipeline was built
+    assert metric_exporters[1].shutdown_called is True
+    assert state.metrics_pipeline is parent_pipeline
+    assert [t.name for t in threading.enumerate()].count("otel-metrics") == 1

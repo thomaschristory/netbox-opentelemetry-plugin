@@ -369,21 +369,33 @@ def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> No
             with contextlib.suppress(Exception):
                 obj.shutdown()
         raise
-    if new_logger_provider is not None:
-        ctx.logger_provider = new_logger_provider
-    if new_tracer_provider is not None:
-        # Instrumentors hold the switchable provider; only the SDK provider behind it changes.
-        ctx.tracer_provider.set_delegate(new_tracer_provider)
-    if ctx.meter_provider is not None:
-        if role not in METRIC_ROLES:
-            # An RQ work-horse exports no metrics (SPEC 6.4). It must not record into the inherited
-            # SDK provider either: the parent's export thread may have held its locks at fork time.
-            state.metrics_pipeline = None
-            ctx.meter_provider.set_delegate(otel.noop_meter_provider())
-        elif new_pipeline is not None:
-            # The inherited pipeline (thread gone, locks copied) is dropped, never shut down.
-            state.metrics_pipeline = new_pipeline
-            ctx.meter_provider.set_delegate(new_pipeline.provider)
+    try:
+        if new_logger_provider is not None:
+            ctx.logger_provider = new_logger_provider
+        if new_tracer_provider is not None:
+            # Instrumentors hold the switchable provider; only the SDK provider behind it changes.
+            ctx.tracer_provider.set_delegate(new_tracer_provider)
+        if ctx.meter_provider is not None:
+            if role not in METRIC_ROLES:
+                # An RQ work-horse exports no metrics (SPEC 6.4). It must not record into the inherited
+                # SDK provider either: the parent's export thread may have held its locks at fork time.
+                state.metrics_pipeline = None
+                with contextlib.suppress(Exception):
+                    ctx.meter_provider.set_delegate(otel.noop_meter_provider())
+            elif new_pipeline is not None:
+                # The inherited pipeline (thread gone, locks copied) is dropped, never shut down.
+                ctx.meter_provider.set_delegate(new_pipeline.provider)
+                state.metrics_pipeline = new_pipeline
+    except Exception:
+        # A swap failed. The caller's failure path switches this process to no-op providers and
+        # drops the new ones, so stop their threads here (all child-owned, never inherited).
+        for obj in built:
+            with contextlib.suppress(Exception):
+                obj.shutdown()
+        if new_pipeline is not None:
+            with contextlib.suppress(Exception):
+                new_pipeline.shutdown(0)
+        raise
     ctx.role = role
     ctx.resource = resource
     for module in state.modules:

@@ -4,14 +4,22 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
-      - run: uv sync
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
 
@@ -21,12 +29,23 @@ jobs:
       matrix:
         python: ["3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           python-version: ${{ matrix.python }}
-      - run: uv sync
+      - run: uv sync --locked
       - run: uv run pytest -v -W error::DeprecationWarning
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv run --group docs mkdocs build --strict
 
   netbox-load:
     name: loads in NetBox ${{ matrix.netbox }}
@@ -35,15 +54,17 @@ jobs:
       matrix:
         netbox: ["v4.7.1"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: plugin
-      - uses: actions/checkout@v5
+          persist-credentials: false
+      - uses: actions/checkout@v7
         with:
           repository: netbox-community/netbox
           ref: ${{ matrix.netbox }}
           path: netbox
-      - uses: actions/setup-python@v6
+          persist-credentials: false
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install NetBox and plugin
@@ -64,6 +85,7 @@ jobs:
               },
           }
           EOF
+      # No database or Redis service: NetBox does not connect to either for check or shell startup.
       - name: System check
         run: python netbox/netbox/manage.py check
       - name: Handler attached
@@ -74,6 +96,18 @@ jobs:
           assert any(isinstance(h, H) for h in logging.getLogger('netbox').handlers), 'handler missing'
           print('handler attached')
           "
+      - name: No endpoint configured
+        run: |
+          set -o pipefail
+          cp netbox/netbox/netbox/configuration_testing.py netbox/netbox/netbox/configuration.py
+          cat >> netbox/netbox/netbox/configuration.py <<'EOF'
+
+          PLUGINS = ["netbox_opentelemetry_plugin"]
+          # NetBox's default. configuration_testing.py disables existing loggers, which hides the warning.
+          LOGGING = {}
+          EOF
+          python netbox/netbox/manage.py check 2>&1 | tee check.log
+          grep -q "no endpoint configured" check.log
 
   netbox-integration:
     name: integration tests on NetBox ${{ matrix.netbox }}
@@ -103,15 +137,17 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: plugin
-      - uses: actions/checkout@v5
+          persist-credentials: false
+      - uses: actions/checkout@v7
         with:
           repository: netbox-community/netbox
           ref: ${{ matrix.netbox }}
           path: netbox
-      - uses: actions/setup-python@v6
+          persist-credentials: false
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install NetBox and plugin
@@ -135,3 +171,34 @@ jobs:
           EOF
       - name: Integration tests
         run: python netbox/netbox/manage.py test --noinput --parallel 1 "$GITHUB_WORKSPACE/plugin/tests_netbox"
+
+  e2e:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      COMPOSE: docker compose -f dev/docker-compose.yml --profile gunicorn --profile uwsgi
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --locked
+      - name: Start the dev stack
+        run: $COMPOSE up -d --build --wait --wait-timeout 600
+      - name: End-to-end tests
+        run: uv run pytest -m e2e tests/e2e -v
+      - name: Collect compose logs
+        if: failure()
+        run: $COMPOSE logs --no-color > compose.log
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: e2e-logs
+          path: |
+            compose.log
+            dev/data/collector/
+          retention-days: 7
+      - name: Stop the dev stack
+        if: always()
+        run: $COMPOSE down -v

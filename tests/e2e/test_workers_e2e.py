@@ -45,17 +45,19 @@ def _login_records(server: str, start_ns: int):
     ]
 
 
-def _login_with_retry(base_url: str, attempts: int = 3) -> int:
+def _login_with_retry(base_url: str, attempts: int = 5) -> int:
     """Log in, retrying when the server drops the connection. Returns the number of dropped attempts.
 
     The dev uWSGI profile recycles workers (--max-requests), and its HTTP router can hand a request
     to a worker that is exiting, which drops the connection. A dropped attempt may or may not have
-    reached NetBox, so it may or may not have produced a login record.
+    reached NetBox, so it may or may not have produced a login record. Drops come in short bursts
+    (seen on CI right after the workers start), so attempts are spaced out.
     """
     for dropped in range(attempts):
         try:
             login(base_url, "admin", "admin")
         except requests.ConnectionError:
+            time.sleep(1)
             continue
         return dropped
     raise AssertionError(f"login to {base_url} dropped {attempts} times in a row")

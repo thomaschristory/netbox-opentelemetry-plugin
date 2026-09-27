@@ -114,7 +114,7 @@ GitHub disables scheduled workflows in a public repository after 60 days without
 
     ```bash
     git push origin main
-    gh run list --workflow ci.yml --branch main --limit 1
+    gh run list --workflow ci.yml --branch main --commit "$(git rev-parse HEAD)" --limit 1
     gh run watch <run-id> --exit-status
     ```
 

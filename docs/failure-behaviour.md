@@ -15,7 +15,7 @@ A failing module disables only itself. The plugin never raises into NetBox: `rea
 | Error in the audit receiver, or in its commit callback | Caught and logged (one warning per process, naming only the exception type, since the message could contain object data); the save that triggered it proceeds regardless |
 | uWSGI running without thread support (`enable-threads` not set, classic uwsgi binary) | One warning naming the fix (`enable-threads = true`); nothing is exported until it is set, since the exporter's background thread cannot run at all |
 | An RQ wrap's target has an unexpected signature (an rq internal changed shape) | One warning naming the target; that wrap alone is skipped, every other wrap and module continues |
-| An SDK (`TracerProvider`, `MeterProvider` or `LoggerProvider`) already configured outside the plugin | Reused instead of building a new one, with one informational log line; an instrumentor that reports itself as already applied is left alone rather than instrumented a second time |
+| An SDK (`TracerProvider`, `MeterProvider` or `LoggerProvider`) already configured outside the plugin | Reused instead of building a new one, with one `logger.info` line rather than a warning; with NetBox's default `LOGGING = {}`, Python's last-resort handler only shows `WARNING` and above, so this line is not shown unless `LOGGING` is configured to include it. An instrumentor that reports itself as already applied is left alone rather than instrumented a second time |
 
 ## Collector outage and RQ throughput
 

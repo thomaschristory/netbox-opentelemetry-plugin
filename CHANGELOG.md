@@ -15,7 +15,7 @@ All notable changes to this project are documented in this file. The format foll
 - Audit records: one OpenTelemetry log record per committed `ObjectChange`, with optional, filtered field data.
 - Traces: spans for Django requests, psycopg, redis and outbound `requests` calls, plus RQ job spans, with trace context propagated into enqueued jobs and redaction of headers, query strings and exception text.
 - Metrics: HTTP server and client request durations, RQ job duration and count, RQ queue depth, an object change counter, optional process runtime metrics, all restricted to an allowlist of names and attributes.
-- Fork safety for gunicorn, uWSGI and Granian, so each forked worker exports under its own identity.
+- Fork and multi-process safety for gunicorn, uWSGI and Granian, so each worker process exports under its own identity.
 - RQ work-horse flush, bounding how long a job's log lines, audit records and spans wait to be exported before the horse exits.
 - Configuration through `PLUGINS_CONFIG` and the standard `OTEL_*` environment variables.
 - Reuse of an OpenTelemetry SDK already configured outside the plugin (for example by `opentelemetry-instrument`).

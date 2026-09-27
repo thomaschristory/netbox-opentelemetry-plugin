@@ -19,7 +19,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # Full history of all branches, for the check that a tag points at a commit on main.
+          fetch-depth: 0
           persist-credentials: false
+      - name: Check that the tagged commit is on main
+        if: github.ref_type == 'tag'
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - uses: astral-sh/setup-uv@v10.2.0
       - run: uv run --locked --group docs mkdocs build --strict
       - uses: actions/upload-pages-artifact@v5

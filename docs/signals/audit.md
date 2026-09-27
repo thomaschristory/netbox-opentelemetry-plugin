@@ -74,7 +74,7 @@ The receiver and the commit callback each catch every exception, so a failure he
 
 ## Sizing
 
-While audit is on, the plugin sizes the underlying log record queue at 20,000 records per process (shared with the logs module), instead of the OTel SDK's smaller default, since a single bulk edit can queue many records at once. A single commit larger than that can still drop records; the SDK reports this only on its own logger, which the plugin never exports (see [Logs, feedback loop](logs.md#feedback-loop)). This larger queue applies only to a `LoggerProvider` the plugin builds itself: when a `LoggerProvider` configured outside the plugin is reused instead (provider detection, see [How it works](../how-it-works.md#an-sdk-configured-outside-the-plugin)), its queue is not resized for audit traffic.
+While audit is on, the plugin sizes the underlying log record queue at 20,000 records per process (shared with the logs module), instead of the OTel SDK's smaller default, since a single bulk edit can queue many records at once. A single commit larger than that can still drop records; the SDK reports this only on its own logger, which the plugin never exports (see [Logs, feedback loop](logs.md#feedback-loop)). This applies only to a `LoggerProvider` the plugin builds itself; see Known limitations below for what changes when one configured outside the plugin is reused instead.
 
 With `include_data`, a record can also grow large for an object with big JSON fields. Most Collectors reject a request above their configured body size limit, which drops the whole batch that record was in, not just that one record. Keep `include_data` off unless you need it, or add large fields such as `config_context` and `local_context_data` to `audit.exclude_fields`.
 
@@ -82,6 +82,6 @@ With `include_data`, a record can also grow large for an object with big JSON fi
 
 - If NetBox updates an M2M change record in a transaction later than the one that created it, the data sent with the first record does not include that later update. This only matters with `include_data`; a same-transaction M2M update is covered above.
 - The 20,000-record queue is shared with the logs module: a burst of audit records can crowd out log lines buffered in the same process, and vice versa.
-- With a `LoggerProvider` configured outside the plugin (provider detection, see [How it works](../how-it-works.md#an-sdk-configured-outside-the-plugin)), its queue is not resized for `include_data` traffic.
+- With a `LoggerProvider` configured outside the plugin reused instead of one the plugin builds itself (provider detection, see [How it works](../how-it-works.md#an-sdk-configured-outside-the-plugin)), its queue is not resized: the 20,000-record figure above applies only to a `LoggerProvider` the plugin builds itself.
 
 See the [configuration reference](../configuration.md#reference) for every `audit.*` setting and its default, and [Data safety](../data-safety.md) for what `include_data` changes about what leaves the process.

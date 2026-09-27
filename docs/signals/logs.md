@@ -1,6 +1,6 @@
 # Logs
 
-With `logs.enabled` (default `True`), the plugin attaches a logging handler directly to the Python loggers listed in `logs.loggers`, so their records are exported over OTLP as well as going wherever NetBox's own logging configuration already sends them (normally stdout).
+With `logs.enabled` (default `True`), the plugin attaches a logging handler directly to the Python loggers listed in `logs.loggers`, so their records are exported over OTLP as well as continuing to go wherever NetBox's own logging configuration already sends them (stderr by default).
 
 ## Which loggers
 
@@ -8,11 +8,13 @@ With `logs.enabled` (default `True`), the plugin attaches a logging handler dire
 
 ## Getting INFO records
 
-NetBox's default `LOGGING` setting is an empty dict, so `netbox`, `django` and `rq` have no level of their own and inherit the root logger's level, which is `WARNING`. `logs.level = "INFO"` only decides what the handler accepts once a record reaches it; it does not lower the logger's own effective level. With the defaults, an INFO record is filtered out by the logger itself before the handler ever sees it, so nothing below `WARNING` is exported. (NetBox's own configuration docs describe INFO records reaching the console by default; the code disagrees, and this plugin follows the code.)
+`logs.level = "INFO"` only decides what the handler accepts once a record reaches it; it does not change any logger's own effective level. NetBox's default `LOGGING` setting is an empty dict, so `netbox` (and anything under it, such as `netbox.dcim.api.views`) has no level of its own and inherits the root logger's level, `WARNING`: with the defaults, an INFO record from `netbox.*` is filtered out by the logger itself before the handler ever sees it. (NetBox's own configuration docs describe INFO records reaching the console by default; the code disagrees, and this plugin follows the code.)
 
-Two ways to get INFO records exported:
+`django` and `rq.worker` are not in the same situation. Django's `configure_logging` always applies its own built-in `DEFAULT_LOGGING` first, which sets the `django` logger to `INFO`; because NetBox's `LOGGING` is an empty dict, the step that would apply an operator's own `LOGGING` on top of that default never runs. Separately, the RQ worker process (`manage.py rqworker`) calls rq's `setup_loghandlers` at its default verbosity, which sets `rq.worker` to `INFO`; a record from `rq.worker` still reaches the handler the plugin attaches to `rq`, since it propagates up to that ancestor logger. So with the plugin's defaults, an INFO record from `django` or `rq.worker` is already exported. `logs.set_logger_levels` and a custom `LOGGING` mainly matter for getting `netbox.*` records below `WARNING`.
 
-- Set `logs.set_logger_levels = True`. This lowers the effective level of each logger in `logs.loggers` to `logs.level`, but only if that logger currently has no level of its own or a higher one; a level an operator already set explicitly, lower than `logs.level`, is left alone.
+Two ways to get `netbox.*` INFO records exported:
+
+- Set `logs.set_logger_levels = True`. This lowers the effective level of each logger in `logs.loggers` to `logs.level`, but only if that logger currently has no level of its own or a higher one; a level an operator already set explicitly, lower than `logs.level`, is left alone. `django` and `rq.worker` are already at `INFO` by the time this runs, so in practice this only changes `netbox`.
 
   ```python
   PLUGINS_CONFIG = {
@@ -40,7 +42,7 @@ Two ways to get INFO records exported:
 - **Body**: the formatted message (`record.getMessage()`, or the result of the handler's formatter if one is set).
 - **Severity number**: mapped from the Python level number. A level that falls between two standard levels maps to the lower one, for example `15` (between `DEBUG` at `10` and `INFO` at `20`) gives `DEBUG`.
 - **Severity text**: the Python level name, except `WARN` for `WARNING` and `FATAL` for `CRITICAL` (the spelling the OTel logs data model uses for those two).
-- **Attributes**, built only from an allowlist, never from arbitrary `extra=` fields: `code.file.path`, `code.function.name`, `code.line.number`, `logger.name`, `thread.name`; `exception.type`, `exception.message` and `exception.stacktrace` when the record carries exception info.
+- **Attributes**, built only from an allowlist, never from arbitrary `extra=` fields: `code.file.path`, `code.function.name`, `code.line.number` and `logger.name` are always present; `thread.name` is present when the record's thread has a name; when the record carries exception info, `exception.type` and `exception.stacktrace` are added, and `exception.message` too, but only when the exception itself has a message (its first argument).
 - **`extra=` fields are not exported.** The handler is implemented to build its attributes only from the allowlist above, so a call such as `logger.info("...", extra={"exception.type": "Fake"})` cannot add data of its own, or spoof one of the allowlisted names.
 - Inside an active span, a record carries that span's trace id and span id automatically.
 
@@ -50,7 +52,7 @@ Each record is emitted through the OTel Logger obtained for the *originating* Py
 
 ## Feedback loop
 
-Records from `netbox_opentelemetry_plugin`, `opentelemetry`, `urllib3` and `grpc` (and any logger nested under one of those names) are always excluded from export, regardless of `logs.loggers`. This stops a record produced by the export path itself, such as a warning logged internally by the OTel SDK or by the HTTP or gRPC client the exporter uses, from feeding back into another export attempt. The plugin's own logger (`netbox_opentelemetry_plugin`) only ever writes to stdout, through NetBox's normal logging configuration.
+Records from `netbox_opentelemetry_plugin`, `opentelemetry`, `urllib3` and `grpc` (and any logger nested under one of those names) are always excluded from export, regardless of `logs.loggers`. This stops a record produced by the export path itself, such as a warning logged internally by the OTel SDK or by the HTTP or gRPC client the exporter uses, from feeding back into another export attempt. The plugin's own logger (`netbox_opentelemetry_plugin`) is never exported and goes wherever NetBox's logging configuration sends it (stderr by default).
 
 ## Background jobs
 

@@ -674,11 +674,47 @@ def test_metrics_rebuild_failure_switches_the_child_to_noop(exporters, monkeypat
         return {
             "pipeline": state.metrics_pipeline is None,
             "noop": type(state.context.meter_provider.delegate).__name__,
+            "logger_provider": state.context.logger_provider is None,
         }
 
     result = _run_in_child(probe)
     assert result["pipeline"] is True
     assert result["noop"] == "NoOpMeterProvider"
+    assert result["logger_provider"] is True
+
+
+def test_horse_rebuild_failure_switches_the_horse_to_noop(metric_exporters, monkeypatch):
+    calls = []
+
+    def factory(cfg):
+        calls.append(os.getpid())
+        if len(calls) > 1:
+            raise RuntimeError("certificate gone")
+        return InMemoryLogRecordExporter()
+
+    monkeypatch.setattr(otel, "build_log_exporter", factory)
+    bootstrap.install(METRICS_USER, env={}, argv=ARGV_RQ)
+
+    def probe():
+        state = bootstrap._state
+        return {
+            "calls_in_child": len(calls),
+            "role": state.context.role,
+            "pipeline": state.metrics_pipeline is None,
+            "noop": type(state.context.meter_provider.delegate).__name__,
+            "logger_provider": state.context.logger_provider is None,
+            "threads": [t.name for t in threading.enumerate()],
+        }
+
+    bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
+    result = _run_in_child(probe)
+    assert result["calls_in_child"] == 2  # the child's rebuild reached the failing build
+    assert result["role"] == bootstrap.ROLE_RQWORKER  # a failed rebuild keeps the inherited role
+    assert result["pipeline"] is True
+    assert result["noop"] == "NoOpMeterProvider"
+    assert result["logger_provider"] is True
+    assert "otel-metrics" not in result["threads"]
+    assert len(metric_exporters) == 1  # no exporter was built in the horse
 
 
 def test_external_meter_provider_is_kept_in_a_web_child_and_switched_off_in_a_horse(exporters, monkeypatch):

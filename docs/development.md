@@ -10,7 +10,7 @@ This page covers the repository layout, the local development stack, the tests, 
 | `tests/` | Unit tests (pytest). `tests/e2e/` holds the end-to-end tests that run against the dev stack. |
 | `tests_netbox/` | Integration tests that run inside NetBox with `manage.py test`. |
 | `dev/` | Docker compose dev stack: `Dockerfile`, `docker-compose.yml`, NetBox plugin configuration, Collector configuration, environment files and helper scripts. |
-| `docs/` | This documentation (MkDocs with the Material theme). |
+| `docs/` | This documentation, built with Zensical from `mkdocs.yml`. |
 | `.github/workflows/` | CI, release and documentation workflows. |
 
 Requirements: Python 3.12 or later, [uv](https://docs.astral.sh/uv/), Docker with the compose plugin, and `make`.
@@ -66,8 +66,8 @@ UV_PYTHON=3.13 uv run pytest
 
 | Command | What it does |
 | --- | --- |
-| `make docs` | Builds the site into `site/` with `mkdocs build --strict` and fails if the output contains files that must not be published. |
-| `make docs-serve` | Serves the documentation with live reload on `http://127.0.0.1:8000`. Stop the dev stack first, or pass another address with `uv run --group docs mkdocs serve -a 127.0.0.1:8010`. |
+| `make docs` | Builds the site into `site/` with `zensical build --strict`. Zensical publishes every file under `docs/`, so the build runs on a staging copy (`build/docs-src/`) of the files git can see: files excluded through `.gitignore` or `.git/info/exclude` are never published. The target also fails if the output contains such files. |
+| `make docs-serve` | Serves the working tree with live reload on `http://localhost:8000`, for local preview only (it includes locally excluded files). Stop the dev stack first, or pass another address with `uv run --group docs zensical serve -a 127.0.0.1:8010`. |
 
 The documentation tools are in the `docs` dependency group of `pyproject.toml`; `uv run --group docs` installs them on first use.
 
@@ -81,7 +81,7 @@ Three workflows live in `.github/workflows/`.
 | --- | --- |
 | `lint` | ruff check and format check. |
 | `unit` | Unit tests on Python 3.12, 3.13 and 3.14, with `uv sync --locked` so a stale `uv.lock` fails. |
-| `docs` | `mkdocs build --strict` with the locked documentation dependencies. |
+| `docs` | `make docs` (`zensical build --strict`) with the locked documentation dependencies. |
 | `netbox-load` | Installs NetBox from source with the plugin on Python 3.12, runs `manage.py check`, checks that the log handler is attached, and checks that a configuration without any endpoint starts and prints `no endpoint configured`. |
 | `netbox-integration` | Runs `tests_netbox/` with `manage.py test` against Postgres and Valkey service containers. |
 | `e2e` | Nightly and on manual dispatch only. Starts the dev stack with all three web servers and runs `tests/e2e/`. On failure, the compose logs and the Collector output are uploaded as the `e2e-logs` artifact. |

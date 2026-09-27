@@ -26,7 +26,7 @@ jobs:
         if: github.ref_type == 'tag'
         run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - uses: astral-sh/setup-uv@v10.2.0
-      - run: uv run --locked --group docs mkdocs build --strict
+      - run: make docs
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site/

@@ -4,17 +4,9 @@ site_url: https://thomaschristory.github.io/netbox-opentelemetry-plugin/
 repo_url: https://github.com/thomaschristory/netbox-opentelemetry-plugin
 repo_name: netbox-opentelemetry-plugin
 edit_uri: ""
+# Built with Zensical (make docs), which reads this file. Zensical publishes everything under
+# docs_dir, so make docs builds from a staging copy of the files git can see.
 docs_dir: docs
-strict: true
-
-exclude_docs: |
-  superpowers/
-
-validation:
-  omitted_files: warn
-  absolute_links: warn
-  unrecognized_links: warn
-  anchors: warn
 
 theme:
   name: material

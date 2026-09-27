@@ -55,9 +55,7 @@ dev = [
     "pyyaml>=6",
 ]
 docs = [
-    "mkdocs>=1.6,<2",
-    "mkdocs-material>=9.7,<10",
-    "pymdown-extensions>=10",
+    "zensical>=0.0.65",
 ]
 
 [tool.hatch.version]

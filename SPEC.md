@@ -57,7 +57,7 @@ netbox_opentelemetry_plugin/
     rq.py          job spans, job metrics, queue depth, horse flush, context propagation
 tests/
 dev/               docker compose, NetBox config, Collector config, sample script
-docs/              MkDocs Material
+docs/              documentation site (Zensical, configured by mkdocs.yml)
 ```
 
 Modules depend on `config` and a shared context object (providers, Resource, process role), never on each other. The `ObjectChange` receiver is registered once and serves both audit records and change counters.
@@ -320,4 +320,4 @@ CI (GitHub Actions): ruff; unit tests on Python 3.12, 3.13, 3.14; NetBox integra
 | M4 | audit | create, update, delete of a prefix and bulk import of 10 devices produce the expected records with shared `request_id`; rollback produces none; filtering proven by tests (integration tests: devices via API bulk create; e2e: prefixes) |
 | M5 | traces, RQ spans, propagation | API requests produce spans; logs carry the matching trace id; a webhook fired by an edit shares the edit's trace |
 | M6 | metrics, change counters, runtime | all metrics of 6.4 visible in the Collector; job metrics come from the worker parent |
-| M7 | docs and release | MkDocs Material site (install per install type, config reference, OpenShift Collector example, limitations), README with compatibility matrix, CHANGELOG, tagged release on PyPI |
+| M7 | docs and release | documentation site (Zensical) (install per install type, config reference, OpenShift Collector example, limitations), README with compatibility matrix, CHANGELOG, tagged release on PyPI |

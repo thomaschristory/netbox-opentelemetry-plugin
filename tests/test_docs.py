@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -78,9 +79,17 @@ def test_otel_names_are_read():
     assert unknown == {}
 
 
-def test_mkdocs_config_excludes_superpowers():
-    text = (ROOT / "mkdocs.yml").read_text()
-    assert re.search(r"^exclude_docs: \|\n\s+superpowers/", text, flags=re.M)
+def test_docs_build_input_excludes_superpowers():
+    # make docs stages exactly these files for Zensical, which has no exclude setting.
+    listed = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "--", "docs", "mkdocs.yml", "CHANGELOG.md"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert "docs/index.md" in listed
+    assert [path for path in listed if "superpowers" in path] == []
 
 
 ROW = re.compile(r"^\| `([a-z_]+(?:\.[a-z_]+)*)` \| `([^`]*)` \|", flags=re.M)

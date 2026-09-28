@@ -5,6 +5,7 @@ import socket
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from opentelemetry import trace
@@ -232,17 +233,24 @@ def test_current_span_wins_over_the_request_span_context(pipeline):
         SimpleNamespace(),
         _request_with("not a span context"),
         _request_with(trace.INVALID_SPAN_CONTEXT),
+        _request_with(SimpleNamespace(is_valid=True, trace_id=1, span_id=1, trace_flags=0)),
+        Mock(),
         None,
     ],
-    ids=["missing", "string", "invalid", "none"],
+    ids=["missing", "string", "invalid", "look-alike", "permissive", "none"],
 )
-def test_record_without_a_usable_request_span_context_has_no_ids(pipeline, request_obj):
+def test_record_without_a_usable_request_span_context_has_no_ids(pipeline, request_obj, monkeypatch):
+    # "look-alike" and "permissive" get past the attribute lookups without raising, so only the
+    # SpanContext type check keeps their values out of the record (and out of the batch encoder).
     exporter, handler = pipeline
+    handled = []
+    monkeypatch.setattr(handler, "handleError", handled.append)
     with _logger("django.request", handler) as lg:
         lg.warning("Not Found: /api/x/", extra={"request": request_obj})
     record = exporter.get_finished_logs()[0].log_record
     assert not record.trace_id
     assert not record.span_id
+    assert handled == []
 
 
 class _HostileRequest:

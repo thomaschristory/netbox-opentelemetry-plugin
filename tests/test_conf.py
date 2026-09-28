@@ -594,3 +594,13 @@ def test_insecure_skip_verify_with_env_certificate_is_rejected():
 def test_insecure_skip_verify_is_not_read_from_the_environment():
     env = {"OTEL_EXPORTER_OTLP_INSECURE_SKIP_VERIFY": "true", **ENDPOINT_ENV}
     assert conf.resolve({}, env).log_exporter.insecure_skip_verify is False
+
+
+def test_insecure_skip_verify_disables_only_the_grpc_signal():
+    user = {"exporter": {"insecure_skip_verify": True}, "traces": {"enabled": True}, "metrics": {"enabled": True}}
+    env = {"OTEL_EXPORTER_OTLP_TRACES_PROTOCOL": "grpc", **ENDPOINT_ENV}
+    s = conf.resolve(user, env)
+    assert s.traces.enabled is False
+    assert any("not supported over grpc" in w for w in s.warnings)
+    assert s.log_exporter.insecure_skip_verify is True
+    assert s.metrics.exporter.insecure_skip_verify is True

@@ -15,6 +15,13 @@ def test_plugin_config_metadata():
     assert cfg.version == __version__
 
 
+def test_plugin_config_author():
+    # Shown on NetBox's plugin detail page and in /api/plugins/installed-plugins/.
+    cfg = plugin.NetBoxOpenTelemetryConfig
+    assert cfg.author == "Thomas Christory"
+    assert cfg.author_email == "9317624+thomaschristory@users.noreply.github.com"
+
+
 def test_netbox_loads_config_attribute():
     # NetBox imports "<plugin>.config" and expects the PluginConfig class there.
     assert plugin.config is plugin.NetBoxOpenTelemetryConfig

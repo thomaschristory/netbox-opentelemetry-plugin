@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- The NetBox plugin page now shows the plugin's author; `author` and `author_email` are set on the plugin config ([#13](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/13)).
+
 ## [0.2.0] - 2026-09-28
 
 ### Added

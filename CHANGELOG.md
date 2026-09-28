@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-28
+
 ### Fixed
 
 - The NetBox plugin page now shows the plugin's author; `author` and `author_email` are set on the plugin config ([#13](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/13)).
@@ -31,6 +33,7 @@ All notable changes to this project are documented in this file. The format foll
 - Reuse of an OpenTelemetry SDK already configured outside the plugin (for example by `opentelemetry-instrument`).
 - NetBox 4.7 support.
 
-[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/releases/tag/v0.1.0

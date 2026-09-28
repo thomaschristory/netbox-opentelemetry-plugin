@@ -45,6 +45,8 @@ Two ways to get `netbox.*` INFO records exported:
 - **Attributes**, built only from an allowlist, never from arbitrary `extra=` fields: `code.file.path`, `code.function.name`, `code.line.number` and `logger.name` are always present; `thread.name` is present when the record's thread has a name; when the record carries exception info, `exception.type` and `exception.stacktrace` are added, and `exception.message` too, but only when the exception itself has a message (its first argument).
 - **`extra=` fields are not exported.** The handler is implemented to build its attributes only from the allowlist above, so a call such as `logger.info("...", extra={"exception.type": "Fake"})` cannot add data of its own, or spoof one of the allowlisted names.
 - Inside an active span, a record carries that span's trace id and span id automatically.
+- A record written after the request's span has ended, when no span is current, carries the trace id and span id of that request's SERVER span, taken from the request the record references (its `extra={"request": ...}`). Django writes such records itself: the `Not Found`, `Forbidden`, `Bad Request` and `Internal Server Error` lines of `django.request` are logged once the middleware chain has returned, after the span has ended. This includes an API 500 that NetBox's exception handling turns into a response. `RequestSpanMiddleware` records the span context on the request before the view runs; the request object itself is only read for these ids and is never exported. The record's timestamp can be slightly after the span's end time.
+- With traces off (including metrics-only instrumentation), or for a URL in `traces.excluded_urls`, there is no span, so such a record has no trace id.
 
 ## Instrumentation scope
 
@@ -61,5 +63,6 @@ Log lines written inside an RQ job or custom script run in the work-horse proces
 ## Known limitations
 
 - `exception.message` on a log record is not scrubbed for URL query strings. Span attributes, status descriptions and span exception events are (see [Traces](traces.md)); log records are not.
+- A 4xx or 5xx response returned, without raising, by a middleware that runs before the plugin's own `RequestSpanMiddleware` (for example another plugin's middleware listed earlier in `PLUGINS`) produces a `django.request` record without a trace id: the request never reached the point where its span context is recorded. Stock NetBox 4.7 middleware has no such path.
 
 See the [configuration reference](../configuration.md#reference) for every `logs.*` setting and its default.

@@ -123,6 +123,32 @@ class HttpServerMetricsTest(MetricsMixin, APITestCase):
         self.assertFalse(records[0].log_record.trace_id)
         self.assertFalse(records[0].log_record.span_id)
 
+    def test_django_request_record_has_no_trace_id_with_traces_off(self):
+        # With traces off there is no valid span, so the plugin's middleware stores no span
+        # context on the request and the django.request record for the 404 has no ids.
+        self.add_permissions("dcim.view_device")
+        exporter = InMemoryLogRecordExporter()
+        handler = otel.build_logging_handler(
+            otel.build_logger_provider(self.base.resource, exporter, synchronous=True), logging.INFO
+        )
+        request_logger = logging.getLogger("django.request")
+        previous = (list(request_logger.handlers), request_logger.level, request_logger.disabled)
+        request_logger.addHandler(handler)
+        request_logger.setLevel(logging.WARNING)
+        request_logger.disabled = False
+        path = reverse("dcim-api:device-detail", kwargs={"pk": 2147483647})
+        try:
+            response = self.client.get(
+                path, HTTP_TRACEPARENT="00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", **self.header
+            )
+        finally:
+            request_logger.handlers, request_logger.level, request_logger.disabled = previous
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+        records = [r for r in exporter.get_finished_logs() if r.log_record.body == f"Not Found: {path}"]
+        self.assertEqual(len(records), 1)
+        self.assertFalse(records[0].log_record.trace_id)
+        self.assertFalse(records[0].log_record.span_id)
+
     def test_excluded_url_records_no_duration(self):
         self.client.get("/api/status/", **self.header)
         points = [

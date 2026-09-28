@@ -123,6 +123,32 @@ def test_audit_and_log_records_carry_the_request_trace_id(header):
         _call("DELETE", f"/api/ipam/prefixes/{response.json()['id']}/", header)
 
 
+def test_django_request_404_record_carries_the_server_span_ids(header):
+    # Django logs "Not Found: ..." to django.request after the request's span has ended; the record
+    # still carries that span's trace id and span id. Sent directly: _call raises on the 404.
+    trace_id, traceparent = _traceparent()
+    headers = {**_headers(header), "traceparent": traceparent}
+    response = requests.get(f"{NETBOX_URL}/api/dcim/devices/2147483647/", headers=headers, timeout=15)
+    assert response.status_code == 404
+
+    def not_found():
+        return [
+            r
+            for _, _, r in log_records()
+            if r.get("traceId") == trace_id
+            and r.get("body", {}).get("stringValue", "").startswith("Not Found: /api/dcim/devices/")
+        ]
+
+    found = _wait(not_found)
+    assert len(found) == 1, "expected one django.request record carrying the request's trace id"
+
+    def server():
+        return [t for t in _trace(trace_id) if t[2]["kind"] == SPAN_KIND_SERVER]
+
+    found_server = _wait(server)
+    assert found_server and found[0].get("spanId") == found_server[0][2]["spanId"]
+
+
 def test_webhook_fired_by_an_edit_shares_the_edit_trace(header):
     suffix = uuid.uuid4().hex[:8]
     webhook = rule = prefix = None

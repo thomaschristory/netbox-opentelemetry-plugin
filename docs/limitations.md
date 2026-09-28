@@ -5,6 +5,7 @@ Every known limitation of the plugin, in one place, grouped by signal. Each item
 ## Logs
 
 - `exception.message` on a log record is not scrubbed for URL query strings. This is unlike spans, where a status description, an exception event and URL attributes all have query strings replaced; log record content is a separate code path that the plugin does not apply the same scrubbing to. See [Logs, known limitations](signals/logs.md#known-limitations) and [Data safety, traces in detail](data-safety.md#traces-in-detail).
+- A 4xx or 5xx response returned, without raising, by a middleware that runs before the plugin's own (for example another plugin's middleware listed earlier in `PLUGINS`) produces a `django.request` record without a trace id. Stock NetBox 4.7 has no such path. See [Logs, known limitations](signals/logs.md#known-limitations).
 
 ## Audit
 

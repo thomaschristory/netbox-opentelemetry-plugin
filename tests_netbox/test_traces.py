@@ -147,6 +147,45 @@ class RequestSpanTest(TracingMixin, APITestCase):
         self.assertEqual(records[0].log_record.trace_id, span.context.trace_id)
         self.assertEqual(records[0].log_record.span_id, span.context.span_id)
 
+    def _get_logging_django_request(self, path):
+        # Django logs 4xx and 5xx responses to django.request in BaseHandler.get_response, after
+        # the middleware chain, so after the instrumentor's middleware has ended the span.
+        exporter = InMemoryLogRecordExporter()
+        handler = otel.build_logging_handler(
+            otel.build_logger_provider(self.trace_ctx.resource, exporter, synchronous=True), logging.INFO
+        )
+        request_logger = logging.getLogger("django.request")
+        previous = (list(request_logger.handlers), request_logger.level, request_logger.disabled)
+        request_logger.addHandler(handler)
+        request_logger.setLevel(logging.WARNING)
+        request_logger.disabled = False
+        try:
+            response = self.client.get(path, **self.header)
+        finally:
+            request_logger.handlers, request_logger.level, request_logger.disabled = previous
+        return response, exporter.get_finished_logs()
+
+    def test_api_404_logs_django_request_with_the_server_span_trace_id(self):
+        self.add_permissions("dcim.view_device")
+        path = reverse("dcim-api:device-detail", kwargs={"pk": 2147483647})
+        response, logs = self._get_logging_django_request(path)
+        self.assertHttpStatus(response, status.HTTP_404_NOT_FOUND)
+        span = self.server_span()
+        records = [r for r in logs if r.log_record.body == f"Not Found: {path}"]
+        self.assertEqual(len(records), 1, [r.log_record.body for r in logs])
+        self.assertEqual(records[0].log_record.trace_id, span.context.trace_id)
+        self.assertEqual(records[0].log_record.span_id, span.context.span_id)
+
+    def test_api_403_logs_django_request_with_the_server_span_trace_id(self):
+        path = reverse("dcim-api:device-list")
+        response, logs = self._get_logging_django_request(path)
+        self.assertHttpStatus(response, status.HTTP_403_FORBIDDEN)
+        span = self.server_span()
+        records = [r for r in logs if r.log_record.body == f"Forbidden: {path}"]
+        self.assertEqual(len(records), 1, [r.log_record.body for r in logs])
+        self.assertEqual(records[0].log_record.trace_id, span.context.trace_id)
+        self.assertEqual(records[0].log_record.span_id, span.context.span_id)
+
 
 class JobSpanTest(TracingMixin, APITestCase):
     def setUp(self):

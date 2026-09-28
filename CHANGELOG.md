@@ -9,6 +9,7 @@ All notable changes to this project are documented in this file. The format foll
 ### Fixed
 
 - Outbound HTTP calls from NetBox no longer forward a client's `baggage` header: inbound baggage is dropped and only the trace context is propagated, with traces on or metrics only. `OTEL_PROPAGATORS` still selects the trace-context format ([#1](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/1)).
+- `django.request` records for 4xx and 5xx responses, and other records Django writes after the request span has ended, now carry the request's trace id and span id ([#12](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/12)).
 
 ## [0.2.1] - 2026-09-28
 

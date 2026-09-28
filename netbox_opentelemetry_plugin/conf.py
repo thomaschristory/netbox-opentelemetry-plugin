@@ -41,6 +41,7 @@ DEFAULTS: dict[str, Any] = {
         "timeout": 10,
         "insecure": None,
         "certificate": None,
+        "insecure_skip_verify": False,
     },
     "service_name": "netbox",
     "resource_attributes": {},
@@ -95,6 +96,7 @@ class ExporterConfig:
     timeout: float = 10.0
     insecure: bool | None = None
     certificate: str | None = None
+    insecure_skip_verify: bool = False
 
     def redacted(self) -> dict[str, Any]:
         return {
@@ -104,6 +106,7 @@ class ExporterConfig:
             "timeout": self.timeout,
             "insecure": self.insecure,
             "certificate": self.certificate,
+            "insecure_skip_verify": self.insecure_skip_verify,
         }
 
     def __repr__(self) -> str:
@@ -377,6 +380,15 @@ def resolve_exporter(
     certificate = _pick(exporter_section, "certificate", env, env_names("CERTIFICATE"), None, _parse_str)
     if certificate is not None and not isinstance(certificate, str):
         raise ConfigError("exporter.certificate must be a file path")
+    # PLUGINS_CONFIG only: the OpenTelemetry spec defines no environment variable for this.
+    skip_verify = exporter_section.get("insecure_skip_verify")
+    if skip_verify is None:
+        skip_verify = defaults["insecure_skip_verify"]
+    skip_verify = _typed(skip_verify, bool, "exporter.insecure_skip_verify")
+    if skip_verify and protocol == "grpc":
+        raise ConfigError("exporter.insecure_skip_verify is not supported over grpc; use exporter.certificate instead")
+    if skip_verify and certificate is not None:
+        raise ConfigError("exporter.insecure_skip_verify and exporter.certificate cannot both be set")
 
     return ExporterConfig(
         endpoint=endpoint,
@@ -385,6 +397,7 @@ def resolve_exporter(
         timeout=float(timeout),
         insecure=insecure,
         certificate=certificate,
+        insecure_skip_verify=skip_verify,
     )
 
 

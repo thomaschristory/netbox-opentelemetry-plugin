@@ -552,3 +552,45 @@ def test_logs_config_has_no_exporter_alias():
     assert not hasattr(s.logs, "exporter")
     assert "exporter" not in s.logs.redacted()
     assert s.redacted()["log_exporter"]["endpoint"] == "http://collector:4318/v1/logs"
+
+
+def test_insecure_skip_verify_defaults_to_false():
+    s = conf.resolve({}, ENDPOINT_ENV)
+    assert s.log_exporter.insecure_skip_verify is False
+    assert s.log_exporter.redacted()["insecure_skip_verify"] is False
+
+
+def test_insecure_skip_verify_true_is_respected():
+    user = {"exporter": {"insecure_skip_verify": True}, "traces": {"enabled": True}, "metrics": {"enabled": True}}
+    s = conf.resolve(user, ENDPOINT_ENV)
+    assert s.log_exporter.insecure_skip_verify is True
+    assert s.traces.exporter.insecure_skip_verify is True
+    assert s.metrics.exporter.insecure_skip_verify is True
+    assert s.warnings == ()
+
+
+def test_insecure_skip_verify_must_be_bool():
+    with pytest.raises(conf.ConfigError, match="exporter.insecure_skip_verify"):
+        conf.resolve_exporter("logs", {}, {"insecure_skip_verify": "yes"}, ENDPOINT_ENV)
+
+
+def test_insecure_skip_verify_is_rejected_over_grpc():
+    with pytest.raises(conf.ConfigError, match="not supported over grpc"):
+        conf.resolve_exporter("logs", {}, {"insecure_skip_verify": True, "protocol": "grpc"}, ENDPOINT_ENV)
+
+
+def test_insecure_skip_verify_with_certificate_is_rejected():
+    section = {"insecure_skip_verify": True, "certificate": "/etc/ssl/ca.pem"}
+    with pytest.raises(conf.ConfigError, match="exporter.certificate"):
+        conf.resolve_exporter("logs", {}, section, ENDPOINT_ENV)
+
+
+def test_insecure_skip_verify_with_env_certificate_is_rejected():
+    env = {"OTEL_EXPORTER_OTLP_CERTIFICATE": "/etc/ssl/ca.pem", **ENDPOINT_ENV}
+    with pytest.raises(conf.ConfigError, match="exporter.certificate"):
+        conf.resolve_exporter("logs", {}, {"insecure_skip_verify": True}, env)
+
+
+def test_insecure_skip_verify_is_not_read_from_the_environment():
+    env = {"OTEL_EXPORTER_OTLP_INSECURE_SKIP_VERIFY": "true", **ENDPOINT_ENV}
+    assert conf.resolve({}, env).log_exporter.insecure_skip_verify is False

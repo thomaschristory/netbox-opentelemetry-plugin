@@ -26,6 +26,7 @@ import traceback
 from collections.abc import Mapping
 
 import opentelemetry.context
+import requests
 from opentelemetry import metrics as metrics_api
 from opentelemetry import trace
 from opentelemetry._logs import LogRecord, SeverityNumber, get_logger_provider
@@ -98,6 +99,37 @@ def _grpc_credentials(cfg: ExporterConfig):
         return grpc.ssl_channel_credentials(fh.read())
 
 
+class _NoVerifySession(requests.Session):
+    """A session that never verifies the server's TLS certificate (exporter.insecure_skip_verify).
+
+    The OTLP HTTP exporters pass verify=<certificate_file or True> on every request, and treat a
+    falsy certificate_file as unset, so verification can only be turned off by overriding it here.
+    """
+
+    def request(self, method, url, *args, **kwargs):
+        kwargs["verify"] = False
+        return super().request(method, url, *args, **kwargs)
+
+
+# (pid, endpoint) pairs already warned about, so each process warns once per endpoint.
+_skip_verify_warned: set[tuple[int, str]] = set()
+
+
+def _http_session(cfg: ExporterConfig) -> requests.Session | None:
+    if not cfg.insecure_skip_verify:
+        return None
+    endpoint = cfg.redacted()["endpoint"]
+    key = (os.getpid(), endpoint)
+    if key not in _skip_verify_warned:
+        _skip_verify_warned.add(key)
+        logger.warning(
+            "TLS certificate verification is disabled for %s (exporter.insecure_skip_verify); "
+            "the Collector's identity is not checked",
+            endpoint,
+        )
+    return _NoVerifySession()
+
+
 def build_log_exporter(cfg: ExporterConfig) -> LogRecordExporter:
     if cfg.protocol == "grpc":
         from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
@@ -121,6 +153,7 @@ def build_log_exporter(cfg: ExporterConfig) -> LogRecordExporter:
         headers=dict(cfg.headers),
         timeout=cfg.timeout,
         certificate_file=cfg.certificate,
+        session=_http_session(cfg),
     )
 
 
@@ -308,6 +341,7 @@ def build_span_exporter(cfg: ExporterConfig) -> SpanExporter:
         headers=dict(cfg.headers),
         timeout=cfg.timeout,
         certificate_file=cfg.certificate,
+        session=_http_session(cfg),
     )
 
 
@@ -754,6 +788,7 @@ def build_metric_exporter(cfg: ExporterConfig) -> MetricExporter:
         headers=dict(cfg.headers),
         timeout=cfg.timeout,
         certificate_file=cfg.certificate,
+        session=_http_session(cfg),
     )
 
 

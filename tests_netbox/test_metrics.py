@@ -161,7 +161,16 @@ class HttpClientMetricsTest(MetricsMixin, APITestCase):
         self.assertNotIn("baggage", headers)
         self.assertNotIn("otel-secret-baggage", repr(headers))
         points = data_points(self.collect(), "http.client.request.duration")
-        self.assertTrue(any(p.attributes.get("server.address") == "127.0.0.1" for p in points))
+        # The class shares one cumulative reader, so the sibling test's refused call to 127.0.0.1 may
+        # already be in it; only a successful point without error.type is the feed fetch.
+        self.assertTrue(
+            any(
+                p.attributes.get("server.address") == "127.0.0.1"
+                and p.attributes.get("http.response.status_code") == 200
+                and "error.type" not in p.attributes
+                for p in points
+            )
+        )
 
 
 class ChangeCounterTest(MetricsMixin, APITestCase):

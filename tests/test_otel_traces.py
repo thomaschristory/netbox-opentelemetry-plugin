@@ -632,17 +632,30 @@ def test_baggage_free_extract_without_a_context_ignores_the_current_baggage():
 
 
 def test_baggage_free_wrapping_an_empty_composite():
+    # OTEL_PROPAGATORS=none: CompositePropagator([]).extract returns its context argument, None here.
+    # extract must then return an empty Context, not the caller's current one (span and baggage).
     from opentelemetry import baggage, context
     from opentelemetry.propagators.composite import CompositePropagator
 
     propagator = otel.BaggageFreePropagator(CompositePropagator([]))
-    ctx = propagator.extract({"traceparent": _TRACEPARENT, "baggage": "leak=secret"})
-    assert isinstance(ctx, context.Context)
-    assert dict(baggage.get_all(ctx)) == {}
-    carrier: dict = {}
-    token = context.attach(baggage.set_baggage("leak", "secret", _remote_parent()))
+    token = context.attach(baggage.set_baggage("k", "v", _remote_parent()))
     try:
-        propagator.inject(carrier)
+        ctx = propagator.extract({"traceparent": _TRACEPARENT, "baggage": "leak=secret"})
+    finally:
+        context.detach(token)
+    assert isinstance(ctx, context.Context)
+    assert not trace.get_current_span(ctx).get_span_context().is_valid
+    assert dict(baggage.get_all(ctx)) == {}
+
+
+def test_baggage_free_wrapping_an_empty_composite_injects_nothing():
+    from opentelemetry import context
+    from opentelemetry.propagators.composite import CompositePropagator
+
+    carrier: dict = {}
+    token = context.attach(_remote_parent())
+    try:
+        otel.BaggageFreePropagator(CompositePropagator([])).inject(carrier)
     finally:
         context.detach(token)
     assert carrier == {}

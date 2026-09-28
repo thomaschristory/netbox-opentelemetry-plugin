@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-28
+
 ### Added
 
 - `exporter.insecure_skip_verify`: send OTLP over HTTPS without verifying the Collector's certificate, for Collectors behind a self-signed certificate. HTTP only; rejected over gRPC and together with `exporter.certificate`. Logs a warning once per process and endpoint when on ([#10](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/10)).
@@ -25,5 +27,6 @@ All notable changes to this project are documented in this file. The format foll
 - Reuse of an OpenTelemetry SDK already configured outside the plugin (for example by `opentelemetry-instrument`).
 - NetBox 4.7 support.
 
-[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/releases/tag/v0.1.0

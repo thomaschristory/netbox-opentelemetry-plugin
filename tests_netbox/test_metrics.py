@@ -29,6 +29,7 @@ from netbox_opentelemetry_plugin.conf import MetricsConfig, RqConfig, TracesConf
 from netbox_opentelemetry_plugin.modules.rq import JOB_DURATION, JOBS, QUEUE_DEPTH, RqModule
 from netbox_opentelemetry_plugin.modules.traces import TracesModule
 from tests.otel_helpers import data_points, metric_names
+from tests_netbox import rss_feed
 
 TEST_QUEUE = "netbox-otel-metrics-test"
 
@@ -143,6 +144,24 @@ class HttpClientMetricsTest(MetricsMixin, APITestCase):
         self.assertTrue(points)
         self.assertTrue(any(p.attributes.get("error.type") for p in points))
         self.assertNotIn("s3cret", repr(data))
+
+    def test_outbound_call_forwards_neither_trace_context_nor_baggage_with_traces_off(self):
+        self.client.force_login(self.user)
+        with rss_feed.FeedServer() as feed:
+            rss_feed.use_feed_dashboard(self.user, feed.url)
+            response = self.client.get(
+                "/",
+                HTTP_TRACEPARENT="00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                HTTP_BAGGAGE="leak=otel-secret-baggage",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(feed.received_headers), 1)
+        headers = feed.received_headers[0]
+        self.assertNotIn("traceparent", headers)
+        self.assertNotIn("baggage", headers)
+        self.assertNotIn("otel-secret-baggage", repr(headers))
+        points = data_points(self.collect(), "http.client.request.duration")
+        self.assertTrue(any(p.attributes.get("server.address") == "127.0.0.1" for p in points))
 
 
 class ChangeCounterTest(MetricsMixin, APITestCase):

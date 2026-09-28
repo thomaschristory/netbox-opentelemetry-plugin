@@ -33,7 +33,7 @@ An instrumentor that is only needed for its metrics, either because traces are o
 
 - No span is started by that instrumentor.
 - An inbound trace context is not made current from it, and nothing is forwarded from it on an outbound call: with traces off, log and audit records written while handling a request that carried a `traceparent` header have no trace id, and an outbound `requests` call from that same request sends no `traceparent`.
-- Inbound W3C baggage is a separate mechanism from the span: Django's instrumentor extracts and attaches it to the request's context regardless of the tracer, so it is not removed from the context just because tracing is off, and the requests instrumentor still forwards it on an outbound call from that same context. See [Traces, outbound baggage](traces.md#outbound-baggage).
+- Inbound baggage is dropped as well, and nothing is forwarded from it: Django's instrumentor extracts the request context through the global propagator whatever the tracer, and the plugin's wrapper around that propagator never extracts or injects baggage. See [Traces, baggage](traces.md#baggage).
 
 ## Export interval and temporality
 

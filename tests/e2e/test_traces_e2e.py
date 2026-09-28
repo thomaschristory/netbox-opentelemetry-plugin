@@ -12,7 +12,7 @@ import uuid
 import pytest
 import requests
 
-from tests.e2e.collector import log_records, record_attr, spans, string_attr
+from tests.e2e.collector import log_records, record_attr, session_login, spans, string_attr
 from tests.e2e.netbox_api import _headers, delete_token, provision_token
 
 pytestmark = pytest.mark.e2e
@@ -202,3 +202,43 @@ def test_webhook_fired_by_an_edit_shares_the_edit_trace(header):
             _safe_delete(f"/api/extras/event-rules/{rule['id']}/", header)
         if webhook is not None:
             _safe_delete(f"/api/extras/webhooks/{webhook['id']}/", header)
+
+
+def test_dashboard_feed_fetch_carries_the_request_trace_but_not_its_baggage(header):
+    # The sink echoes the traceparent trace id and the baggage it was fetched with into the feed's
+    # item title, which the RSS widget renders on the home page.
+    feed = f"http://webhook-sink:8080/feed?run={uuid.uuid4().hex}"
+    session = session_login(NETBOX_URL, "admin", "admin")
+    session.get(f"{NETBOX_URL}/", timeout=15).raise_for_status()  # creates the user's dashboard
+    widget = str(uuid.uuid4())
+    original = _call("GET", "/api/extras/dashboard/", header).json()
+    _call(
+        "PATCH",
+        "/api/extras/dashboard/",
+        header,
+        json={
+            "layout": [{"id": widget, "x": 0, "y": 0, "w": 4, "h": 3}],
+            "config": {
+                widget: {
+                    "class": "extras.RSSFeedWidget",
+                    "title": "otel",
+                    "config": {"feed_url": feed, "max_entries": 1, "cache_timeout": 600, "request_timeout": 3},
+                }
+            },
+        },
+    )
+    try:
+        trace_id, traceparent = _traceparent()
+        page = session.get(
+            f"{NETBOX_URL}/",
+            headers={"traceparent": traceparent, "baggage": f"leak={SECRET}"},
+            timeout=15,
+        )
+        page.raise_for_status()
+        assert "otel-probe" in page.text, "the RSS widget did not render the sink's feed"
+        assert f"tp={trace_id}" in page.text
+        assert "bag=none" in page.text
+        assert SECRET not in page.text
+    finally:
+        restore = {"layout": original["layout"], "config": original["config"]}
+        _call("PATCH", "/api/extras/dashboard/", header, json=restore)

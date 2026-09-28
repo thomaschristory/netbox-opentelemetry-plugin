@@ -27,11 +27,13 @@ from collections.abc import Mapping
 
 import opentelemetry.context
 import requests
+from opentelemetry import baggage as baggage_api
 from opentelemetry import metrics as metrics_api
 from opentelemetry import trace
 from opentelemetry._logs import LogRecord, SeverityNumber, get_logger_provider
 from opentelemetry.context import Context
 from opentelemetry.metrics import MeterProvider, NoOpMeterProvider, Observation
+from opentelemetry.propagators import textmap
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import (
     BatchLogRecordProcessor,
@@ -649,6 +651,48 @@ def extract_trace_context(carrier: object) -> Context | None:
     if not clean:
         return None
     return _TRACECONTEXT.extract(clean)
+
+
+class BaggageFreePropagator(textmap.TextMapPropagator):
+    """Delegates trace-context propagation to the configured propagator, never baggage.
+
+    Baggage is cleared at the Context level, so every format that goes through the baggage API
+    (W3C baggage, jaeger uberctx-*, OT ot-baggage-*) is dropped, while tracecontext, b3, xray and
+    other trace-context formats still flow through the delegate.
+    """
+
+    def __init__(self, delegate: textmap.TextMapPropagator) -> None:
+        self._delegate = delegate
+
+    def extract(self, carrier, context=None, getter=textmap.default_getter) -> Context:
+        extracted = self._delegate.extract(carrier, context, getter=getter)
+        if extracted is None:  # CompositePropagator([]) (OTEL_PROPAGATORS=none) returns the input context
+            extracted = context if context is not None else Context()
+        result = baggage_api.clear(extracted)
+        if context is not None:  # keep the caller's own baggage, none from the carrier
+            for name, value in baggage_api.get_all(context).items():
+                result = baggage_api.set_baggage(name, value, result)
+        return result
+
+    def inject(self, carrier, context=None, setter=textmap.default_setter) -> None:
+        # clear(None) copies the current context without baggage; the current span is kept.
+        self._delegate.inject(carrier, baggage_api.clear(context), setter=setter)
+
+    @property
+    def fields(self) -> set[str]:
+        return self._delegate.fields
+
+
+def install_baggage_free_propagator() -> None:
+    """Wrap the global propagator in a BaggageFreePropagator. Idempotent.
+
+    Raises if the configured propagator cannot be loaded (a bad OTEL_PROPAGATORS).
+    """
+    from opentelemetry import propagate  # lazy: importing it loads OTEL_PROPAGATORS and can raise
+
+    current = propagate.get_global_textmap()
+    if not isinstance(current, BaggageFreePropagator):
+        propagate.set_global_textmap(BaggageFreePropagator(current))
 
 
 def start_span(provider, scope: str, version: str, name: str, *, kind, parent, attributes: Mapping):

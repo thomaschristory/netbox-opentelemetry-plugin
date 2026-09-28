@@ -25,7 +25,7 @@ from netbox_opentelemetry_plugin.conf import RqConfig, TracesConfig
 from netbox_opentelemetry_plugin.modules import rq as rq_module
 from netbox_opentelemetry_plugin.modules.rq import RqModule
 from netbox_opentelemetry_plugin.modules.traces import TracesModule
-from tests_netbox import jobs
+from tests_netbox import jobs, rss_feed
 
 # Not one of NetBox's queues, so the dev stack's own worker never takes these jobs.
 TEST_QUEUE = "netbox-otel-test"
@@ -194,3 +194,24 @@ class JobSpanTest(TracingMixin, APITestCase):
         self.assertEqual(span.attributes["netbox.job.id"], netbox_job.pk)
         self.assertEqual(span.attributes["netbox.job.name"], "otel integration")
         self.assertIsNone(span.parent)
+
+
+class OutboundBaggageTest(TracingMixin, APITestCase):
+    def test_outbound_call_carries_the_trace_context_but_not_inbound_baggage(self):
+        inbound_trace_id = 0x0AF7651916CD43DD8448EB211C80319C
+        self.client.force_login(self.user)
+        with rss_feed.FeedServer() as feed:
+            rss_feed.use_feed_dashboard(self.user, feed.url)
+            response = self.client.get(
+                "/",
+                HTTP_TRACEPARENT=f"00-{inbound_trace_id:032x}-b7ad6b7169203331-01",
+                HTTP_BAGGAGE="leak=otel-secret-baggage",
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(feed.received_headers), 1)
+        headers = feed.received_headers[0]
+        span = self.server_span()
+        self.assertEqual(span.context.trace_id, inbound_trace_id)
+        self.assertEqual(headers["traceparent"].split("-")[1], f"{inbound_trace_id:032x}")
+        self.assertNotIn("baggage", headers)
+        self.assertNotIn("otel-secret-baggage", repr(headers))

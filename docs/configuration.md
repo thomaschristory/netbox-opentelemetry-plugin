@@ -12,7 +12,7 @@ For every setting, in order: an explicit `PLUGINS_CONFIG` value, then a signal-s
 
 Two things do not fit that simple per-key picture:
 
-- The `exporter.*` values in `PLUGINS_CONFIG` (`protocol`, `headers`, `timeout`, `insecure`, `certificate`) apply to every signal at once, and an explicit `exporter.*` value beats even a signal-specific environment variable such as `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`.
+- The `exporter.*` values in `PLUGINS_CONFIG` (`protocol`, `headers`, `timeout`, `insecure`, `certificate`, `insecure_skip_verify`) apply to every signal at once, and an explicit `exporter.*` value beats even a signal-specific environment variable such as `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`.
 - The plugin has no per-signal `headers` or `timeout` setting of its own in `PLUGINS_CONFIG`. To give one signal its own headers or timeout, use the signal-specific environment variable (`OTEL_EXPORTER_OTLP_<SIGNAL>_HEADERS`, `OTEL_EXPORTER_OTLP_<SIGNAL>_TIMEOUT`) instead, and leave `exporter.headers` / `exporter.timeout` unset in `PLUGINS_CONFIG`.
 
 ## Endpoints
@@ -43,6 +43,7 @@ Every key in `conf.DEFAULTS`, its default, and its environment fallback if it ha
 | `exporter.timeout` | `10` | `OTEL_EXPORTER_OTLP_<SIGNAL>_TIMEOUT`, then `OTEL_EXPORTER_OTLP_TIMEOUT` | Export request timeout, in seconds. The environment variable is read as seconds too by the installed OTLP exporters (the published OpenTelemetry specification names this variable in milliseconds, but the Python exporters this plugin uses treat the value as seconds, and the plugin does not convert it). |
 | `exporter.insecure` | `None` | `OTEL_EXPORTER_OTLP_<SIGNAL>_INSECURE`, then `OTEL_EXPORTER_OTLP_INSECURE` | gRPC only, ignored over HTTP. `None` (the default) is inferred from the endpoint's URL scheme: an `https://` endpoint resolves to a secure channel, an `http://` endpoint to an insecure one, and an endpoint with no recognized scheme (a bare `host:port`, as gRPC endpoints are often written) also resolves to a secure channel. An `https://` endpoint is always forced to a secure channel, even if `insecure` is explicitly set to `True`. |
 | `exporter.certificate` | `None` | `OTEL_EXPORTER_OTLP_<SIGNAL>_CERTIFICATE`, then `OTEL_EXPORTER_OTLP_CERTIFICATE` | Path to a CA certificate file. Over gRPC, its bytes are read once when the exporter is built (`otel._grpc_credentials`, at startup and again after every fork that rebuilds the exporter); a missing file fails that build, and rotating the certificate on disk needs a restart (or a fork rebuild) to take effect. This has no effect if `insecure` ends up `True`. Over HTTP, the path is passed straight through as the exporter's `certificate_file`, which the underlying HTTP client reads when it opens the TLS connection for each export, not when the exporter is built; a missing file only fails at export time, and rotating the certificate on disk is picked up on the exporter's next connection, without a restart. |
+| `exporter.insecure_skip_verify` | `False` | none | HTTP only. `True` sends every export without checking the Collector's TLS certificate (chain, expiry and host name), for a Collector behind a self-signed certificate whose CA file is not at hand; prefer `certificate` whenever the CA file is available. Anyone able to intercept the connection can then read everything exported, including the `headers` values, so the plugin logs one warning per process and endpoint when it is on. Rejected as a configuration error over gRPC, since the gRPC Python client has no way to skip verification, and when `certificate` also resolves (from `PLUGINS_CONFIG` or an `OTEL_*_CERTIFICATE` variable), since the two contradict each other. The OpenTelemetry specification defines no environment variable for this, so it is read from `PLUGINS_CONFIG` only. |
 | `service_name` | `"netbox"` | `OTEL_SERVICE_NAME` | The `service.name` resource attribute on every span, log record and metric point. |
 | `resource_attributes` | `{}` | - | Dict of string keys to string, bool, int or float values, added to the Resource on every signal. The OpenTelemetry SDK separately merges `OTEL_RESOURCE_ATTRIBUTES` from the environment underneath this; both this setting and the plugin's own resource keys (`service.name`, `service.version`, and so on) win over an environment attribute of the same name. See [How it works](how-it-works.md). |
 | `logs.enabled` | `True` | - | Switches the logs signal on or off. |
@@ -83,7 +84,7 @@ The plugin resolves `PLUGINS_CONFIG` once per process, and a bad value never sto
 
 - An unknown key logs one warning and is otherwise ignored (this does not apply inside `exporter.headers` or `resource_attributes`, whose keys are chosen by the operator).
 - A wrong type or an invalid value inside `logs`, `audit`, `traces`, `metrics` or `rq` disables only that section, with one warning; the rest of the plugin keeps running.
-- An invalid `exporter.*` value (`protocol`, `timeout`, `headers`, `insecure`, `certificate`) is resolved separately for each enabled signal, so it disables every enabled signal that uses the exporter, each with its own warning: logs and audit together (they share one exporter), traces, and metrics, whichever of those are enabled. A signal that is off to begin with is not affected, since its exporter is never resolved.
+- An invalid `exporter.*` value (`protocol`, `timeout`, `headers`, `insecure`, `certificate`, `insecure_skip_verify`) is resolved separately for each enabled signal, so it disables every enabled signal that uses the exporter, each with its own warning: logs and audit together (they share one exporter), traces, and metrics, whichever of those are enabled. A signal that is off to begin with is not affected, since its exporter is never resolved.
 - An invalid top-level value (`enabled`, `service_name`, `resource_attributes` or `exporter` not of the expected type) disables the whole plugin, with one warning.
 - A signal with no endpoint that resolves at all logs one warning and disables itself; the other signals are unaffected.
 - The resolved configuration is logged once at `DEBUG` level, with every header value replaced and any URL credentials in an endpoint replaced by `***`.
@@ -114,6 +115,19 @@ PLUGINS_CONFIG = {
             "protocol": "grpc",
             "headers": {"authorization": "Bearer secret-token"},
             "certificate": "/etc/ssl/certs/otel-ca.pem",
+        },
+    },
+}
+```
+
+HTTP to a Collector behind a self-signed certificate, without verifying it (see `exporter.insecure_skip_verify` above before using this outside a lab):
+
+```python
+PLUGINS_CONFIG = {
+    "netbox_opentelemetry_plugin": {
+        "exporter": {
+            "endpoint": "https://collector.lab.example:4318",
+            "insecure_skip_verify": True,
         },
     },
 }

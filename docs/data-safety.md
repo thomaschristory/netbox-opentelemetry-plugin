@@ -30,6 +30,10 @@ Audit records, the one signal that can include the full field values of a change
 - An endpoint URL's credentials (`https://user:pass@host/...`) are masked to `https://***@host/...` in the DEBUG-level configuration dump and in warning and exception text, by stripping the URL's own userinfo component before logging (`conf._redact_userinfo`).
 - On top of that, warning and exception messages the plugin builds around a caught setup or fork failure (`bootstrap._describe`, used for every warning logged from inside such an `except` block) run two additional regular expressions over the (already length-bounded) text: one matching a `word:word@` shape and one matching a bare `//word@` shape, either of which gets masked to `***@`, whatever produced the text. This is deliberately broader than "is this actually a valid URL userinfo": it favours false positives, masking some text that only happens to look like credentials, over ever leaving real credentials expressed in that shape unmasked in a warning.
 
+## TLS verification
+
+By default every HTTPS or TLS gRPC export verifies the Collector's certificate. With `exporter.insecure_skip_verify = True` (HTTP only), it does not: anyone able to intercept the connection between NetBox and the Collector can read or alter everything exported, header values included, and the plugin cannot tell. The plugin logs one warning per process and endpoint when this is on. `urllib3` also emits its own `InsecureRequestWarning` through Python's `warnings` module; the plugin leaves that alone, since filtering it would be process-wide and would also hide it for NetBox's own outbound requests. Use `exporter.certificate` with the Collector's CA file instead whenever that file is available.
+
 ## What a provider configured outside the plugin changes
 
 When a `TracerProvider`, `MeterProvider` or `LoggerProvider` is already set globally before NetBox starts (for example under `opentelemetry-instrument`) and the plugin reuses it instead of building its own (see [How it works](how-it-works.md#an-sdk-configured-outside-the-plugin)), several of the guarantees above stop being the plugin's to enforce:

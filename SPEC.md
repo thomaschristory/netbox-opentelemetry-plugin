@@ -135,6 +135,7 @@ PLUGINS_CONFIG = {
             "timeout": 10,  # OTEL_EXPORTER_OTLP_TIMEOUT (seconds)
             "insecure": None,  # defaults to inferred from the endpoint scheme, grpc only
             "certificate": None,  # OTEL_EXPORTER_OTLP_CERTIFICATE
+            "insecure_skip_verify": False,  # http only, no env var; logs a warning when True
         },
         "service_name": "netbox",  # OTEL_SERVICE_NAME
         "resource_attributes": {},  # OTEL_RESOURCE_ATTRIBUTES

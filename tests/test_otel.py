@@ -263,3 +263,56 @@ def test_build_logger_provider_sets_max_queue_size(resource):
     processor = provider._multi_log_record_processor._log_record_processors[0]
     assert processor._batch_processor._max_queue_size == 12345
     provider.shutdown()
+
+
+def _skip_verify_cfg(endpoint="https://collector:4318/v1/logs"):
+    return ExporterConfig(endpoint, "http/protobuf", {}, 3.0, insecure_skip_verify=True)
+
+
+@pytest.mark.parametrize(
+    "build", [otel.build_log_exporter, otel.build_span_exporter, otel.build_metric_exporter], ids=lambda b: b.__name__
+)
+def test_http_exporters_skip_verification_when_asked(build, monkeypatch):
+    import requests
+
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    seen = {}
+
+    def fake_send(self, request, **kwargs):
+        seen["verify"] = kwargs.get("verify")
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b""
+        return response
+
+    monkeypatch.setattr(requests.Session, "send", fake_send)
+    exporter = build(_skip_verify_cfg())
+    # The exporter passes verify=True (its default) per request; the session must override it.
+    exporter._session.post("https://collector:4318/v1/logs", data=b"", verify=True)
+    assert seen["verify"] is False
+    exporter.shutdown()
+
+
+def test_http_exporter_verifies_by_default(monkeypatch):
+    exporter = otel.build_log_exporter(ExporterConfig("https://collector:4318/v1/logs", "http/protobuf", {}, 3.0))
+    assert not isinstance(exporter._session, otel._NoVerifySession)
+    exporter.shutdown()
+
+
+def test_skip_verify_warns_once_per_process_and_endpoint(monkeypatch, caplog):
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    caplog.set_level(logging.WARNING, logger="netbox_opentelemetry_plugin")
+    for _ in range(2):
+        otel.build_log_exporter(_skip_verify_cfg()).shutdown()
+    otel.build_span_exporter(_skip_verify_cfg("https://collector:4318/v1/traces")).shutdown()
+    messages = [r.getMessage() for r in caplog.records if "certificate verification is disabled" in r.getMessage()]
+    assert len(messages) == 2
+    assert "https://collector:4318/v1/logs" in messages[0]
+
+
+def test_skip_verify_warning_redacts_endpoint_userinfo(monkeypatch, caplog):
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    caplog.set_level(logging.WARNING, logger="netbox_opentelemetry_plugin")
+    otel.build_log_exporter(_skip_verify_cfg("https://user:pass@collector:4318/v1/logs")).shutdown()
+    assert "user:pass" not in caplog.text
+    assert "https://***@collector:4318/v1/logs" in caplog.text

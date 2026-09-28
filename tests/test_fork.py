@@ -538,6 +538,30 @@ def test_tracer_rebuild_failure_stops_span_export_in_the_child(exporters, span_e
     }
 
 
+def test_rebuild_failure_without_an_owned_logger_provider_still_rewraps_the_propagator(monkeypatch):
+    from opentelemetry import propagate
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    # Log export and audit both off: the plugin owns no LoggerProvider in this process.
+    user = {**TRACES_USER, "logs": {"enabled": False}, "audit": {"enabled": False}}
+    bootstrap.install(user, env={}, argv=ARGV_WEB)
+    assert bootstrap._state.owns_logger_provider is False
+    assert isinstance(propagate.get_global_textmap(), otel.BaggageFreePropagator)
+    # Another plugin's ready() replaces the global propagator between ready() and fork.
+    propagate.set_global_textmap(TraceContextTextMapPropagator())
+
+    def boom(cfg):
+        raise OSError("certificate unreadable")
+
+    # Patched in the parent: the automatic at-fork hook in the child inherits it and fails.
+    monkeypatch.setattr(otel, "build_span_exporter", boom)
+
+    def probe():
+        return {"wrapped": isinstance(propagate.get_global_textmap(), otel.BaggageFreePropagator)}
+
+    assert _run_in_child(probe) == {"wrapped": True}
+
+
 def test_external_tracer_provider_is_not_rebuilt(exporters, monkeypatch):
     from opentelemetry.sdk.trace import TracerProvider
 

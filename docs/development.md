@@ -24,6 +24,7 @@ The stack is based on the netbox-docker image, with the plugin installed in edit
 | `make dev` | NetBox on Granian, the RQ worker, Postgres, two Valkey instances, the Collector and a webhook sink. |
 | `make dev-gunicorn` | The same, plus NetBox on gunicorn with `--preload`. |
 | `make dev-uwsgi` | The same, plus NetBox on uWSGI (pyuwsgi, master mode) behind nginx, laid out like NetBox's `contrib/uwsgi.ini`: uWSGI listens on a uwsgi-protocol socket and nginx forwards to it with `uwsgi_pass`. |
+| `make dev-ui` | The same as `make dev`, plus Grafana with Loki, Tempo and Prometheus (profile `ui`, see [Grafana UI](#grafana-ui)). |
 | `make down` | Stops every service of all profiles. |
 
 To run all three web servers at once, as the scheduled CI job does:
@@ -39,12 +40,45 @@ Ports on the host:
 | 8000 | NetBox on Granian |
 | 8001 | NetBox on gunicorn (profile `gunicorn`) |
 | 8002 | NetBox on uWSGI, through nginx (profile `uwsgi`) |
+| 3000 | Grafana (profile `ui`) |
 | 4317 | Collector, OTLP gRPC |
 | 4318 | Collector, OTLP HTTP |
 
 The NetBox superuser is `admin` with password `admin`.
 
 The Collector writes everything it receives to `dev/data/collector/` (`logs.json`, `traces.json`, `metrics.json`, one JSON document per line) and prints it with the `debug` exporter. `make logs-collector` follows the Collector's output. The files grow without limit; delete them while the stack is stopped if they get too large.
+
+### Grafana UI
+
+The `ui` profile adds [grafana/otel-lgtm](https://github.com/grafana/docker-otel-lgtm), one container with Grafana, Loki (logs), Tempo (traces) and Prometheus (metrics). The Collector then sends everything it receives to it over OTLP gRPC, in addition to the `debug` and `file` exporters, so the files in `dev/data/collector/` and the e2e tests work the same with or without it.
+
+```bash
+make dev-ui                 # Granian, as make dev
+make dev-gunicorn UI=1      # any dev target takes UI=1
+make dev-uwsgi UI=1
+```
+
+Grafana is on `http://localhost:3000` with anonymous access and the Admin role, so no login is needed. The `admin` user has the password `admin`. The data sources `Loki`, `Tempo` and `Prometheus` are provisioned by the image. NetBox telemetry has the service name `netbox`: in Explore, query Loki with `{service_name="netbox"}`, search Tempo for the service `netbox`, and query Prometheus for metrics such as `http_server_request_duration_seconds_count`. The image keeps its data inside the container, so it is lost when the container is recreated.
+
+Selecting a Collector configuration is not something a compose profile can do, so the profile comes with an override file. `make dev-ui` runs:
+
+```bash
+docker compose -f dev/docker-compose.yml -f dev/docker-compose.ui.yml --profile ui up -d --build
+```
+
+`dev/docker-compose.ui.yml` starts the Collector with a second `--config` flag that loads `dev/otelcol/ui.yaml` over `dev/otelcol/config.yaml`. That overlay adds the `otlp_grpc/lgtm` exporter to the three pipelines. Without the override the Collector has no exporter pointing at otel-lgtm, so the default stack does not depend on it and logs no export errors when it is absent. Using the override without `--profile ui` fails at once with `service "otel-collector" depends on undefined service "otel-lgtm"`. With `--profile ui` alone, Grafana starts but receives nothing.
+
+Running `make dev` after `make dev-ui` recreates the Collector with the default configuration and leaves otel-lgtm running; `make down` stops it.
+
+The Grafana, Loki, Tempo and Prometheus APIs can be queried through Grafana's data source proxy, without publishing more ports:
+
+```bash
+curl -s 'http://localhost:3000/api/datasources/proxy/uid/prometheus/api/v1/query' \
+  --data-urlencode 'query=count by (__name__) ({service_name="netbox"})'
+curl -s 'http://localhost:3000/api/datasources/proxy/uid/loki/loki/api/v1/query_range' \
+  --data-urlencode 'query={service_name="netbox"}' --data-urlencode 'limit=5'
+curl -s 'http://localhost:3000/api/datasources/proxy/uid/tempo/api/search?tags=service.name%3Dnetbox&limit=5'
+```
 
 ## Tests
 

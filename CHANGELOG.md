@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Dev stack: the `ui` compose profile runs `grafana/otel-lgtm` (Grafana, Loki, Tempo, Prometheus) with Grafana on port 3000, and `make dev-ui` starts it with a Collector overlay (`dev/otelcol/ui.yaml`, loaded by `dev/docker-compose.ui.yml`) that forwards logs, traces and metrics to it over OTLP. Other dev targets take `UI=1`. The default stack is unchanged ([#6](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/6)).
+
 ### Changed
 
 - `service.instance.id` is now `<hostname>-<pid>-<6 hex>`: a random suffix, generated once per process and again in every forked child, is appended to the hostname and PID. A restarted container that got the same hostname and PID used to report the same identity as the one it replaced, which the OpenTelemetry semantic conventions do not allow. Every process start now begins new metric series, so a backend holds more series over time; aggregate across `service.instance.id` rather than select one ([#5](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/5)).

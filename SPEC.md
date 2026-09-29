@@ -308,9 +308,9 @@ Known limitations:
 
 - `dev/docker-compose.yml`: `netboxcommunity/netbox:v4.7.1` (netbox-docker 5.1.1), worker, Postgres, Redis, `otelcol-contrib` with OTLP receiver and `debug` (verbosity detailed) and `file` (JSON) exporters.
 - Plugin mounted and installed editable (`uv pip install -e`) by an entrypoint wrapper.
-- Compose profiles: default (Granian), `gunicorn` (gunicorn with `--preload`, host port 8001), `uwsgi` (pyuwsgi master with forked workers on a uwsgi-protocol socket behind nginx, as in NetBox's `contrib/uwsgi.ini`, host port 8002), `ui` (`grafana/otel-lgtm`, Collector forwards to it; not implemented yet). The uWSGI threads warning path is covered by unit tests only, since pyuwsgi always has thread support.
+- Compose profiles: default (Granian), `gunicorn` (gunicorn with `--preload`, host port 8001), `uwsgi` (pyuwsgi master with forked workers on a uwsgi-protocol socket behind nginx, as in NetBox's `contrib/uwsgi.ini`, host port 8002), `ui` (`grafana/otel-lgtm`, Grafana on host port 3000; the Collector forwards to it through the overlay `dev/otelcol/ui.yaml`, loaded by the override `dev/docker-compose.ui.yml`, so the default stack never depends on it). The uWSGI threads warning path is covered by unit tests only, since pyuwsgi always has thread support.
 - `dev/scripts/otel_demo.py`: custom script logging at every level, touching objects, with an option to raise.
-- Make targets: `dev`, `dev-gunicorn`, `dev-uwsgi`, `down`, `test`, `e2e`, `lint`, `format`, `logs-collector`. `test-netbox` (NetBox integration tests) is added with the audit milestone.
+- Make targets: `dev`, `dev-gunicorn`, `dev-uwsgi` (each takes `UI=1`), `dev-ui`, `down`, `test`, `e2e`, `lint`, `format`, `logs-collector`. `test-netbox` (NetBox integration tests) is added with the audit milestone.
 
 ## 10. Testing
 

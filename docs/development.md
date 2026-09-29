@@ -40,7 +40,7 @@ Ports on the host:
 | 8000 | NetBox on Granian |
 | 8001 | NetBox on gunicorn (profile `gunicorn`) |
 | 8002 | NetBox on uWSGI, through nginx (profile `uwsgi`) |
-| 3000 | Grafana (profile `ui`) |
+| 3000 | Grafana (profile `ui`), on 127.0.0.1 only |
 | 4317 | Collector, OTLP gRPC |
 | 4318 | Collector, OTLP HTTP |
 
@@ -58,7 +58,7 @@ make dev-gunicorn UI=1      # any dev target takes UI=1
 make dev-uwsgi UI=1
 ```
 
-Grafana is on `http://localhost:3000` with anonymous access and the Admin role, so no login is needed. The `admin` user has the password `admin`. The data sources `Loki`, `Tempo` and `Prometheus` are provisioned by the image. NetBox telemetry has the service name `netbox`: in Explore, query Loki with `{service_name="netbox"}`, search Tempo for the service `netbox`, and query Prometheus for metrics such as `http_server_request_duration_seconds_count`. The image keeps its data inside the container, so it is lost when the container is recreated.
+The image is about 2.5 GB. Grafana is on `http://localhost:3000`, published on the loopback interface only, with anonymous access and the Admin role, so no login is needed. The `admin` user has the password `admin`. The data sources `Loki`, `Tempo` and `Prometheus` are provisioned by the image. NetBox telemetry has the service name `netbox`: in Explore, query Loki with `{service_name="netbox"}`, search Tempo for the service `netbox`, and query Prometheus for metrics such as `http_server_request_duration_seconds_count`. The image keeps its data inside the container, so it is lost when the container is recreated.
 
 ![NetBox logs in Grafana Explore, Loki data source](images/grafana-logs.png)
 

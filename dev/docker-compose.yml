@@ -174,8 +174,9 @@ services:
       # The image defaults, stated here: anonymous access with the Admin role, no login needed.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    # Loopback only: anyone reaching the port is a Grafana admin.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     # The image's own check (ready file, then each component's health endpoint), polled more
     # often than the image's 30 s so `up --wait` returns soon after the stack is ready.
     healthcheck:

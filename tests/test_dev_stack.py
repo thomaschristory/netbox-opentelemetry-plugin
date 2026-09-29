@@ -65,9 +65,9 @@ def test_otel_lgtm_service_is_pinned_and_only_in_the_ui_profile():
 
     assert lgtm["profiles"] == ["ui"]
     assert re.fullmatch(r"docker\.io/grafana/otel-lgtm:\d+\.\d+\.\d+", lgtm["image"])
-    assert "3000:3000" in lgtm["ports"]
-    # The Collector already publishes 4317 and 4318 on the host.
-    assert not any(port.split(":")[0] in {"4317", "4318"} for port in lgtm["ports"])
+    # Anonymous Admin access, so Grafana is published on the loopback interface only, and only
+    # Grafana: the Collector already publishes 4317 and 4318 on the host.
+    assert lgtm["ports"] == ["127.0.0.1:3000:3000"]
     assert "otel-lgtm" not in services["otel-collector"].get("depends_on", {})
 
 

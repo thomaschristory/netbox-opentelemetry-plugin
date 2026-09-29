@@ -111,7 +111,11 @@ class RqModule:
             # of one configured outside the plugin are not counted, so no flush could ever count as a
             # success and close the breaker again.
             breakers = {
-                signal: FlushBreaker(cfg.flush_breaker_threshold, cfg.flush_breaker_cooldown)
+                signal: FlushBreaker(
+                    cfg.flush_breaker_threshold,
+                    cfg.flush_breaker_cooldown,
+                    slow_seconds=slow_failure_seconds(cfg.flush_timeout, _exporter_timeout(ctx, signal)),
+                )
                 for signal in BREAKER_SIGNALS
                 if signal in ctx.counted_signals
             }
@@ -466,9 +470,22 @@ def _flush_horse(
             _warn_once("breaker", "OpenTelemetry: RQ work-horse flush breaker failed: %s", type(exc).__name__)
 
 
-def slow_failure_seconds(flush_timeout: float) -> float:
-    """Time failed exports must have taken for a flush that finished to count as failed."""
-    return min(1.0, 0.25 * flush_timeout)
+def slow_failure_seconds(flush_timeout: float, exporter_timeout: float | None = None) -> float:
+    """Time failed exports must have taken for a flush that finished to count as failed.
+
+    1 second, or a quarter of rq.flush_timeout or of the signal's exporter.timeout when that is
+    shorter. With a short exporter.timeout (about 1 s) an export to a refused connection gives up
+    after one backoff of 0.8 to 1.2 s, so a fixed 1 s bar would never be reached. An instant
+    rejection (a few milliseconds) stays below the bar in every case.
+    """
+    shortest = flush_timeout if exporter_timeout is None else min(flush_timeout, exporter_timeout)
+    return min(1.0, 0.25 * shortest)
+
+
+def _exporter_timeout(ctx: Context, signal: str) -> float | None:
+    settings = ctx.settings
+    exporter = settings.log_exporter if signal == otel.SIGNAL_LOGS else settings.traces.exporter
+    return getattr(exporter, "timeout", None)
 
 
 def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bool, before, after) -> None:
@@ -480,8 +497,7 @@ def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bo
     # instant rejection (HTTP 400, 401, 413) costs the worker nothing: skipping later flushes would
     # only drop records. Neither is counted, and neither resets a failure streak.
     failed_slowly = (
-        after.failed > before.failed
-        and after.failed_seconds - before.failed_seconds >= slow_failure_seconds(cfg.flush_timeout)
+        after.failed > before.failed and after.failed_seconds - before.failed_seconds >= breaker.slow_seconds
     )
     if not completed or (failed_slowly and not exported):
         if breaker.record_failure():
@@ -540,9 +556,11 @@ class FlushBreaker:
     an rq worker pool allocates its own page.
     """
 
-    def __init__(self, threshold: int, cooldown: float, clock=None) -> None:
+    def __init__(self, threshold: int, cooldown: float, clock=None, slow_seconds: float = 1.0) -> None:
         self._threshold = threshold
         self._cooldown = cooldown
+        # A flush that finished counts as failed only if its failed exports took at least this long.
+        self.slow_seconds = slow_seconds
         self._clock = clock
         self._mem: mmap.mmap | None = None
         self._owner: int | None = None

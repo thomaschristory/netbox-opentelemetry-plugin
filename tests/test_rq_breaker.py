@@ -247,6 +247,45 @@ def test_the_slow_threshold_follows_a_short_flush_timeout(stubs, outcomes, as_ho
     assert outcomes.flushed == [["logs"]] * 2 + [[]]
 
 
+def test_slow_failure_seconds_follows_the_shortest_timeout():
+    assert rq_module.slow_failure_seconds(5.0, 10.0) == 1.0
+    assert rq_module.slow_failure_seconds(0.4, 10.0) == pytest.approx(0.1)
+    assert rq_module.slow_failure_seconds(5.0, 1.0) == pytest.approx(0.25)
+    assert rq_module.slow_failure_seconds(0.4, 0.2) == pytest.approx(0.05)
+
+
+def test_the_slow_threshold_follows_a_short_exporter_timeout(stubs, outcomes, as_horse):  # noqa: F811
+    # exporter.timeout 1 s against a refused connection: the exporter waits one backoff of 0.8 to
+    # 1.0 s and gives up before the next one. Such a flush stays under 1 s but must count.
+    outcomes.results = [{"logs": (True, 0, 1, 0.9)}] * 4
+    user = {**USER, "exporter": {**USER["exporter"], "timeout": 1}}
+    bootstrap.install({**user, "rq": {"flush_breaker_threshold": 3, "flush_timeout": 5}}, env={}, argv=ARGV_RQ)
+    for _ in range(4):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 3 + [[]]
+
+
+def test_a_short_exporter_timeout_still_ignores_an_instant_rejection(stubs, outcomes, as_horse):  # noqa: F811
+    outcomes.results = [{"logs": (True, 0, 1, 0.01)}] * 3
+    user = {**USER, "exporter": {**USER["exporter"], "timeout": 1}}
+    bootstrap.install({**user, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
+    for _ in range(3):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 3
+
+
+def test_the_slow_threshold_uses_the_exporter_timeout_of_each_signal(stubs, outcomes, as_horse):  # noqa: F811
+    # OTEL_EXPORTER_OTLP_LOGS_TIMEOUT shortens only the logs exporter: 0.9 s counts for logs, while
+    # traces keep the 10 s default and so the 1 s threshold.
+    outcomes.results = [{"logs": (True, 0, 1, 0.9), "traces": (True, 0, 1, 0.9)}] * 3
+    bootstrap.install(
+        {**TRACES, "rq": {"flush_breaker_threshold": 2}}, env={"OTEL_EXPORTER_OTLP_LOGS_TIMEOUT": "1"}, argv=ARGV_RQ
+    )
+    for _ in range(3):
+        _run_horse()
+    assert outcomes.flushed == [["logs", "traces"]] * 2 + [["traces"]]
+
+
 def test_an_instant_rejection_does_not_count(stubs, outcomes, as_horse):  # noqa: F811
     # For example HTTP 413 for a horse's single oversized batch: the exporter gives up at once, so
     # the flush cost no time and skipping later flushes would gain nothing.

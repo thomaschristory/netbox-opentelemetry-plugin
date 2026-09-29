@@ -22,6 +22,9 @@ class Context:
     logger_provider: LoggerProvider | None = None
     tracer_provider: TracerProvider | None = None
     meter_provider: MeterProvider | None = None
+    # Signals ("logs", "traces") whose provider the plugin built, so otel.export_outcomes counts
+    # their exports. A provider configured outside the plugin is reused as is and not counted.
+    counted_signals: frozenset[str] = frozenset()
 
 
 class Module(Protocol):

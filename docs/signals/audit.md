@@ -66,7 +66,7 @@ With `include_data` on, the pre- and post-change data is read from the database 
 
 ## Background jobs
 
-Audit records for changes made inside an RQ job or custom script are flushed by the same mechanism as log lines (see [Logs](logs.md#background-jobs)): both wait on the work-horse before it exits, up to `rq.flush_timeout`.
+Audit records for changes made inside an RQ job or custom script are flushed by the same mechanism as log lines (see [Logs](logs.md#background-jobs)): both wait on the work-horse before it exits, up to `rq.flush_timeout`, and both are dropped in a horse that skips its flush during a Collector outage (see [Failure behaviour](../failure-behaviour.md#collector-outage-and-rq-throughput)).
 
 ## Failure handling
 

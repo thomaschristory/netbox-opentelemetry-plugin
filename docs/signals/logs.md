@@ -58,7 +58,7 @@ Records from `netbox_opentelemetry_plugin`, `opentelemetry`, `urllib3` and `grpc
 
 ## Background jobs
 
-Log lines written inside an RQ job or custom script run in the work-horse process. They are flushed, together with that horse's tracer provider, before the horse exits, waiting at most `rq.flush_timeout` seconds. See [How it works](../how-it-works.md#rq-work-horses) for the paths that SIGKILL a horse instead of letting it flush.
+Log lines written inside an RQ job or custom script run in the work-horse process. They are flushed, together with that horse's tracer provider, before the horse exits, waiting at most `rq.flush_timeout` seconds. During a Collector outage, horses skip this flush once `rq.flush_breaker_threshold` flushes in a row have failed (see [Failure behaviour](../failure-behaviour.md#collector-outage-and-rq-throughput)). See [How it works](../how-it-works.md#rq-work-horses) for the paths that SIGKILL a horse instead of letting it flush.
 
 ## Known limitations
 

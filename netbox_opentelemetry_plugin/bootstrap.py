@@ -286,19 +286,27 @@ def force_flush(timeout: float) -> bool:
     Each provider's flush runs on its own helper thread, in parallel, so a stuck export cannot
     hold the caller beyond the deadline.
     """
+    return all(flush_signals(timeout).values())
+
+
+def flush_signals(timeout: float, skip: frozenset[str] = frozenset()) -> dict[str, bool]:
+    """As force_flush, per signal: {"logs" | "traces" | "metrics": finished within the deadline}.
+
+    Only signals with a provider in this process, and not listed in `skip`, appear in the result;
+    an empty dict means there was nothing to flush. Never raises.
+    """
     state = _state
     if state is None or state.pid != os.getpid() or state.context is None:
-        return True
+        return {}
     ctx = state.context
-    flushables = [p for p in (ctx.logger_provider, ctx.tracer_provider) if p is not None]
-    if state.metrics_pipeline is not None:
-        # Never in a work-horse: it has no pipeline (SPEC 6.4).
-        flushables.append(state.metrics_pipeline)
-    if not flushables:
-        return True
+    candidates = [("logs", ctx.logger_provider), ("traces", ctx.tracer_provider)]
+    # Never in a work-horse: it has no pipeline (SPEC 6.4).
+    candidates.append(("metrics", state.metrics_pipeline))
+    flushables = [(signal, p) for signal, p in candidates if p is not None and signal not in skip]
+    results: dict[str, bool] = {}
     deadline = time.monotonic() + timeout
     done_events = []
-    for flushable in flushables:
+    for signal, flushable in flushables:
         done = threading.Event()
 
         def run(flushable=flushable, done=done) -> None:
@@ -313,10 +321,13 @@ def force_flush(timeout: float) -> bool:
             threading.Thread(target=run, name="otel-flush", daemon=True).start()
         except Exception:
             # Thread creation can fail (resource limits, interpreter finalization). Nothing was
-            # started, so there is nothing to wait on: report the flush as not completed.
-            return False
-        done_events.append(done)
-    return all(done.wait(max(0.0, deadline - time.monotonic())) for done in done_events)
+            # started, so there is nothing to wait on: report this flush as not completed.
+            results[signal] = False
+            continue
+        done_events.append((signal, done))
+    for signal, done in done_events:
+        results[signal] = done.wait(max(0.0, deadline - time.monotonic()))
+    return results
 
 
 def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> None:
@@ -454,6 +465,7 @@ def _setup_logger_provider(ctx: Context, state: _State) -> None:
         max_queue_size = AUDIT_QUEUE_SIZE if ctx.settings.audit.enabled else None
         ctx.logger_provider = otel.build_logger_provider(ctx.resource, exporter, max_queue_size=max_queue_size)
         state.owns_logger_provider = True
+        ctx.counted_signals = ctx.counted_signals | {otel.SIGNAL_LOGS}
     except Exception as exc:
         logger.warning("OpenTelemetry: log export disabled: could not build exporter: %s", _describe(exc, ctx.settings))
 
@@ -480,6 +492,7 @@ def _setup_tracer_provider(ctx: Context, state: _State) -> None:
         return
     ctx.tracer_provider = otel.SwitchableTracerProvider(provider)
     state.owns_tracer_provider = True
+    ctx.counted_signals = ctx.counted_signals | {otel.SIGNAL_TRACES}
 
 
 def _build_metrics_pipeline(settings: conf.Settings, resource) -> otel.MetricsPipeline:

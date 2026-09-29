@@ -894,6 +894,11 @@ class _GrpcReceiver:
         with self._cond:
             return {(r["signal"], n) for r in self._received if r["instance_id"] == instance_id for n in r["names"]}
 
+    def occurrences(self, signal: str, name: str) -> list[str]:
+        """The instance id of every delivery of `name` for `signal`, from any sender, repeats included."""
+        with self._cond:
+            return [r["instance_id"] for r in self._received if r["signal"] == signal for n in r["names"] if n == name]
+
     def count(self, instance_id: str, signal: str) -> int:
         """How many resources of `signal` arrived from `instance_id` (one per resource in each Export request)."""
         with self._cond:
@@ -975,6 +980,12 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
     is off by default), which is why the child never touches the inherited one.
     """
     built = _spy_on_exporter_builders(monkeypatch)
+    # Batch processors that never export on their own schedule (the defaults are 1 s for logs and 5 s
+    # for spans), so a record left unflushed is still queued at every fork below. Only an explicit
+    # force_flush exports. The SDK reads these when each processor is built, in the parent and in
+    # every child.
+    monkeypatch.setenv("OTEL_BLRP_SCHEDULE_DELAY", "3600000")
+    monkeypatch.setenv("OTEL_BSP_SCHEDULE_DELAY", "3600000")
     user = {
         "exporter": {"endpoint": grpc_receiver.endpoint, "protocol": "grpc", "timeout": 10},
         "logs": {"loggers": ["t.fork.grpc"]},
@@ -1001,10 +1012,14 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
 
     assert emit("parent")
     assert not grpc_receiver.missing(parent_id, expected("parent"))
-    # Left unflushed in the parent's batch queues when the children are forked. No child may send them.
+    # Left unflushed in the parent's batch queues when the children are forked. They carry the parent's
+    # Resource, so a child that exported the inherited queue would deliver them under parent_id, not
+    # under its own id. The final check therefore counts every delivery, whatever its instance id.
+    pending = (("logs", "log parent pending"), ("traces", "span parent pending"))
     lg.info("log parent pending")
     with tracer.start_as_current_span("span parent pending", kind=SpanKind.SERVER):
         pass
+    assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[], []]
 
     for n in range(GRPC_CHILDREN):
         tag = f"child {n}"
@@ -1028,8 +1043,11 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
         assert result["instance_id"].endswith(f"-{result['pid']}")
         assert result["instance_id"] != parent_id
         assert not grpc_receiver.missing(result["instance_id"], expected(tag))
-        # Nothing of the parent's was sent again under the child's identity.
+        # The child's own pipeline sent nothing of the parent's. This only covers records tagged with
+        # the child's id; a resend of the inherited queue is caught by the delivery count at the end.
         assert not {name for _, name in grpc_receiver.names(result["instance_id"]) if "parent" in name}
+        # Still only queued in the parent: neither the parent nor any child has delivered them.
+        assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[], []]
 
     # The metric name carries no tag and was already received from the parent, so the name check alone
     # would pass without a new export. Require one more metrics export from the parent.
@@ -1038,7 +1056,12 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
     assert not grpc_receiver.missing(parent_id, expected("parent after forks"))
     assert grpc_receiver.wait_count(parent_id, "metrics", metrics_before + 1) > metrics_before
     # The parent still delivers the records it held across the forks, under its own identity.
-    assert not grpc_receiver.missing(parent_id, {("logs", "log parent pending"), ("traces", "span parent pending")})
+    assert not grpc_receiver.missing(parent_id, set(pending))
+    # Each pending record was delivered exactly once, by the parent. The children have exited
+    # (_run_in_child waits for them), so any resend of theirs was already sent; the parent's flush
+    # returned after its own export. A short settle covers the receiver's stdout pipe.
+    time.sleep(1)
+    assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[parent_id], [parent_id]]
     assert {kind: len(exporters) for kind, exporters in built.items()} == {"logs": 1, "traces": 1, "metrics": 1}
 
 

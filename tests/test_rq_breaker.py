@@ -172,19 +172,20 @@ def test_state_written_by_one_forked_horse_is_seen_by_the_next():
 
 @pytest.fixture
 def outcomes(monkeypatch):
-    """Scripted horse flushes. Each entry of `results` is one horse: {signal: (finished, ok, failed)},
-    the flush result for that signal and the export results it adds. `flushed` records, per horse,
-    the signals that were actually flushed."""
-    state = SimpleNamespace(results=[], flushed=[], totals={"logs": [0, 0], "traces": [0, 0]})
+    """Scripted horse flushes. Each entry of `results` is one horse: {signal: (finished, ok, failed)}
+    or (finished, ok, failed, failed_seconds), the flush result for that signal and the export
+    results it adds. `flushed` records, per horse, the signals that were actually flushed."""
+    state = SimpleNamespace(results=[], flushed=[], totals={"logs": [0, 0, 0.0], "traces": [0, 0, 0.0]})
 
     def fake_flush(timeout, skip=frozenset()):
         script = state.results[len(state.flushed)]
         done = {}
-        for signal, (finished, exported_ok, exported_failed) in script.items():
+        for signal, (finished, exported_ok, exported_failed, *seconds) in script.items():
             if signal in skip:
                 continue
             state.totals[signal][0] += exported_ok
             state.totals[signal][1] += exported_failed
+            state.totals[signal][2] += seconds[0] if seconds else 0.0
             done[signal] = finished
         state.flushed.append(sorted(done))
         return done
@@ -227,13 +228,43 @@ def test_an_outage_of_one_signal_does_not_skip_the_other(stubs, outcomes, as_hor
     assert outcomes.flushed == [["logs", "traces"]] * 2 + [["logs"]] * 2
 
 
-def test_a_failed_export_counts_even_when_the_flush_returns_in_time(stubs, outcomes, as_horse):  # noqa: F811
-    # For example exporter.timeout below rq.flush_timeout: the flush returns, the export failed.
-    outcomes.results = [{"logs": (True, 0, 1)}] * 3
+def test_a_slow_failed_export_counts_even_when_the_flush_returns_in_time(stubs, outcomes, as_horse):  # noqa: F811
+    # For example exporter.timeout below rq.flush_timeout: the flush returns after the exporter
+    # spent its retries, the export failed.
+    outcomes.results = [{"logs": (True, 0, 1, 1.0)}] * 3
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 2}}, env={}, argv=ARGV_RQ)
     for _ in range(3):
         _run_horse()
     assert outcomes.flushed == [["logs"]] * 2 + [[]]
+
+
+def test_the_slow_threshold_follows_a_short_flush_timeout(stubs, outcomes, as_horse):  # noqa: F811
+    # With rq.flush_timeout 0.4 s, a failed export that took 0.1 s (a quarter of it) counts.
+    outcomes.results = [{"logs": (True, 0, 1, 0.1)}] * 3
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 2, "flush_timeout": 0.4}}, env={}, argv=ARGV_RQ)
+    for _ in range(3):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 2 + [[]]
+
+
+def test_an_instant_rejection_does_not_count(stubs, outcomes, as_horse):  # noqa: F811
+    # For example HTTP 413 for a horse's single oversized batch: the exporter gives up at once, so
+    # the flush cost no time and skipping later flushes would gain nothing.
+    outcomes.results = [{"logs": (True, 0, 1, 0.01)}] * 4
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
+    for _ in range(4):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 4
+
+
+def test_an_instant_rejection_neither_resets_nor_adds_to_an_outage(stubs, outcomes, as_horse):  # noqa: F811
+    rejected = {"logs": (True, 0, 1, 0.01)}
+    outcomes.results = [LOGS_DOWN, rejected, LOGS_DOWN, LOGS_DOWN]
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 2}}, env={}, argv=ARGV_RQ)
+    for _ in range(4):
+        _run_horse()
+    # The rejection left the streak at one: the third flush is the second failure.
+    assert outcomes.flushed == [["logs"]] * 3 + [[]]
 
 
 def test_a_flush_with_nothing_exported_changes_nothing(stubs, outcomes, as_horse):  # noqa: F811
@@ -387,26 +418,34 @@ def test_no_breaker_for_a_tracer_provider_configured_outside_the_plugin(
 
 
 class _SwitchableLogExporter(InMemoryLogRecordExporter):
-    """Fails every export while `down`, and counts the exports it was asked to make."""
+    """Fails every export while `down`, taking `clock` 2 s forward like an exporter retrying an
+    unreachable endpoint, and counts the exports it was asked to make."""
 
-    def __init__(self):
+    def __init__(self, clock):
         super().__init__()
+        self.clock = clock
         self.down = True
         self.exports = 0
 
     def export(self, batch):
         self.exports += 1
         if self.down:
+            self.clock.now += 2.0
             return LogRecordExportResult.FAILURE
         return super().export(batch)
 
 
 def test_breaker_with_the_real_flush_and_export_counters(stubs, as_horse, monkeypatch, caplog):  # noqa: F811
     # No scripted outcomes: the plugin's own batch LoggerProvider, counting exporter and flush.
-    exporter = _SwitchableLogExporter()
-    monkeypatch.setattr(otel, "build_log_exporter", lambda cfg: exporter)
+    # The batch worker thread also exports on its own timer, counted from when it started rather
+    # than from an emit; a one hour schedule delay leaves force_flush as the only export, so the
+    # export counts and the dropped record count below are exact.
+    monkeypatch.setenv("OTEL_BLRP_SCHEDULE_DELAY", "3600000")
     clock = Clock()
+    # Patches time.monotonic itself: the breaker and the export timing in otel both read it.
     monkeypatch.setattr(rq_module.time, "monotonic", clock)
+    exporter = _SwitchableLogExporter(clock)
+    monkeypatch.setattr(otel, "build_log_exporter", lambda cfg: exporter)
     bootstrap.install(
         {**USER, "rq": {"flush_breaker_threshold": 2, "flush_breaker_cooldown": 30}}, env={}, argv=ARGV_RQ
     )

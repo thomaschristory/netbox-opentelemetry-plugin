@@ -466,12 +466,24 @@ def _flush_horse(
             _warn_once("breaker", "OpenTelemetry: RQ work-horse flush breaker failed: %s", type(exc).__name__)
 
 
+def slow_failure_seconds(flush_timeout: float) -> float:
+    """Time failed exports must have taken for a flush that finished to count as failed."""
+    return min(1.0, 0.25 * flush_timeout)
+
+
 def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bool, before, after) -> None:
     label = SIGNAL_LABELS[signal]
     exported = after.succeeded > before.succeeded
-    # A failed export alongside successful ones (for example one oversized batch rejected by a
-    # proxy) shows the endpoint is reachable: not counted as a failed flush.
-    if not completed or (after.failed > before.failed and not exported):
+    # A flush that finished counts as failed only if its failed exports cost time (retries against
+    # an unreachable endpoint, a read timeout). A failed export alongside successful ones (for
+    # example one oversized batch rejected by a proxy) shows the endpoint is reachable, and an
+    # instant rejection (HTTP 400, 401, 413) costs the worker nothing: skipping later flushes would
+    # only drop records. Neither is counted, and neither resets a failure streak.
+    failed_slowly = (
+        after.failed > before.failed
+        and after.failed_seconds - before.failed_seconds >= slow_failure_seconds(cfg.flush_timeout)
+    )
+    if not completed or (failed_slowly and not exported):
         if breaker.record_failure():
             logger.warning(
                 "OpenTelemetry: the RQ work-horse flush of %s did not finish or failed %s times in a row; "
@@ -484,7 +496,7 @@ def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bo
             )
         return
     if not exported:
-        # Nothing was exported: no evidence either way about the endpoint.
+        # Nothing was exported, or only fast failures: no evidence of an outage that costs time.
         return
     summary = breaker.record_success()
     if summary is None:

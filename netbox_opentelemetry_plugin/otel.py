@@ -163,6 +163,7 @@ def _http_session(cfg: ExporterConfig) -> requests.Session | None:
 class ExportOutcomes(NamedTuple):
     succeeded: int
     failed: int
+    failed_seconds: float = 0.0  # time spent in the export calls that failed
 
 
 SIGNAL_LOGS = "logs"  # log and audit records: one LoggerProvider
@@ -171,20 +172,26 @@ SIGNAL_TRACES = "traces"
 # Export calls made by the log and span exporters of this process, by signal and result. A forked
 # child inherits the parent's totals; callers compare two readings taken in the same process.
 _outcomes_lock = threading.Lock()
-_outcomes = {SIGNAL_LOGS: [0, 0], SIGNAL_TRACES: [0, 0]}
+_outcomes = {SIGNAL_LOGS: [0, 0, 0.0], SIGNAL_TRACES: [0, 0, 0.0]}
 
 
 def export_outcomes(signal: str) -> ExportOutcomes:
     """Totals of export calls for `signal` ("logs" or "traces") in this process that succeeded and
-    that failed. An export that raised counts as failed. Metrics exports are not counted."""
+    that failed, and the seconds spent in the failed ones. An export that raised counts as failed.
+    Metrics exports are not counted."""
     with _outcomes_lock:
-        succeeded, failed = _outcomes[signal]
-    return ExportOutcomes(succeeded, failed)
+        succeeded, failed, failed_seconds = _outcomes[signal]
+    return ExportOutcomes(succeeded, failed, failed_seconds)
 
 
-def _count_outcome(signal: str, succeeded: bool) -> None:
+def _count_outcome(signal: str, succeeded: bool, seconds: float) -> None:
     with _outcomes_lock:
-        _outcomes[signal][0 if succeeded else 1] += 1
+        totals = _outcomes[signal]
+        if succeeded:
+            totals[0] += 1
+        else:
+            totals[1] += 1
+            totals[2] += max(0.0, seconds)
 
 
 def _reset_outcomes_lock() -> None:
@@ -205,12 +212,14 @@ class _OutcomeCountingExporter:
         self._signal = signal
 
     def export(self, batch):
+        start = time.monotonic()
         try:
             result = self._delegate.export(batch)
         except BaseException:
-            _count_outcome(self._signal, False)
+            _count_outcome(self._signal, False, time.monotonic() - start)
             raise
-        _count_outcome(self._signal, result is LogRecordExportResult.SUCCESS or result is SpanExportResult.SUCCESS)
+        succeeded = result is LogRecordExportResult.SUCCESS or result is SpanExportResult.SUCCESS
+        _count_outcome(self._signal, succeeded, time.monotonic() - start)
         return result
 
     def shutdown(self, timeout_millis: float | None = None):

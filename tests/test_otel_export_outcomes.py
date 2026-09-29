@@ -108,6 +108,36 @@ def test_failed_span_exports_are_counted(resource, synchronous):
         spans.shutdown()
 
 
+def test_time_spent_in_failed_exports_is_added_up(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(otel.time, "monotonic", lambda: now[0])
+
+    class Timed:
+        def __init__(self):
+            self.result, self.seconds, self.raises = LogRecordExportResult.FAILURE, 0.0, False
+
+        def export(self, batch):
+            now[0] += self.seconds
+            if self.raises:
+                raise ConnectionError("collector down")
+            return self.result
+
+    delegate = Timed()
+    counted = otel._OutcomeCountingExporter(delegate, "logs")
+    before, before_spans = otel.export_outcomes("logs"), otel.export_outcomes("traces")
+    delegate.seconds = 2.5
+    counted.export([])
+    delegate.result = LogRecordExportResult.SUCCESS
+    delegate.seconds = 4.0
+    counted.export([])  # time spent in a successful export is not added
+    delegate.seconds, delegate.raises = 1.0, True
+    with pytest.raises(ConnectionError):
+        counted.export([])
+    after = otel.export_outcomes("logs")
+    assert after.failed_seconds - before.failed_seconds == pytest.approx(3.5)
+    assert otel.export_outcomes("traces") == before_spans
+
+
 def test_counting_keeps_the_exporter_usable(resource):
     exporter = InMemoryLogRecordExporter()
     logs = otel.build_logger_provider(resource, exporter, synchronous=True)

@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-09-29
+
 ### Fixed
 
 - Outbound HTTP calls from NetBox no longer forward a client's `baggage` header: inbound baggage is dropped and only the trace context is propagated, with traces on or metrics only. `OTEL_PROPAGATORS` still selects the trace-context format ([#1](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/1)).
@@ -38,7 +40,8 @@ All notable changes to this project are documented in this file. The format foll
 - Reuse of an OpenTelemetry SDK already configured outside the plugin (for example by `opentelemetry-instrument`).
 - NetBox 4.7 support.
 
-[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/releases/tag/v0.1.0

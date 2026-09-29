@@ -170,19 +170,26 @@ def test_state_written_by_one_forked_horse_is_seen_by_the_next():
 
 @pytest.fixture
 def outcomes(monkeypatch):
-    """Scripted flush results: each horse's flush returns the next value and adds its export results."""
-    state = SimpleNamespace(results=[], calls=0, succeeded=0, failed=0)
+    """Scripted horse flushes. Each entry of `results` is one horse: {signal: (finished, ok, failed)},
+    the flush result for that signal and the export results it adds. `flushed` records, per horse,
+    the signals that were actually flushed."""
+    state = SimpleNamespace(results=[], flushed=[], totals={"logs": [0, 0], "traces": [0, 0]})
 
-    def fake_flush(timeout):
-        ok, exported_ok, exported_failed = state.results[state.calls]
-        state.calls += 1
-        state.succeeded += exported_ok
-        state.failed += exported_failed
-        return ok
+    def fake_flush(timeout, skip=frozenset()):
+        script = state.results[len(state.flushed)]
+        done = {}
+        for signal, (finished, exported_ok, exported_failed) in script.items():
+            if signal in skip:
+                continue
+            state.totals[signal][0] += exported_ok
+            state.totals[signal][1] += exported_failed
+            done[signal] = finished
+        state.flushed.append(sorted(done))
+        return done
 
-    monkeypatch.setattr(bootstrap, "force_flush", fake_flush)
-    monkeypatch.setattr(otel, "export_outcomes", lambda: otel.ExportOutcomes(state.succeeded, state.failed))
-    monkeypatch.setattr(otel, "buffered_records", lambda: 7)
+    monkeypatch.setattr(bootstrap, "flush_signals", fake_flush)
+    monkeypatch.setattr(otel, "export_outcomes", lambda signal: otel.ExportOutcomes(*state.totals[signal]))
+    monkeypatch.setattr(otel, "buffered_records", lambda signal: 7 if signal == "logs" else 2)
     return state
 
 
@@ -193,36 +200,47 @@ def _run_horse():
 
 TIMED_OUT = (False, 0, 0)
 EXPORTED = (True, 2, 0)
+LOGS_DOWN = {"logs": TIMED_OUT}
+LOGS_UP = {"logs": EXPORTED}
 
 
 def test_horses_skip_the_flush_after_threshold_failures(stubs, outcomes, as_horse, caplog):  # noqa: F811
-    outcomes.results = [TIMED_OUT] * 3
+    outcomes.results = [LOGS_DOWN] * 5
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 3}}, env={}, argv=ARGV_RQ)
     with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
         for _ in range(5):
             assert _run_horse() is True
-    assert outcomes.calls == 3
-    opened = [r for r in caplog.records if "skip their flush" in r.getMessage()]
+    assert outcomes.flushed == [["logs"]] * 3 + [[]] * 2
+    opened = [r.getMessage() for r in caplog.records if "now skip it" in r.getMessage()]
     assert len(opened) == 1
-    assert "3 work-horse flushes in a row" in opened[0].getMessage()
+    assert "flush of log records did not finish or failed 3 times in a row" in opened[0]
     assert len(stubs["perform"]) == 5
+
+
+def test_an_outage_of_one_signal_does_not_skip_the_other(stubs, outcomes, as_horse):  # noqa: F811
+    outcomes.results = [{"logs": EXPORTED, "traces": TIMED_OUT}] * 4
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 2}}, env={}, argv=ARGV_RQ)
+    for _ in range(4):
+        _run_horse()
+    assert outcomes.flushed == [["logs", "traces"]] * 2 + [["logs"]] * 2
 
 
 def test_a_failed_export_counts_even_when_the_flush_returns_in_time(stubs, outcomes, as_horse):  # noqa: F811
     # For example exporter.timeout below rq.flush_timeout: the flush returns, the export failed.
-    outcomes.results = [(True, 0, 1)] * 2
+    outcomes.results = [{"logs": (True, 0, 1)}] * 3
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 2}}, env={}, argv=ARGV_RQ)
     for _ in range(3):
         _run_horse()
-    assert outcomes.calls == 2
+    assert outcomes.flushed == [["logs"]] * 2 + [[]]
 
 
 def test_a_flush_with_nothing_exported_changes_nothing(stubs, outcomes, as_horse):  # noqa: F811
-    outcomes.results = [TIMED_OUT, (True, 0, 0), TIMED_OUT, TIMED_OUT]
+    outcomes.results = [LOGS_DOWN, {"logs": (True, 0, 0)}, LOGS_DOWN, LOGS_DOWN, LOGS_DOWN]
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 3}}, env={}, argv=ARGV_RQ)
     for _ in range(5):
         _run_horse()
-    assert outcomes.calls == 4  # the empty flush neither reset nor added to the count
+    # The empty flush neither reset nor added to the count: the fourth flush is the third failure.
+    assert outcomes.flushed == [["logs"]] * 4 + [[]]
 
 
 def test_a_successful_probe_restores_the_flush_and_reports_the_drop(
@@ -234,7 +252,7 @@ def test_a_successful_probe_restores_the_flush_and_reports_the_drop(
 ):
     clock = Clock()
     monkeypatch.setattr(rq_module.time, "monotonic", clock)
-    outcomes.results = [TIMED_OUT, EXPORTED, EXPORTED]
+    outcomes.results = [LOGS_DOWN, LOGS_DOWN, LOGS_DOWN, LOGS_UP, LOGS_UP]
     bootstrap.install(
         {**USER, "rq": {"flush_breaker_threshold": 1, "flush_breaker_cooldown": 10}}, env={}, argv=ARGV_RQ
     )
@@ -245,34 +263,33 @@ def test_a_successful_probe_restores_the_flush_and_reports_the_drop(
         clock.now += 11
         _run_horse()  # probe succeeds
         _run_horse()  # full flush again
-    assert outcomes.calls == 3
-    (recovered,) = [r for r in caplog.records if "succeeded again" in r.getMessage()]
-    message = recovered.getMessage()
-    assert "2 work-horse flushes were skipped" in message
-    assert "14 buffered log records and spans" in message
+    assert outcomes.flushed == [["logs"], [], [], ["logs"], ["logs"]]
+    (recovered,) = [r.getMessage() for r in caplog.records if "succeeded again" in r.getMessage()]
+    assert "flush of log records succeeded again" in recovered
+    assert "2 flushes were skipped, dropping 14 buffered log records" in recovered
 
 
 def test_uncountable_records_are_reported_as_such(stubs, outcomes, as_horse, monkeypatch, caplog):  # noqa: F811
     clock = Clock()
     monkeypatch.setattr(rq_module.time, "monotonic", clock)
-    monkeypatch.setattr(otel, "buffered_records", lambda: None)
-    outcomes.results = [TIMED_OUT, EXPORTED]
+    monkeypatch.setattr(otel, "buffered_records", lambda signal: None)
+    outcomes.results = [LOGS_DOWN, LOGS_DOWN, LOGS_UP]
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
     with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
         _run_horse()
         _run_horse()
         clock.now += 31
         _run_horse()
-    (recovered,) = [r for r in caplog.records if "succeeded again" in r.getMessage()]
-    assert "could not be counted in 1" in recovered.getMessage()
+    (recovered,) = [r.getMessage() for r in caplog.records if "succeeded again" in r.getMessage()]
+    assert "could not be counted in 1 of those flushes" in recovered
 
 
 def test_threshold_zero_always_flushes(stubs, outcomes, as_horse):  # noqa: F811
-    outcomes.results = [TIMED_OUT] * 6
+    outcomes.results = [LOGS_DOWN] * 6
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 0}}, env={}, argv=ARGV_RQ)
     for _ in range(6):
         _run_horse()
-    assert outcomes.calls == 6
+    assert outcomes.flushed == [["logs"]] * 6
 
 
 def test_shared_memory_failure_keeps_the_full_flush(stubs, outcomes, as_horse, monkeypatch, caplog):  # noqa: F811
@@ -280,19 +297,19 @@ def test_shared_memory_failure_keeps_the_full_flush(stubs, outcomes, as_horse, m
         raise OSError("no shared memory")
 
     monkeypatch.setattr(mmap, "mmap", boom)
-    outcomes.results = [TIMED_OUT] * 5
+    outcomes.results = [LOGS_DOWN] * 5
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
     with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
         for _ in range(5):
             assert _run_horse() is True
-    assert outcomes.calls == 5
+    assert outcomes.flushed == [["logs"]] * 5
     assert stubs["fork"] == [bootstrap.ROLE_RQ_HORSE] * 5
     warnings = [r for r in caplog.records if "could not set up" in r.getMessage()]
     assert len(warnings) == 1
 
 
 def test_breaker_errors_never_break_the_job(stubs, outcomes, as_horse, monkeypatch):  # noqa: F811
-    outcomes.results = [TIMED_OUT] * 3
+    outcomes.results = [LOGS_DOWN] * 3
     bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
 
     def boom(*args, **kwargs):
@@ -302,4 +319,4 @@ def test_breaker_errors_never_break_the_job(stubs, outcomes, as_horse, monkeypat
     monkeypatch.setattr(rq_module.FlushBreaker, "record_failure", boom)
     for _ in range(3):
         assert _run_horse() is True
-    assert outcomes.calls == 3
+    assert outcomes.flushed == [["logs"]] * 3

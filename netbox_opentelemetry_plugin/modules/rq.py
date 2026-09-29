@@ -37,6 +37,8 @@ WORKER_PARAMS = ("self", "job", "queue")
 ENQUEUE_PARAMS = ("self", "job", "pipeline", "at_front", "unique")
 CONTEXT_META_KEY = "netbox_otel_context"
 JOB_SCOPE = "netbox_opentelemetry_plugin.rq"
+BREAKER_SIGNALS = (otel.SIGNAL_LOGS, otel.SIGNAL_TRACES)
+SIGNAL_LABELS = {otel.SIGNAL_LOGS: "log records", otel.SIGNAL_TRACES: "spans"}
 JOB_DURATION = "netbox.rq.job.duration"
 JOBS = "netbox.rq.jobs"
 QUEUE_DEPTH = "netbox.rq.queue.depth"
@@ -102,17 +104,22 @@ class RqModule:
             self._register_queue_depth(ctx)
         if not cfg.patch_worker:
             return
-        breaker = None
+        breakers = {}
         if cfg.flush_breaker_threshold > 0:
-            breaker = FlushBreaker(cfg.flush_breaker_threshold, cfg.flush_breaker_cooldown)
+            # One per signal: logs and traces can go to different endpoints, and an outage of one
+            # must not make horses drop the other.
+            breakers = {
+                signal: FlushBreaker(cfg.flush_breaker_threshold, cfg.flush_breaker_cooldown)
+                for signal in BREAKER_SIGNALS
+            }
         if isinstance(inspect.getattr_static(BaseWorker, "is_horse", None), property):
-            self._wrap(BaseWorker, "perform_job", _perform_job_wrapper(ctx, breaker), WORKER_PARAMS)
+            self._wrap(BaseWorker, "perform_job", _perform_job_wrapper(ctx, breakers), WORKER_PARAMS)
         else:
             logger.warning(
                 "OpenTelemetry: rq BaseWorker.is_horse is not a property; the work-horse flush and job "
                 "spans are disabled"
             )
-        self._wrap(Worker, "fork_work_horse", _fork_work_horse_wrapper(breaker), WORKER_PARAMS)
+        self._wrap(Worker, "fork_work_horse", _fork_work_horse_wrapper(breakers), WORKER_PARAMS)
         if ctx.meter_provider is not None:
             job_metrics = _JobMetrics(ctx.meter_provider)
             self._wrap(Worker, "execute_job", _execute_job_wrapper(job_metrics), WORKER_PARAMS)
@@ -390,10 +397,12 @@ class _JobSpan:
         return False
 
 
-def _perform_job_wrapper(ctx: Context, breaker: FlushBreaker | None = None):
+def _perform_job_wrapper(ctx: Context, breakers: dict[str, FlushBreaker] | None = None):
+    breakers = breakers or {}
+
     def make(original):
         def perform_job(self, job, queue):
-            before = _outcomes_or_none() if breaker is not None and getattr(self, "is_horse", False) else None
+            before = _outcomes_or_none() if breakers and getattr(self, "is_horse", False) else None
             try:
                 with _JobSpan(ctx, self, job, queue) as span:
                     result = original(self, job, queue)
@@ -403,71 +412,85 @@ def _perform_job_wrapper(ctx: Context, breaker: FlushBreaker | None = None):
                 # Only a forked work-horse exits (os._exit) right after this returns. A SimpleWorker
                 # runs jobs in the long-lived worker process, whose batch processors flush normally.
                 if getattr(self, "is_horse", False):
-                    _flush_horse(ctx, breaker, before)
+                    _flush_horse(ctx, breakers, before)
 
         return perform_job
 
     return make
 
 
-def _outcomes_or_none() -> otel.ExportOutcomes | None:
+def _outcomes_or_none() -> dict[str, otel.ExportOutcomes] | None:
     try:
-        return otel.export_outcomes()
+        return {signal: otel.export_outcomes(signal) for signal in BREAKER_SIGNALS}
     except Exception:
         return None
 
 
-def _flush_horse(ctx: Context, breaker: FlushBreaker | None = None, before: otel.ExportOutcomes | None = None) -> None:
+def _flush_horse(
+    ctx: Context,
+    breakers: dict[str, FlushBreaker] | None = None,
+    before: dict[str, otel.ExportOutcomes] | None = None,
+) -> None:
     from .. import bootstrap
 
     cfg = ctx.settings.rq
-    if breaker is not None:
+    breakers = dict(breakers or {})
+    skip = set()
+    for signal, breaker in list(breakers.items()):
         try:
             if breaker.should_skip():
-                breaker.record_skip(otel.buffered_records())
-                return
+                breaker.record_skip(otel.buffered_records(signal))
+                skip.add(signal)
         except Exception as exc:
             _warn_once("breaker", "OpenTelemetry: RQ work-horse flush breaker failed: %s", type(exc).__name__)
-            breaker = None
-    completed = False
+            breakers.pop(signal)
+    results: dict[str, bool] = {}
     try:
-        completed = bootstrap.force_flush(cfg.flush_timeout)
-        if not completed:
+        results = bootstrap.flush_signals(cfg.flush_timeout, frozenset(skip))
+        if not all(results.values()):
             logger.warning("OpenTelemetry: flush in the RQ work-horse did not finish within %s s", cfg.flush_timeout)
     except Exception as exc:
         _warn_once("flush", "OpenTelemetry: flush in the RQ work-horse failed: %s", type(exc).__name__)
-    if breaker is None or before is None:
+    if before is None:
         return
-    try:
-        _record_flush_outcome(breaker, cfg, completed, before, otel.export_outcomes())
-    except Exception as exc:
-        _warn_once("breaker", "OpenTelemetry: RQ work-horse flush breaker failed: %s", type(exc).__name__)
+    for signal, completed in results.items():
+        breaker = breakers.get(signal)
+        if breaker is None or signal not in before:
+            continue
+        try:
+            _record_flush_outcome(breaker, signal, cfg, completed, before[signal], otel.export_outcomes(signal))
+        except Exception as exc:
+            _warn_once("breaker", "OpenTelemetry: RQ work-horse flush breaker failed: %s", type(exc).__name__)
 
 
-def _record_flush_outcome(breaker: FlushBreaker, cfg, completed: bool, before, after) -> None:
-    failed = after.failed > before.failed
-    if not completed or failed:
+def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bool, before, after) -> None:
+    label = SIGNAL_LABELS[signal]
+    if not completed or after.failed > before.failed:
         if breaker.record_failure():
             logger.warning(
-                "OpenTelemetry: %s work-horse flushes in a row did not finish or their exports failed; "
-                "RQ work-horses now skip their flush, with one full flush attempt every %s s until an "
-                "export succeeds. Records buffered in a work-horse that skips its flush are dropped",
+                "OpenTelemetry: the RQ work-horse flush of %s did not finish or failed %s times in a row; "
+                "work-horses now skip it, with one full attempt every %s s until an export succeeds. "
+                "The %s buffered in a work-horse that skips it are dropped",
+                label,
                 cfg.flush_breaker_threshold,
                 cfg.flush_breaker_cooldown,
+                label,
             )
         return
     if after.succeeded == before.succeeded:
-        # Nothing was exported: no evidence either way about the Collector.
+        # Nothing was exported: no evidence either way about the endpoint.
         return
     summary = breaker.record_success()
     if summary is None:
         return
-    uncounted = f"; the records could not be counted in {summary.uncounted} of them" if summary.uncounted else ""
+    uncounted = f"; they could not be counted in {summary.uncounted} of those flushes" if summary.uncounted else ""
     logger.warning(
-        "OpenTelemetry: export from the RQ work-horse succeeded again, work-horses flush normally. "
-        "%s work-horse flushes were skipped, dropping %s buffered log records and spans%s",
+        "OpenTelemetry: the RQ work-horse flush of %s succeeded again; work-horses flush them normally. "
+        "%s flushes were skipped, dropping %s buffered %s%s",
+        label,
         summary.skipped,
         summary.dropped,
+        label,
         uncounted,
     )
 
@@ -483,7 +506,7 @@ _BREAKER_STATE = struct.Struct("=qdqqq")
 
 
 class FlushBreaker:
-    """Circuit breaker for the work-horse flush, shared by a worker and the horses it forks.
+    """Circuit breaker for the work-horse flush of one signal, shared by a worker and its horses.
 
     The worker parent allocates an anonymous shared memory page (MAP_SHARED, so writes are seen
     across fork) before its first fork; each horse reads and updates it, and the worker itself
@@ -568,12 +591,14 @@ class FlushBreaker:
         return SkipSummary(skipped, dropped, uncounted)
 
 
-def _fork_work_horse_wrapper(breaker: FlushBreaker | None = None):
+def _fork_work_horse_wrapper(breakers: dict[str, FlushBreaker] | None = None):
+    breakers = breakers or {}
+
     def make(original):
         def fork_work_horse(self, job, queue):
             from .. import bootstrap
 
-            if breaker is not None:
+            for breaker in breakers.values():
                 try:
                     breaker.prepare()
                 except Exception as exc:

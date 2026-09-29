@@ -74,11 +74,11 @@ def stubs(monkeypatch):
 def flushes(monkeypatch):
     recorded = []
 
-    def fake_flush(timeout):
+    def fake_flush(timeout, skip=frozenset()):
         recorded.append(timeout)
-        return True
+        return {"logs": True}
 
-    monkeypatch.setattr(bootstrap, "force_flush", fake_flush)
+    monkeypatch.setattr(bootstrap, "flush_signals", fake_flush)
     return recorded
 
 
@@ -184,7 +184,7 @@ def test_perform_job_flushes_when_job_raises(stubs, flushes):
 
 
 def test_flush_timeout_logs_a_warning(stubs, monkeypatch, caplog):
-    monkeypatch.setattr(bootstrap, "force_flush", lambda timeout: False)
+    monkeypatch.setattr(bootstrap, "flush_signals", lambda timeout, skip=frozenset(): {"logs": False})
     bootstrap.install(USER, env={}, argv=ARGV_RQ)
     with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
         BaseWorker.perform_job(_horse(), "job", "queue")
@@ -324,14 +324,14 @@ def test_job_span_is_ended_before_the_horse_flush(stubs, spans, monkeypatch):
 
     monkeypatch.setattr(rq_module._JobSpan, "__exit__", exit_)
 
-    real_flush = bootstrap.force_flush
+    real_flush = bootstrap.flush_signals
 
-    def flush(timeout):
+    def flush(timeout, skip=frozenset()):
         order.append("flush")
         recording_during_flush.append(otel.current_span_is_recording())
-        return real_flush(timeout)
+        return real_flush(timeout, skip)
 
-    monkeypatch.setattr(bootstrap, "force_flush", flush)
+    monkeypatch.setattr(bootstrap, "flush_signals", flush)
     BaseWorker.perform_job(FakeWorker(), FakeJob(), SimpleNamespace(name="default"))
     assert order == ["end", "flush"]
     assert recording_during_flush == [False]
@@ -445,10 +445,10 @@ def test_no_job_span_without_traces(stubs, flushes):
 def test_flush_error_never_replaces_the_job_result(stubs, monkeypatch):
     bootstrap.install(USER, env={}, argv=ARGV_RQ)
 
-    def broken(timeout):
+    def broken(timeout, skip=frozenset()):
         raise RuntimeError("flush exploded")
 
-    monkeypatch.setattr(bootstrap, "force_flush", broken)
+    monkeypatch.setattr(bootstrap, "flush_signals", broken)
     assert BaseWorker.perform_job(_horse(), "job", SimpleNamespace(name="q")) is True
 
 

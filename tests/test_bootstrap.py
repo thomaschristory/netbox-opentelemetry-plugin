@@ -386,6 +386,23 @@ def test_force_flush_flushes_spans_and_logs(exporter, span_exporter):
     assert [r.log_record.body for r in exporter.get_finished_logs()] == ["in span"]
 
 
+def test_flush_signals_reports_each_signal_and_honours_skip(exporter, span_exporter, monkeypatch):
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    release = threading.Event()
+    monkeypatch.setattr(ctx.tracer_provider, "force_flush", lambda timeout_millis=30000: release.wait(5))
+    try:
+        assert bootstrap.flush_signals(0.2) == {"logs": True, "traces": False}
+        assert bootstrap.flush_signals(0.2, skip=frozenset({"traces"})) == {"logs": True}
+    finally:
+        release.set()
+
+
+def test_flush_signals_without_state_is_empty():
+    bootstrap.shutdown()
+    bootstrap._state = None
+    assert bootstrap.flush_signals(1.0) == {}
+
+
 def test_force_flush_reports_a_slow_tracer_flush(exporter, span_exporter, monkeypatch):
     ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
     release = threading.Event()

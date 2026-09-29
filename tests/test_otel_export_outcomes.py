@@ -55,12 +55,17 @@ def test_successful_log_and_span_exports_are_counted(resource):
     spans = otel.build_tracer_provider(
         resource, InMemorySpanExporter(), otel.build_sampler("always_on", 1.0), synchronous=True
     )
-    before = otel.export_outcomes()
+    before_logs, before_spans = otel.export_outcomes("logs"), otel.export_outcomes("traces")
     _emit(logs)
+    after_logs = otel.export_outcomes("logs")
+    assert after_logs.succeeded - before_logs.succeeded == 1
+    assert otel.export_outcomes("traces") == before_spans
     _span(spans)
-    after = otel.export_outcomes()
-    assert after.succeeded - before.succeeded == 2
-    assert after.failed == before.failed
+    after_spans = otel.export_outcomes("traces")
+    assert after_spans.succeeded - before_spans.succeeded == 1
+    assert otel.export_outcomes("logs") == after_logs
+    assert after_logs.failed == before_logs.failed
+    assert after_spans.failed == before_spans.failed
     logs.shutdown()
     spans.shutdown()
 
@@ -68,9 +73,9 @@ def test_successful_log_and_span_exports_are_counted(resource):
 @pytest.mark.parametrize("exporter_cls", [_Failing, _Raising])
 def test_failed_or_raising_log_exports_are_counted(resource, exporter_cls):
     logs = otel.build_logger_provider(resource, exporter_cls(), synchronous=True)
-    before = otel.export_outcomes()
+    before = otel.export_outcomes("logs")
     _emit(logs)
-    after = otel.export_outcomes()
+    after = otel.export_outcomes("logs")
     assert after.failed - before.failed == 1
     assert after.succeeded == before.succeeded
     logs.shutdown()
@@ -80,9 +85,9 @@ def test_failed_span_exports_are_counted(resource):
     spans = otel.build_tracer_provider(
         resource, _FailingSpans(), otel.build_sampler("always_on", 1.0), synchronous=True
     )
-    before = otel.export_outcomes()
+    before = otel.export_outcomes("traces")
     _span(spans)
-    assert otel.export_outcomes().failed - before.failed == 1
+    assert otel.export_outcomes("traces").failed - before.failed == 1
     spans.shutdown()
 
 
@@ -105,8 +110,8 @@ def test_shutdown_timeout_is_forwarded_only_when_the_exporter_takes_one():
         def shutdown(self):
             calls.append("plain")
 
-    otel._OutcomeCountingExporter(WithTimeout()).shutdown(timeout_millis=250)
-    otel._OutcomeCountingExporter(WithoutTimeout()).shutdown(timeout_millis=250)
+    otel._OutcomeCountingExporter(WithTimeout(), "logs").shutdown(timeout_millis=250)
+    otel._OutcomeCountingExporter(WithoutTimeout(), "traces").shutdown(timeout_millis=250)
     assert calls == [250, "plain"]
 
 
@@ -114,11 +119,12 @@ def test_buffered_records_counts_queued_logs_and_spans(resource):
     logs = otel.build_logger_provider(resource, InMemoryLogRecordExporter())
     spans = otel.build_tracer_provider(resource, InMemorySpanExporter(), otel.build_sampler("always_on", 1.0))
     try:
-        baseline = otel.buffered_records()
+        logs_before, spans_before = otel.buffered_records("logs"), otel.buffered_records("traces")
         _emit(logs, 3)
         _span(spans)
         # The batch threads only wake up after their schedule delay (1 s for logs, 5 s for spans).
-        assert otel.buffered_records() - baseline == 4
+        assert otel.buffered_records("logs") - logs_before == 3
+        assert otel.buffered_records("traces") - spans_before == 1
     finally:
         logs.shutdown()
         spans.shutdown()
@@ -127,9 +133,9 @@ def test_buffered_records_counts_queued_logs_and_spans(resource):
 def test_buffered_records_is_none_when_sdk_internals_change(resource, monkeypatch):
     logs = otel.build_logger_provider(resource, InMemoryLogRecordExporter())
     try:
-        processor = otel._batch_processors[-1][1]()
+        processor = otel._batch_processors[-1][2]()
         monkeypatch.delattr(processor, "_batch_processor")
-        assert otel.buffered_records() is None
+        assert otel.buffered_records("logs") is None
     finally:
         monkeypatch.undo()
         logs.shutdown()
@@ -138,12 +144,12 @@ def test_buffered_records_is_none_when_sdk_internals_change(resource, monkeypatc
 def test_buffered_records_ignores_processors_of_the_parent_process(resource, monkeypatch):
     logs = otel.build_logger_provider(resource, InMemoryLogRecordExporter())
     try:
-        baseline = otel.buffered_records()
+        baseline = otel.buffered_records("logs")
         _emit(logs, 2)
         monkeypatch.setattr(os, "getpid", lambda: -1)
-        assert otel.buffered_records() == 0
+        assert otel.buffered_records("logs") == 0
         monkeypatch.undo()
-        assert otel.buffered_records() - baseline == 2
+        assert otel.buffered_records("logs") - baseline == 2
     finally:
         logs.shutdown()
 
@@ -156,9 +162,9 @@ def test_counters_work_in_a_forked_child(resource):
     pid = os.fork()
     if pid == 0:  # pragma: no cover - child
         try:
-            before = otel.export_outcomes()
+            before = otel.export_outcomes("logs")
             _emit(logs)
-            ok = otel.export_outcomes().succeeded - before.succeeded == 1
+            ok = otel.export_outcomes("logs").succeeded - before.succeeded == 1
             os.write(write_fd, b"1" if ok else b"0")
         finally:
             os._exit(0)

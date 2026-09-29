@@ -165,22 +165,26 @@ class ExportOutcomes(NamedTuple):
     failed: int
 
 
-# Export calls made by the log and span exporters of this process, by result. A forked child
-# inherits the parent's totals; callers compare two readings taken in the same process.
+SIGNAL_LOGS = "logs"  # log and audit records: one LoggerProvider
+SIGNAL_TRACES = "traces"
+
+# Export calls made by the log and span exporters of this process, by signal and result. A forked
+# child inherits the parent's totals; callers compare two readings taken in the same process.
 _outcomes_lock = threading.Lock()
-_outcomes = [0, 0]
+_outcomes = {SIGNAL_LOGS: [0, 0], SIGNAL_TRACES: [0, 0]}
 
 
-def export_outcomes() -> ExportOutcomes:
-    """Totals of log and span export calls in this process that succeeded and that failed. An
-    export that raised counts as failed. Metrics exports are not counted."""
+def export_outcomes(signal: str) -> ExportOutcomes:
+    """Totals of export calls for `signal` ("logs" or "traces") in this process that succeeded and
+    that failed. An export that raised counts as failed. Metrics exports are not counted."""
     with _outcomes_lock:
-        return ExportOutcomes(_outcomes[0], _outcomes[1])
+        succeeded, failed = _outcomes[signal]
+    return ExportOutcomes(succeeded, failed)
 
 
-def _count_outcome(succeeded: bool) -> None:
+def _count_outcome(signal: str, succeeded: bool) -> None:
     with _outcomes_lock:
-        _outcomes[0 if succeeded else 1] += 1
+        _outcomes[signal][0 if succeeded else 1] += 1
 
 
 def _reset_outcomes_lock() -> None:
@@ -196,16 +200,17 @@ if hasattr(os, "register_at_fork"):
 class _OutcomeCountingExporter:
     """Passes every call through to the log or span exporter it wraps and counts each export's result."""
 
-    def __init__(self, delegate) -> None:
+    def __init__(self, delegate, signal: str) -> None:
         self._delegate = delegate
+        self._signal = signal
 
     def export(self, batch):
         try:
             result = self._delegate.export(batch)
         except BaseException:
-            _count_outcome(False)
+            _count_outcome(self._signal, False)
             raise
-        _count_outcome(result is LogRecordExportResult.SUCCESS or result is SpanExportResult.SUCCESS)
+        _count_outcome(self._signal, result is LogRecordExportResult.SUCCESS or result is SpanExportResult.SUCCESS)
         return result
 
     def shutdown(self, timeout_millis: float | None = None):
@@ -227,17 +232,18 @@ class _OutcomeCountingExporter:
 # Batch processors built by this module, with the PID of the process that built them. A forked
 # child still references its parent's processors (their queues are cleared by the SDK at fork),
 # so buffered_records() counts only those of the current process.
-_batch_processors: list[tuple[int, weakref.ref]] = []
+_batch_processors: list[tuple[int, str, weakref.ref]] = []
 
 
-def _register_batch_processor(processor) -> None:
+def _register_batch_processor(processor, signal: str) -> None:
     pid = os.getpid()
-    _batch_processors[:] = [(p, ref) for p, ref in _batch_processors if p == pid and ref() is not None]
-    _batch_processors.append((pid, weakref.ref(processor)))
+    _batch_processors[:] = [(p, s, ref) for p, s, ref in _batch_processors if p == pid and ref() is not None]
+    _batch_processors.append((pid, signal, weakref.ref(processor)))
 
 
-def buffered_records() -> int | None:
-    """Log records and spans waiting in the batch queues of this process's providers.
+def buffered_records(signal: str) -> int | None:
+    """Log records (signal "logs") or spans ("traces") waiting in the batch queues of this
+    process's providers.
 
     None when the SDK's internal queue cannot be read (its layout changed). Relies on SDK 1.44
     internals: BatchLogRecordProcessor and BatchSpanProcessor keep a BatchProcessor whose queue
@@ -245,9 +251,9 @@ def buffered_records() -> int | None:
     """
     pid = os.getpid()
     total = 0
-    for owner, ref in list(_batch_processors):
+    for owner, kind, ref in list(_batch_processors):
         processor = ref()
-        if owner != pid or processor is None:
+        if owner != pid or kind != signal or processor is None:
             continue
         try:
             total += len(processor._batch_processor._queue)
@@ -292,13 +298,13 @@ def build_logger_provider(
 ) -> LoggerProvider:
     # shutdown_on_exit=False: bootstrap owns shutdown ordering (remove handlers first, then flush).
     provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
-    counted = _OutcomeCountingExporter(exporter)
+    counted = _OutcomeCountingExporter(exporter, SIGNAL_LOGS)
     if synchronous:
         processor = SimpleLogRecordProcessor(counted)
     else:
         kwargs = {} if max_queue_size is None else {"max_queue_size": max_queue_size}
         processor = BatchLogRecordProcessor(counted, **kwargs)
-        _register_batch_processor(processor)
+        _register_batch_processor(processor, SIGNAL_LOGS)
     provider.add_log_record_processor(processor)
     return provider
 
@@ -705,12 +711,12 @@ def build_tracer_provider(
 ) -> TracerProvider:
     # shutdown_on_exit=False: bootstrap owns shutdown ordering, as for the LoggerProvider.
     provider = TracerProvider(sampler=sampler, resource=resource, shutdown_on_exit=False)
-    counted = _OutcomeCountingExporter(exporter)
+    counted = _OutcomeCountingExporter(exporter, SIGNAL_TRACES)
     if synchronous:
         inner = SimpleSpanProcessor(counted)
     else:
         inner = BatchSpanProcessor(counted)
-        _register_batch_processor(inner)
+        _register_batch_processor(inner, SIGNAL_TRACES)
     provider.add_span_processor(RedactingSpanProcessor(inner))
     return provider
 

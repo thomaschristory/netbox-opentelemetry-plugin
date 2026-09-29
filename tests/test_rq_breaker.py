@@ -6,12 +6,14 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, LogRecordExportResult
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from rq.worker.base import BaseWorker
 from rq.worker.worker_classes import Worker
 
 from netbox_opentelemetry_plugin import bootstrap, otel
 from netbox_opentelemetry_plugin.modules import rq as rq_module
-from tests.test_rq_module import ARGV_RQ, USER, stubs  # noqa: F401  (fixture)
+from tests.test_rq_module import ARGV_RQ, TRACES, USER, stubs  # noqa: F401  (fixture)
 
 # Python 3.12+ warns when forking a process that has threads (the batch worker). Expected here.
 FORK_WARNING = "ignore:.*use of fork\\(\\) may lead to deadlocks:DeprecationWarning"
@@ -219,7 +221,7 @@ def test_horses_skip_the_flush_after_threshold_failures(stubs, outcomes, as_hors
 
 def test_an_outage_of_one_signal_does_not_skip_the_other(stubs, outcomes, as_horse):  # noqa: F811
     outcomes.results = [{"logs": EXPORTED, "traces": TIMED_OUT}] * 4
-    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 2}}, env={}, argv=ARGV_RQ)
+    bootstrap.install({**TRACES, "rq": {"flush_breaker_threshold": 2}}, env={}, argv=ARGV_RQ)
     for _ in range(4):
         _run_horse()
     assert outcomes.flushed == [["logs", "traces"]] * 2 + [["logs"]] * 2
@@ -320,3 +322,112 @@ def test_breaker_errors_never_break_the_job(stubs, outcomes, as_horse, monkeypat
     for _ in range(3):
         assert _run_horse() is True
     assert outcomes.flushed == [["logs"]] * 3
+
+
+def test_a_rejected_batch_among_successful_exports_is_not_an_outage(stubs, outcomes, as_horse):  # noqa: F811
+    # For example one oversized batch rejected with HTTP 413 while the other batches went through.
+    outcomes.results = [{"logs": (True, 2, 1)}] * 3
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
+    for _ in range(3):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 3
+
+
+def _external_logger_provider():
+    resource = otel.build_resource("ext", {}, service_version="x", plugin_version="x", role="rqworker")
+    return otel.build_logger_provider(resource, InMemoryLogRecordExporter(), synchronous=True)
+
+
+def _external_tracer_provider():
+    resource = otel.build_resource("ext", {}, service_version="x", plugin_version="x", role="rqworker")
+    return otel.build_tracer_provider(
+        resource, InMemorySpanExporter(), otel.build_sampler("always_on", 1.0), synchronous=True
+    )
+
+
+BOTH_DOWN = {"logs": TIMED_OUT, "traces": TIMED_OUT}
+
+
+def test_no_breaker_for_a_logger_provider_configured_outside_the_plugin(
+    stubs,  # noqa: F811
+    outcomes,
+    as_horse,
+    monkeypatch,
+):
+    # Its exports are not counted, so a flush could never count as a success and close the breaker.
+    external = _external_logger_provider()
+    monkeypatch.setattr(otel, "existing_logger_provider", lambda: external)
+    outcomes.results = [BOTH_DOWN] * 4
+    try:
+        bootstrap.install({**TRACES, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
+        for _ in range(4):
+            _run_horse()
+    finally:
+        external.shutdown()
+    # Logs are always flushed; the traces provider is the plugin's own and keeps its breaker.
+    assert outcomes.flushed == [["logs", "traces"]] + [["logs"]] * 3
+
+
+def test_no_breaker_for_a_tracer_provider_configured_outside_the_plugin(
+    stubs,  # noqa: F811
+    outcomes,
+    as_horse,
+    monkeypatch,
+):
+    external = _external_tracer_provider()
+    monkeypatch.setattr(otel, "existing_tracer_provider", lambda: external)
+    outcomes.results = [BOTH_DOWN] * 4
+    try:
+        bootstrap.install({**TRACES, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
+        for _ in range(4):
+            _run_horse()
+    finally:
+        external.shutdown()
+    assert outcomes.flushed == [["logs", "traces"]] + [["traces"]] * 3
+
+
+class _SwitchableLogExporter(InMemoryLogRecordExporter):
+    """Fails every export while `down`, and counts the exports it was asked to make."""
+
+    def __init__(self):
+        super().__init__()
+        self.down = True
+        self.exports = 0
+
+    def export(self, batch):
+        self.exports += 1
+        if self.down:
+            return LogRecordExportResult.FAILURE
+        return super().export(batch)
+
+
+def test_breaker_with_the_real_flush_and_export_counters(stubs, as_horse, monkeypatch, caplog):  # noqa: F811
+    # No scripted outcomes: the plugin's own batch LoggerProvider, counting exporter and flush.
+    exporter = _SwitchableLogExporter()
+    monkeypatch.setattr(otel, "build_log_exporter", lambda cfg: exporter)
+    clock = Clock()
+    monkeypatch.setattr(rq_module.time, "monotonic", clock)
+    bootstrap.install(
+        {**USER, "rq": {"flush_breaker_threshold": 2, "flush_breaker_cooldown": 30}}, env={}, argv=ARGV_RQ
+    )
+    job_logger = logging.getLogger("t.rq")
+
+    def horse():
+        job_logger.warning("job record")
+        _run_horse()
+
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        horse()
+        horse()
+        assert exporter.exports == 2
+        assert any("now skip it" in r.getMessage() for r in caplog.records)
+        horse()  # skipped: nothing exported
+        assert exporter.exports == 2
+        exporter.down = False
+        clock.now += 31
+        horse()  # the probe succeeds and closes the breaker
+        assert exporter.exports == 3
+        horse()
+        assert exporter.exports == 4
+    (recovered,) = [r.getMessage() for r in caplog.records if "succeeded again" in r.getMessage()]
+    assert "1 flushes were skipped, dropping 1 buffered log records" in recovered

@@ -465,6 +465,7 @@ def _setup_logger_provider(ctx: Context, state: _State) -> None:
         max_queue_size = AUDIT_QUEUE_SIZE if ctx.settings.audit.enabled else None
         ctx.logger_provider = otel.build_logger_provider(ctx.resource, exporter, max_queue_size=max_queue_size)
         state.owns_logger_provider = True
+        ctx.counted_signals = ctx.counted_signals | {otel.SIGNAL_LOGS}
     except Exception as exc:
         logger.warning("OpenTelemetry: log export disabled: could not build exporter: %s", _describe(exc, ctx.settings))
 
@@ -491,6 +492,7 @@ def _setup_tracer_provider(ctx: Context, state: _State) -> None:
         return
     ctx.tracer_provider = otel.SwitchableTracerProvider(provider)
     state.owns_tracer_provider = True
+    ctx.counted_signals = ctx.counted_signals | {otel.SIGNAL_TRACES}
 
 
 def _build_metrics_pipeline(settings: conf.Settings, resource) -> otel.MetricsPipeline:

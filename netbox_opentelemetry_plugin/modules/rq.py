@@ -107,10 +107,13 @@ class RqModule:
         breakers = {}
         if cfg.flush_breaker_threshold > 0:
             # One per signal: logs and traces can go to different endpoints, and an outage of one
-            # must not make horses drop the other.
+            # must not make horses drop the other. Only for providers the plugin built: the exports
+            # of one configured outside the plugin are not counted, so no flush could ever count as a
+            # success and close the breaker again.
             breakers = {
                 signal: FlushBreaker(cfg.flush_breaker_threshold, cfg.flush_breaker_cooldown)
                 for signal in BREAKER_SIGNALS
+                if signal in ctx.counted_signals
             }
         if isinstance(inspect.getattr_static(BaseWorker, "is_horse", None), property):
             self._wrap(BaseWorker, "perform_job", _perform_job_wrapper(ctx, breakers), WORKER_PARAMS)
@@ -465,7 +468,10 @@ def _flush_horse(
 
 def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bool, before, after) -> None:
     label = SIGNAL_LABELS[signal]
-    if not completed or after.failed > before.failed:
+    exported = after.succeeded > before.succeeded
+    # A failed export alongside successful ones (for example one oversized batch rejected by a
+    # proxy) shows the endpoint is reachable: not counted as a failed flush.
+    if not completed or (after.failed > before.failed and not exported):
         if breaker.record_failure():
             logger.warning(
                 "OpenTelemetry: the RQ work-horse flush of %s did not finish or failed %s times in a row; "
@@ -477,7 +483,7 @@ def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bo
                 label,
             )
         return
-    if after.succeeded == before.succeeded:
+    if not exported:
         # Nothing was exported: no evidence either way about the endpoint.
         return
     summary = breaker.record_success()

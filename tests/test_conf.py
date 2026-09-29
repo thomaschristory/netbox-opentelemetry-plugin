@@ -245,12 +245,21 @@ def test_malformed_port_does_not_break_redacted_output():
 
 def test_rq_defaults():
     s = conf.resolve({}, ENDPOINT_ENV)
-    assert s.rq == conf.RqConfig(enabled=True, patch_worker=True, flush_timeout=5.0, propagate_context=True)
+    assert s.rq == conf.RqConfig(
+        enabled=True,
+        patch_worker=True,
+        flush_timeout=5.0,
+        propagate_context=True,
+        flush_breaker_threshold=3,
+        flush_breaker_cooldown=30.0,
+    )
     assert s.redacted()["rq"] == {
         "enabled": True,
         "patch_worker": True,
         "flush_timeout": 5.0,
         "propagate_context": True,
+        "flush_breaker_threshold": 3,
+        "flush_breaker_cooldown": 30.0,
     }
 
 
@@ -260,7 +269,32 @@ def test_rq_explicit_values():
     assert s.rq.flush_timeout == 2.0
 
 
-@pytest.mark.parametrize("bad", [{"flush_timeout": 0}, {"flush_timeout": True}, {"patch_worker": "yes"}, "on"])
+def test_rq_flush_breaker_explicit_values():
+    s = conf.resolve({"rq": {"flush_breaker_threshold": 0, "flush_breaker_cooldown": 5}}, ENDPOINT_ENV)
+    assert s.rq.flush_breaker_threshold == 0
+    assert s.rq.flush_breaker_cooldown == 5.0
+    assert isinstance(s.rq.flush_breaker_cooldown, float)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"flush_timeout": 0},
+        {"flush_timeout": True},
+        {"patch_worker": "yes"},
+        "on",
+        {"flush_breaker_threshold": -1},
+        {"flush_breaker_threshold": 2.5},
+        {"flush_breaker_threshold": True},
+        {"flush_breaker_threshold": "3"},
+        {"flush_breaker_cooldown": 0},
+        {"flush_breaker_cooldown": -5},
+        {"flush_breaker_cooldown": False},
+        {"flush_breaker_cooldown": float("inf")},
+        {"flush_breaker_cooldown": float("nan")},
+        {"flush_breaker_cooldown": "30"},
+    ],
+)
 def test_bad_rq_value_disables_only_rq(bad):
     s = conf.resolve({"rq": bad}, ENDPOINT_ENV)
     assert s.enabled is True

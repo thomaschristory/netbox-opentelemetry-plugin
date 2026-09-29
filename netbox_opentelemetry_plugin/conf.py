@@ -77,6 +77,8 @@ DEFAULTS: dict[str, Any] = {
         "patch_worker": True,
         "propagate_context": True,
         "flush_timeout": 5,
+        "flush_breaker_threshold": 3,
+        "flush_breaker_cooldown": 30,
     },
 }
 
@@ -215,6 +217,10 @@ class RqConfig:
     patch_worker: bool = True
     flush_timeout: float = 5.0
     propagate_context: bool = True
+    # Consecutive failed work-horse flushes after which horses skip their flush; 0 turns this off.
+    flush_breaker_threshold: int = 3
+    # Seconds between two full flush attempts while horses are skipping their flush.
+    flush_breaker_cooldown: float = 30.0
 
     def redacted(self) -> dict[str, Any]:
         return {
@@ -222,6 +228,8 @@ class RqConfig:
             "patch_worker": self.patch_worker,
             "flush_timeout": self.flush_timeout,
             "propagate_context": self.propagate_context,
+            "flush_breaker_threshold": self.flush_breaker_threshold,
+            "flush_breaker_cooldown": self.flush_breaker_cooldown,
         }
 
 
@@ -484,23 +492,30 @@ def _resolve_rq(section: Mapping[str, Any]) -> RqConfig:
     if not enabled:
         return RQ_OFF
     patch_worker = _typed(section.get("patch_worker", defaults["patch_worker"]), bool, "rq.patch_worker")
-    flush_timeout = section.get("flush_timeout", defaults["flush_timeout"])
-    if (
-        isinstance(flush_timeout, bool)
-        or not isinstance(flush_timeout, int | float)
-        or flush_timeout <= 0
-        or not math.isfinite(flush_timeout)
-    ):
-        raise ConfigError("rq.flush_timeout must be a positive number of seconds")
+    flush_timeout = _positive_seconds(section.get("flush_timeout", defaults["flush_timeout"]), "rq.flush_timeout")
     propagate_context = _typed(
         section.get("propagate_context", defaults["propagate_context"]), bool, "rq.propagate_context"
+    )
+    threshold = section.get("flush_breaker_threshold", defaults["flush_breaker_threshold"])
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 0:
+        raise ConfigError("rq.flush_breaker_threshold must be a non-negative integer")
+    cooldown = _positive_seconds(
+        section.get("flush_breaker_cooldown", defaults["flush_breaker_cooldown"]), "rq.flush_breaker_cooldown"
     )
     return RqConfig(
         enabled=enabled,
         patch_worker=patch_worker,
-        flush_timeout=float(flush_timeout),
+        flush_timeout=flush_timeout,
         propagate_context=propagate_context,
+        flush_breaker_threshold=threshold,
+        flush_breaker_cooldown=cooldown,
     )
+
+
+def _positive_seconds(value: Any, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0 or not math.isfinite(value):
+        raise ConfigError(f"{path} must be a positive number of seconds")
+    return float(value)
 
 
 # Seconds; a shorter metrics.export_interval is raised to this with a warning.

@@ -9,6 +9,9 @@ With tracing, Queue.enqueue_job stores the W3C trace context of the current span
 perform_job runs each job inside a CONSUMER span whose parent is that context. The span ends
 before the horse flush.
 
+While exports keep failing (a Collector outage), horses skip that flush instead of each waiting up to
+rq.flush_timeout, so the worker keeps its normal pace; see FlushBreaker.
+
 With metrics, the worker parent records netbox.rq.job.duration and netbox.rq.jobs around execute_job
 (the horse records no metrics), and every rqworker process reports netbox.rq.queue.depth.
 """
@@ -18,8 +21,11 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+import mmap
 import os
+import struct
 import time
+from typing import NamedTuple
 
 from .. import otel
 from ..conf import Settings
@@ -96,14 +102,17 @@ class RqModule:
             self._register_queue_depth(ctx)
         if not cfg.patch_worker:
             return
+        breaker = None
+        if cfg.flush_breaker_threshold > 0:
+            breaker = FlushBreaker(cfg.flush_breaker_threshold, cfg.flush_breaker_cooldown)
         if isinstance(inspect.getattr_static(BaseWorker, "is_horse", None), property):
-            self._wrap(BaseWorker, "perform_job", _perform_job_wrapper(ctx), WORKER_PARAMS)
+            self._wrap(BaseWorker, "perform_job", _perform_job_wrapper(ctx, breaker), WORKER_PARAMS)
         else:
             logger.warning(
                 "OpenTelemetry: rq BaseWorker.is_horse is not a property; the work-horse flush and job "
                 "spans are disabled"
             )
-        self._wrap(Worker, "fork_work_horse", _fork_work_horse_wrapper(), WORKER_PARAMS)
+        self._wrap(Worker, "fork_work_horse", _fork_work_horse_wrapper(breaker), WORKER_PARAMS)
         if ctx.meter_provider is not None:
             job_metrics = _JobMetrics(ctx.meter_provider)
             self._wrap(Worker, "execute_job", _execute_job_wrapper(job_metrics), WORKER_PARAMS)
@@ -381,9 +390,10 @@ class _JobSpan:
         return False
 
 
-def _perform_job_wrapper(ctx: Context):
+def _perform_job_wrapper(ctx: Context, breaker: FlushBreaker | None = None):
     def make(original):
         def perform_job(self, job, queue):
+            before = _outcomes_or_none() if breaker is not None and getattr(self, "is_horse", False) else None
             try:
                 with _JobSpan(ctx, self, job, queue) as span:
                     result = original(self, job, queue)
@@ -393,29 +403,186 @@ def _perform_job_wrapper(ctx: Context):
                 # Only a forked work-horse exits (os._exit) right after this returns. A SimpleWorker
                 # runs jobs in the long-lived worker process, whose batch processors flush normally.
                 if getattr(self, "is_horse", False):
-                    _flush_horse(ctx)
+                    _flush_horse(ctx, breaker, before)
 
         return perform_job
 
     return make
 
 
-def _flush_horse(ctx: Context) -> None:
+def _outcomes_or_none() -> otel.ExportOutcomes | None:
+    try:
+        return otel.export_outcomes()
+    except Exception:
+        return None
+
+
+def _flush_horse(ctx: Context, breaker: FlushBreaker | None = None, before: otel.ExportOutcomes | None = None) -> None:
     from .. import bootstrap
 
-    timeout = ctx.settings.rq.flush_timeout
+    cfg = ctx.settings.rq
+    if breaker is not None:
+        try:
+            if breaker.should_skip():
+                breaker.record_skip(otel.buffered_records())
+                return
+        except Exception as exc:
+            _warn_once("breaker", "OpenTelemetry: RQ work-horse flush breaker failed: %s", type(exc).__name__)
+            breaker = None
+    completed = False
     try:
-        if not bootstrap.force_flush(timeout):
-            logger.warning("OpenTelemetry: flush in the RQ work-horse did not finish within %s s", timeout)
+        completed = bootstrap.force_flush(cfg.flush_timeout)
+        if not completed:
+            logger.warning("OpenTelemetry: flush in the RQ work-horse did not finish within %s s", cfg.flush_timeout)
     except Exception as exc:
         _warn_once("flush", "OpenTelemetry: flush in the RQ work-horse failed: %s", type(exc).__name__)
+    if breaker is None or before is None:
+        return
+    try:
+        _record_flush_outcome(breaker, cfg, completed, before, otel.export_outcomes())
+    except Exception as exc:
+        _warn_once("breaker", "OpenTelemetry: RQ work-horse flush breaker failed: %s", type(exc).__name__)
 
 
-def _fork_work_horse_wrapper():
+def _record_flush_outcome(breaker: FlushBreaker, cfg, completed: bool, before, after) -> None:
+    failed = after.failed > before.failed
+    if not completed or failed:
+        if breaker.record_failure():
+            logger.warning(
+                "OpenTelemetry: %s work-horse flushes in a row did not finish or their exports failed; "
+                "RQ work-horses now skip their flush, with one full flush attempt every %s s until an "
+                "export succeeds. Records buffered in a work-horse that skips its flush are dropped",
+                cfg.flush_breaker_threshold,
+                cfg.flush_breaker_cooldown,
+            )
+        return
+    if after.succeeded == before.succeeded:
+        # Nothing was exported: no evidence either way about the Collector.
+        return
+    summary = breaker.record_success()
+    if summary is None:
+        return
+    uncounted = f"; the records could not be counted in {summary.uncounted} of them" if summary.uncounted else ""
+    logger.warning(
+        "OpenTelemetry: export from the RQ work-horse succeeded again, work-horses flush normally. "
+        "%s work-horse flushes were skipped, dropping %s buffered log records and spans%s",
+        summary.skipped,
+        summary.dropped,
+        uncounted,
+    )
+
+
+class SkipSummary(NamedTuple):
+    skipped: int
+    dropped: int
+    uncounted: int
+
+
+# failures (consecutive), retry_at (monotonic seconds), skipped, dropped, uncounted
+_BREAKER_STATE = struct.Struct("=qdqqq")
+
+
+class FlushBreaker:
+    """Circuit breaker for the work-horse flush, shared by a worker and the horses it forks.
+
+    The worker parent allocates an anonymous shared memory page (MAP_SHARED, so writes are seen
+    across fork) before its first fork; each horse reads and updates it, and the worker itself
+    never touches it after that. rq runs one horse at a time per worker and waits for it to exit
+    before forking the next, so there is never more than one writer and no lock is needed. A
+    horse that is SIGKILLed mid-update can leave one field stale; the next outcome corrects it.
+
+    After `threshold` consecutive failed flushes (the flush hit rq.flush_timeout, or an export
+    failed), horses skip their flush. Once `cooldown` seconds have passed, the next horse flushes
+    in full: a success closes the breaker, a failure keeps it open for another `cooldown`. Only a
+    horse of the process that prepared the breaker uses it (os.getppid() check), so another fork
+    of the worker (the rq scheduler), or a process forked by a job, is unaffected; each worker of
+    an rq worker pool allocates its own page.
+    """
+
+    def __init__(self, threshold: int, cooldown: float, clock=None) -> None:
+        self._threshold = threshold
+        self._cooldown = cooldown
+        self._clock = clock
+        self._mem: mmap.mmap | None = None
+        self._owner: int | None = None
+
+    def prepare(self) -> None:
+        """Worker parent, before each fork: allocate the shared page once per process. May raise."""
+        pid = os.getpid()
+        if self._owner == pid and self._mem is not None:
+            return
+        self._mem, self._owner = None, None
+        mem = mmap.mmap(-1, _BREAKER_STATE.size)
+        mem[:] = _BREAKER_STATE.pack(0, 0.0, 0, 0, 0)
+        self._mem, self._owner = mem, pid
+
+    def _now(self) -> float:
+        return (self._clock or time.monotonic)()
+
+    def _active(self) -> bool:
+        return self._mem is not None and self._owner == os.getppid()
+
+    def _read(self) -> list:
+        return list(_BREAKER_STATE.unpack(self._mem[:]))
+
+    def _write(self, state: list) -> None:
+        self._mem[:] = _BREAKER_STATE.pack(*state)
+
+    def should_skip(self) -> bool:
+        if not self._active():
+            return False
+        failures, retry_at, *_ = self._read()
+        return failures >= self._threshold and self._now() < retry_at
+
+    def record_skip(self, dropped: int | None) -> None:
+        if not self._active():
+            return
+        state = self._read()
+        state[2] += 1
+        if dropped is None:
+            state[4] += 1
+        else:
+            state[3] += dropped
+        self._write(state)
+
+    def record_failure(self) -> bool:
+        """True when this failure opened the breaker."""
+        if not self._active():
+            return False
+        state = self._read()
+        was_open = state[0] >= self._threshold
+        state[0] += 1
+        if state[0] >= self._threshold:
+            state[1] = self._now() + self._cooldown
+        self._write(state)
+        return not was_open and state[0] >= self._threshold
+
+    def record_success(self) -> SkipSummary | None:
+        """Close the breaker. Returns what was skipped when it had been open, otherwise None."""
+        if not self._active():
+            return None
+        failures, _, skipped, dropped, uncounted = self._read()
+        self._write([0, 0.0, 0, 0, 0])
+        if failures < self._threshold and not skipped:
+            return None
+        return SkipSummary(skipped, dropped, uncounted)
+
+
+def _fork_work_horse_wrapper(breaker: FlushBreaker | None = None):
     def make(original):
         def fork_work_horse(self, job, queue):
             from .. import bootstrap
 
+            if breaker is not None:
+                try:
+                    breaker.prepare()
+                except Exception as exc:
+                    _warn_once(
+                        "breaker-prepare",
+                        "OpenTelemetry: could not set up the RQ work-horse flush breaker, horses always flush "
+                        "in full: %s",
+                        type(exc).__name__,
+                    )
             bootstrap.set_next_fork_role(bootstrap.ROLE_RQ_HORSE)
             try:
                 return original(self, job, queue)

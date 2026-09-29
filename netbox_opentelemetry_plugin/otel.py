@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import socket
 import threading
 import time
@@ -71,6 +72,29 @@ LOG_ATTRIBUTE_ALLOWLIST = frozenset(
 )
 
 
+# (pid, id) for this process; a forked child has a different PID and so builds its own.
+_instance_id: tuple[int, str] | None = None
+
+
+def service_instance_id() -> str:
+    """Return this process's service.instance.id, `<hostname>-<pid>-<6 hex>`.
+
+    The OpenTelemetry semantic conventions require the id to be unique per service.name (and
+    namespace). Hostname and PID alone are not: a restarted container usually gets the same
+    hostname and PID. The random suffix comes from os.urandom (via secrets), so it is not copied
+    across fork or restart the way a seeded `random` state could be. The value is fixed for the
+    life of a process and regenerated when the PID changes, that is in every forked child.
+    """
+    global _instance_id
+    pid = os.getpid()
+    cached = _instance_id
+    if cached is not None and cached[0] == pid:
+        return cached[1]
+    value = f"{socket.gethostname()}-{pid}-{secrets.token_hex(3)}"
+    _instance_id = (pid, value)
+    return value
+
+
 def build_resource(
     service_name: str,
     resource_attributes: Mapping[str, str | bool | int | float],
@@ -84,7 +108,7 @@ def build_resource(
         {
             "service.name": service_name,
             "service.version": service_version,
-            "service.instance.id": f"{socket.gethostname()}-{os.getpid()}",
+            "service.instance.id": service_instance_id(),
             "netbox.plugin.version": plugin_version,
             "netbox.process.role": role,
         }

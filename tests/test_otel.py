@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -61,8 +62,45 @@ def test_build_resource_attributes(resource):
     assert attrs["service.version"] == "4.7.1"
     assert attrs["netbox.plugin.version"] == "0.1.0"
     assert attrs["netbox.process.role"] == "web"
-    assert attrs["service.instance.id"] == f"{socket.gethostname()}-{os.getpid()}"
+    assert re.fullmatch(rf"{re.escape(socket.gethostname())}-{os.getpid()}-[0-9a-f]{{6}}", attrs["service.instance.id"])
     assert attrs["deployment.environment.name"] == "test"
+
+
+def test_instance_id_is_stable_within_a_process():
+    assert otel.service_instance_id() == otel.service_instance_id()
+    first = otel.build_resource("netbox", {}, service_version="4.7.1", plugin_version="0.1.0", role="web")
+    second = otel.build_resource("netbox", {}, service_version="4.7.1", plugin_version="0.1.0", role="rqworker")
+    assert first.attributes["service.instance.id"] == second.attributes["service.instance.id"]
+
+
+def test_instance_id_suffix_is_random_per_process(monkeypatch):
+    """Same hostname and PID (a restarted container) still gives a different identity."""
+    ids = set()
+    for _ in range(50):
+        monkeypatch.setattr(otel, "_instance_id", None)
+        ids.add(otel.service_instance_id())
+    assert len(ids) == 50
+    assert {i.rsplit("-", 1)[0] for i in ids} == {f"{socket.gethostname()}-{os.getpid()}"}
+
+
+def test_instance_id_is_regenerated_for_a_new_pid(monkeypatch):
+    parent = otel.service_instance_id()
+    monkeypatch.setattr(otel.os, "getpid", lambda: 999999)
+    child = otel.service_instance_id()
+    assert child != parent
+    assert child.rsplit("-", 1)[0] == f"{socket.gethostname()}-999999"
+
+
+def test_instance_id_is_not_derived_from_the_random_module(monkeypatch):
+    """The suffix comes from os.urandom, so a seeded or copied `random` state cannot repeat it."""
+    import random
+
+    ids = set()
+    for _ in range(5):
+        random.seed(0)
+        monkeypatch.setattr(otel, "_instance_id", None)
+        ids.add(otel.service_instance_id())
+    assert len(ids) == 5
 
 
 def test_handler_exports_allowlisted_attributes_only(pipeline):

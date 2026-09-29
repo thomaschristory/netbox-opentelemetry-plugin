@@ -69,17 +69,22 @@ def test_pipeline_exports_on_its_own_thread_every_interval():
         while not all_batches_points(exporter, "netbox.object_changes") and time.monotonic() < deadline:
             time.sleep(0.02)
         assert all_batches_points(exporter, "netbox.object_changes")
-        assert any(t.name == "otel-metrics" for t in threading.enumerate())
+        assert pipeline._thread.name == "otel-metrics"
+        assert pipeline._thread.is_alive()
     finally:
         pipeline.shutdown(1.0)
-    assert not any(t.name == "otel-metrics" and t.is_alive() for t in threading.enumerate())
+    # Checked on this pipeline's own thread: another test's otel-metrics thread may still be exiting.
+    assert not pipeline._thread.is_alive()
     assert exporter.shutdown_called
 
 
 def test_pipeline_reader_has_no_sdk_thread():
+    before = set(threading.enumerate())
     pipeline = otel.MetricsPipeline(RESOURCE, RecordingMetricExporter(), interval=60, timeout=1.0)
     try:
-        assert not any(t.name == "OtelPeriodicExportingMetricReader" for t in threading.enumerate())
+        started = [t for t in threading.enumerate() if t not in before]
+        assert pipeline._thread in started
+        assert not any(t.name == "OtelPeriodicExportingMetricReader" for t in started)
     finally:
         pipeline.shutdown(1.0)
 

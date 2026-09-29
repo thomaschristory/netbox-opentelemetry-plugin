@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import importlib
+import inspect
 import logging
 import math
 import os
@@ -24,7 +25,9 @@ import socket
 import threading
 import time
 import traceback
+import weakref
 from collections.abc import Mapping
+from typing import NamedTuple
 
 import opentelemetry.context
 import requests
@@ -39,6 +42,7 @@ from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import (
     BatchLogRecordProcessor,
     LogRecordExporter,
+    LogRecordExportResult,
     SimpleLogRecordProcessor,
 )
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
@@ -46,7 +50,7 @@ from opentelemetry.sdk.metrics.export import MetricExporter, MetricReader, Perio
 from opentelemetry.sdk.metrics.view import DropAggregation, View
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import Event, ReadableSpan, SpanProcessor, TracerProvider, sampling
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.trace import SpanKind, Status, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
@@ -156,6 +160,102 @@ def _http_session(cfg: ExporterConfig) -> requests.Session | None:
     return _NoVerifySession()
 
 
+class ExportOutcomes(NamedTuple):
+    succeeded: int
+    failed: int
+
+
+# Export calls made by the log and span exporters of this process, by result. A forked child
+# inherits the parent's totals; callers compare two readings taken in the same process.
+_outcomes_lock = threading.Lock()
+_outcomes = [0, 0]
+
+
+def export_outcomes() -> ExportOutcomes:
+    """Totals of log and span export calls in this process that succeeded and that failed. An
+    export that raised counts as failed. Metrics exports are not counted."""
+    with _outcomes_lock:
+        return ExportOutcomes(_outcomes[0], _outcomes[1])
+
+
+def _count_outcome(succeeded: bool) -> None:
+    with _outcomes_lock:
+        _outcomes[0 if succeeded else 1] += 1
+
+
+def _reset_outcomes_lock() -> None:
+    # A batch thread of the parent may have held the lock at fork time.
+    global _outcomes_lock
+    _outcomes_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_outcomes_lock)
+
+
+class _OutcomeCountingExporter:
+    """Passes every call through to the log or span exporter it wraps and counts each export's result."""
+
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+
+    def export(self, batch):
+        try:
+            result = self._delegate.export(batch)
+        except BaseException:
+            _count_outcome(False)
+            raise
+        _count_outcome(result is LogRecordExportResult.SUCCESS or result is SpanExportResult.SUCCESS)
+        return result
+
+    def shutdown(self, timeout_millis: float | None = None):
+        # The SDK's batch processor passes timeout_millis when the exporter's shutdown takes it; the
+        # HTTP exporters' shutdown takes no argument, the gRPC ones do.
+        shutdown = self._delegate.shutdown
+        try:
+            takes_timeout = "timeout_millis" in inspect.signature(shutdown).parameters
+        except (TypeError, ValueError):
+            takes_timeout = False
+        if timeout_millis is not None and takes_timeout:
+            return shutdown(timeout_millis=timeout_millis)
+        return shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._delegate.force_flush(timeout_millis)
+
+
+# Batch processors built by this module, with the PID of the process that built them. A forked
+# child still references its parent's processors (their queues are cleared by the SDK at fork),
+# so buffered_records() counts only those of the current process.
+_batch_processors: list[tuple[int, weakref.ref]] = []
+
+
+def _register_batch_processor(processor) -> None:
+    pid = os.getpid()
+    _batch_processors[:] = [(p, ref) for p, ref in _batch_processors if p == pid and ref() is not None]
+    _batch_processors.append((pid, weakref.ref(processor)))
+
+
+def buffered_records() -> int | None:
+    """Log records and spans waiting in the batch queues of this process's providers.
+
+    None when the SDK's internal queue cannot be read (its layout changed). Relies on SDK 1.44
+    internals: BatchLogRecordProcessor and BatchSpanProcessor keep a BatchProcessor whose queue
+    is a deque.
+    """
+    pid = os.getpid()
+    total = 0
+    for owner, ref in list(_batch_processors):
+        processor = ref()
+        if owner != pid or processor is None:
+            continue
+        try:
+            total += len(processor._batch_processor._queue)
+        except Exception:
+            return None
+    return total
+
+
 def build_log_exporter(cfg: ExporterConfig) -> LogRecordExporter:
     if cfg.protocol == "grpc":
         from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
@@ -192,11 +292,13 @@ def build_logger_provider(
 ) -> LoggerProvider:
     # shutdown_on_exit=False: bootstrap owns shutdown ordering (remove handlers first, then flush).
     provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
+    counted = _OutcomeCountingExporter(exporter)
     if synchronous:
-        processor = SimpleLogRecordProcessor(exporter)
+        processor = SimpleLogRecordProcessor(counted)
     else:
         kwargs = {} if max_queue_size is None else {"max_queue_size": max_queue_size}
-        processor = BatchLogRecordProcessor(exporter, **kwargs)
+        processor = BatchLogRecordProcessor(counted, **kwargs)
+        _register_batch_processor(processor)
     provider.add_log_record_processor(processor)
     return provider
 
@@ -603,7 +705,12 @@ def build_tracer_provider(
 ) -> TracerProvider:
     # shutdown_on_exit=False: bootstrap owns shutdown ordering, as for the LoggerProvider.
     provider = TracerProvider(sampler=sampler, resource=resource, shutdown_on_exit=False)
-    inner = SimpleSpanProcessor(exporter) if synchronous else BatchSpanProcessor(exporter)
+    counted = _OutcomeCountingExporter(exporter)
+    if synchronous:
+        inner = SimpleSpanProcessor(counted)
+    else:
+        inner = BatchSpanProcessor(counted)
+        _register_batch_processor(inner)
     provider.add_span_processor(RedactingSpanProcessor(inner))
     return provider
 

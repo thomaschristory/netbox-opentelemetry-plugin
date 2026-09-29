@@ -894,6 +894,22 @@ class _GrpcReceiver:
         with self._cond:
             return {(r["signal"], n) for r in self._received if r["instance_id"] == instance_id for n in r["names"]}
 
+    def count(self, instance_id: str, signal: str) -> int:
+        """How many resources of `signal` arrived from `instance_id` (one per resource in each Export request)."""
+        with self._cond:
+            return sum(1 for r in self._received if r["instance_id"] == instance_id and r["signal"] == signal)
+
+    def wait_count(self, instance_id: str, signal: str, minimum: int) -> int:
+        """Wait until at least `minimum` resources of `signal` arrived from `instance_id`; return the count."""
+        deadline = time.monotonic() + RECEIVE_TIMEOUT
+        with self._cond:
+            while True:
+                received = self.count(instance_id, signal)
+                remaining = deadline - time.monotonic()
+                if received >= minimum or remaining <= 0:
+                    return received
+                self._cond.wait(remaining)
+
     def missing(self, instance_id: str, expected: set[tuple[str, str]]) -> set[tuple[str, str]]:
         """Wait until every (signal, name) in `expected` arrived from `instance_id`; return what did not."""
         deadline = time.monotonic() + RECEIVE_TIMEOUT
@@ -985,6 +1001,10 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
 
     assert emit("parent")
     assert not grpc_receiver.missing(parent_id, expected("parent"))
+    # Left unflushed in the parent's batch queues when the children are forked. No child may send them.
+    lg.info("log parent pending")
+    with tracer.start_as_current_span("span parent pending", kind=SpanKind.SERVER):
+        pass
 
     for n in range(GRPC_CHILDREN):
         tag = f"child {n}"
@@ -1011,8 +1031,14 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
         # Nothing of the parent's was sent again under the child's identity.
         assert not {name for _, name in grpc_receiver.names(result["instance_id"]) if "parent" in name}
 
+    # The metric name carries no tag and was already received from the parent, so the name check alone
+    # would pass without a new export. Require one more metrics export from the parent.
+    metrics_before = grpc_receiver.count(parent_id, "metrics")
     assert emit("parent after forks")
     assert not grpc_receiver.missing(parent_id, expected("parent after forks"))
+    assert grpc_receiver.wait_count(parent_id, "metrics", metrics_before + 1) > metrics_before
+    # The parent still delivers the records it held across the forks, under its own identity.
+    assert not grpc_receiver.missing(parent_id, {("logs", "log parent pending"), ("traces", "span parent pending")})
     assert {kind: len(exporters) for kind, exporters in built.items()} == {"logs": 1, "traces": 1, "metrics": 1}
 
 

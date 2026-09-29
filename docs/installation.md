@@ -38,7 +38,7 @@ RUN /usr/local/bin/uv pip install -r /opt/netbox/plugin_requirements.txt
 with `plugin_requirements.txt` containing:
 
 ```text
-netbox-opentelemetry-plugin==0.2.2
+netbox-opentelemetry-plugin==0.3.0
 ```
 
 `PLUGINS` and `PLUGINS_CONFIG` go in a file such as `/etc/netbox/config/plugins.py`; netbox-docker loads every `*.py` file it finds in `/etc/netbox/config/`. The endpoint can instead come from the container environment, `OTEL_EXPORTER_OTLP_ENDPOINT`, which avoids baking it into the config file.

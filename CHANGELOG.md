@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-29
+
 ### Added
 
 - `rq.flush_breaker_threshold` and `rq.flush_breaker_cooldown`: during a Collector outage, RQ work-horses skip their flush of log records, or of spans, after 3 failed flushes of that signal in a row (a flush that hits `rq.flush_timeout`, or exports that return an error after retrying for at least 1 second, or a quarter of `rq.flush_timeout` or of that signal's `exporter.timeout` when that is shorter, in both cases with no export of that signal succeeding; a flush that hits `rq.flush_timeout` after some exports succeeded does not count, nor does an export the Collector or a proxy rejects at once, such as HTTP `413`), with one full flush attempt every 30 seconds until exports succeed again. A worker no longer slows to about one job per `rq.flush_timeout` for the length of the outage. Records buffered in a horse that skips its flush are dropped; one warning (from the work-horse, in the worker's output) is logged when skipping starts and one when it ends, with the number of skipped flushes and dropped log records and spans. The breaker covers only providers the plugin builds, not a `LoggerProvider` or `TracerProvider` configured outside it. `rq.flush_breaker_threshold = 0` restores the previous behaviour ([#4](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/4)).
@@ -55,7 +57,8 @@ All notable changes to this project are documented in this file. The format foll
 - Reuse of an OpenTelemetry SDK already configured outside the plugin (for example by `opentelemetry-instrument`).
 - NetBox 4.7 support.
 
-[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.1.0...v0.2.0

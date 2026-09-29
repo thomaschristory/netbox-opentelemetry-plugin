@@ -77,6 +77,7 @@ These are read by the OpenTelemetry SDK or the OTLP exporters directly, not by t
 - `OTEL_RESOURCE_ATTRIBUTES`: merged into the Resource by the SDK itself, underneath `resource_attributes` and the plugin's own resource keys. See [How it works](how-it-works.md).
 - `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE`: honoured by the metrics exporter; the default is cumulative temporality.
 - `OTEL_SEMCONV_STABILITY_OPT_IN`: the plugin sets this to `http` (selecting the stable HTTP semantic conventions) unless it is already set in the environment, so an operator's own value is always kept.
+- `OTEL_PROPAGATORS`: selects the trace-context formats used for inbound and outbound HTTP (default `tracecontext,baggage`). Baggage propagation is off, whatever this variable lists, in every process where the plugin's traces or metrics are on (web and worker processes); see [Traces, baggage](signals/traces.md#baggage).
 
 ## Validation
 

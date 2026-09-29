@@ -4,6 +4,10 @@ and the HTTP duration metrics (metrics); one set serves both.
 The provider handed to the instrumentors is the plugin's SwitchableTracerProvider (or a provider
 configured outside the plugin); the instrumentors keep it for the process lifetime, and bootstrap
 replaces the SDK provider behind it after fork. The same holds for the SwitchableMeterProvider.
+
+install also wraps the global propagator in otel.BaggageFreePropagator, so inbound baggage is
+never made current and outbound calls carry the trace context only; the wrapper is kept after
+shutdown.
 """
 
 from __future__ import annotations
@@ -53,6 +57,7 @@ class TracesModule:
 
     def __init__(self) -> None:
         self._instrumented: list = []
+        self._propagator_wrapped = False
 
     def enabled(self, settings: Settings) -> bool:
         return settings.traces.enabled or settings.metrics.enabled
@@ -60,6 +65,10 @@ class TracesModule:
     def install(self, ctx: Context) -> None:
         if self._instrumented or (ctx.tracer_provider is None and ctx.meter_provider is None):
             return
+        # Before any instrumentor: if the configured propagator cannot be loaded, this raises and
+        # bootstrap disables the whole module, so nothing is instrumented with baggage passthrough.
+        otel.install_baggage_free_propagator()
+        self._propagator_wrapped = True
         otel.prefer_stable_http_semconv()
         for name in instrumentations(ctx):
             try:
@@ -82,9 +91,19 @@ class TracesModule:
             self._instrumented.append(instrumentor)
 
     def after_fork(self, ctx: Context) -> None:
-        pass
+        if not self._propagator_wrapped:
+            return
+        # Re-wraps a propagator set with set_global_textmap between ready() and fork.
+        try:
+            otel.install_baggage_free_propagator()
+        except Exception as exc:
+            logger.warning(
+                "OpenTelemetry: could not re-apply the baggage-free propagator after fork: %s", type(exc).__name__
+            )
 
     def shutdown(self) -> None:
+        # The propagator wrapper is not restored: a WSGI handler that is already built keeps
+        # extracting, and restoring it would let baggage through for requests racing the shutdown.
         for instrumentor in reversed(self._instrumented):
             try:
                 instrumentor.uninstrument()

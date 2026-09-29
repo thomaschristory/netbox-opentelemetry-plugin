@@ -5,7 +5,7 @@ import threading
 
 import pytest
 import requests
-from opentelemetry import context, trace
+from opentelemetry import baggage, context, propagate, trace
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.resources import Resource
@@ -256,7 +256,7 @@ def test_metrics_only_requests_neither_continues_nor_forwards_an_inbound_trace(l
     ctx, _ = _ctx(instrument=(), traces_on=False, meter_provider=meter)
     module = TracesModule()
     module.install(ctx)
-    token = context.attach(_remote_parent())
+    token = context.attach(baggage.set_baggage("leak", "secret", _remote_parent()))
     try:
         requests.get(f"{local_server}/hook", timeout=5)
     finally:
@@ -264,6 +264,7 @@ def test_metrics_only_requests_neither_continues_nor_forwards_an_inbound_trace(l
         module.shutdown()
     assert len(_Handler.received_headers) == 1
     assert "traceparent" not in _Handler.received_headers[0]
+    assert "baggage" not in _Handler.received_headers[0]
     assert data_points(reader.get_metrics_data(), "http.client.request.duration")
 
 
@@ -328,3 +329,129 @@ def test_logs_and_audit_events_inside_a_span_carry_its_ids():
     for record in records:
         assert record.log_record.trace_id == span_ctx.trace_id
         assert record.log_record.span_id == span_ctx.span_id
+
+
+def test_install_wraps_the_global_propagator_and_shutdown_keeps_it(fakes):
+    original = propagate.get_global_textmap()
+    module = TracesModule()
+    module.install(_ctx(instrument=())[0])
+    wrapped = propagate.get_global_textmap()
+    assert isinstance(wrapped, otel.BaggageFreePropagator)
+    assert wrapped._delegate is original
+    module.shutdown()
+    assert propagate.get_global_textmap() is wrapped
+
+
+def test_a_second_install_does_not_double_wrap(fakes):
+    TracesModule().install(_ctx(instrument=())[0])
+    wrapped = propagate.get_global_textmap()
+    TracesModule().install(_ctx(instrument=())[0])
+    assert propagate.get_global_textmap() is wrapped
+    assert not isinstance(wrapped._delegate, otel.BaggageFreePropagator)
+
+
+def test_after_fork_rewraps_a_propagator_set_after_install(fakes):
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    ctx, _ = _ctx(instrument=())
+    module = TracesModule()
+    module.install(ctx)
+    foreign = TraceContextTextMapPropagator()
+    propagate.set_global_textmap(foreign)
+    module.after_fork(ctx)
+    current = propagate.get_global_textmap()
+    assert isinstance(current, otel.BaggageFreePropagator)
+    assert current._delegate is foreign
+
+
+def test_after_fork_without_install_leaves_the_propagator_alone():
+    original = propagate.get_global_textmap()
+    TracesModule().after_fork(_ctx(instrument=())[0])
+    assert propagate.get_global_textmap() is original
+
+
+def test_after_fork_rewrap_failure_logs_a_warning(fakes, monkeypatch, caplog):
+    ctx, _ = _ctx(instrument=())
+    module = TracesModule()
+    module.install(ctx)
+
+    def broken():
+        raise ValueError("Propagator b3 not found")
+
+    monkeypatch.setattr(otel, "install_baggage_free_propagator", broken)
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        module.after_fork(ctx)
+    assert [r.getMessage() for r in caplog.records] == [
+        "OpenTelemetry: could not re-apply the baggage-free propagator after fork: ValueError"
+    ]
+
+
+def _broken_propagator():
+    raise ValueError("Propagator b3 not found. It is either misspelled or not installed.")
+
+
+def test_a_wrap_failure_instruments_nothing(fakes, monkeypatch):
+    fakes.update(django=FakeInstrumentor(), requests=FakeInstrumentor())
+    monkeypatch.setattr(otel, "install_baggage_free_propagator", _broken_propagator)
+    ctx, _ = _ctx(instrument=("django", "requests"))
+    with pytest.raises(ValueError):
+        TracesModule().install(ctx)
+    assert fakes["django"].kwargs is None and fakes["requests"].kwargs is None
+
+
+def test_a_wrap_failure_disables_only_the_instrumentation_module(fakes, monkeypatch, caplog):
+    from netbox_opentelemetry_plugin import bootstrap
+
+    fakes.update(django=FakeInstrumentor())
+    monkeypatch.setattr(otel, "install_baggage_free_propagator", _broken_propagator)
+    monkeypatch.setattr(otel, "build_log_exporter", lambda cfg: InMemoryLogRecordExporter())
+    monkeypatch.setattr(otel, "build_span_exporter", lambda cfg: InMemorySpanExporter())
+    user = {
+        "exporter": {"endpoint": "http://collector:4318"},
+        "logs": {"loggers": ["t.traces.wrap"]},
+        "traces": {"enabled": True, "instrument": ["django"]},
+    }
+    bootstrap.shutdown()
+    bootstrap._state = None
+    try:
+        with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+            ctx = bootstrap.install(user, env={}, argv=["granian", "netbox.granian:application"])
+        assert ctx is not None
+        assert [m.name for m in bootstrap._state.modules] == ["logs", "audit", "rq"]
+    finally:
+        bootstrap.shutdown()
+        bootstrap._state = None
+    warnings = [r.getMessage() for r in caplog.records if "module disabled" in r.getMessage()]
+    assert warnings == [
+        "OpenTelemetry: instrumentation module disabled: ValueError: Propagator b3 not found. "
+        "It is either misspelled or not installed."
+    ]
+    assert fakes["django"].kwargs is None
+
+
+def test_inbound_baggage_is_not_extracted_after_install(fakes):
+    TracesModule().install(_ctx(instrument=())[0])
+    extracted = propagate.extract(
+        {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", "baggage": "leak=secret"}
+    )
+    assert trace.get_current_span(extracted).get_span_context().is_valid
+    assert dict(baggage.get_all(extracted)) == {}
+
+
+def test_traced_requests_forward_the_trace_context_but_not_baggage(local_server):
+    ctx, _ = _ctx(instrument=("requests",))
+    module = TracesModule()
+    module.install(ctx)
+    try:
+        tracer = ctx.tracer_provider.get_tracer("test")
+        with tracer.start_as_current_span("job", kind=SpanKind.CONSUMER) as span:
+            token = context.attach(baggage.set_baggage("leak", "secret"))
+            try:
+                requests.get(f"{local_server}/hook", timeout=5)
+            finally:
+                context.detach(token)
+    finally:
+        module.shutdown()
+    (headers,) = _Handler.received_headers
+    assert headers["traceparent"].split("-")[1] == f"{span.get_span_context().trace_id:032x}"
+    assert "baggage" not in headers

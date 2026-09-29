@@ -30,3 +30,13 @@ def _restore_semconv_opt_in():
         os.environ.pop("OTEL_SEMCONV_STABILITY_OPT_IN", None)
     else:
         os.environ["OTEL_SEMCONV_STABILITY_OPT_IN"] = saved
+
+
+@pytest.fixture(autouse=True)
+def _restore_global_propagator():
+    # TracesModule wraps the global propagator and never restores it (by design), so tests do it.
+    from opentelemetry import propagate
+
+    saved = propagate.get_global_textmap()
+    yield
+    propagate.set_global_textmap(saved)

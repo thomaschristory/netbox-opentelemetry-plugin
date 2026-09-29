@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Outbound HTTP calls from NetBox no longer forward a client's `baggage` header: inbound baggage is dropped and only the trace context is propagated, with traces on or metrics only. `OTEL_PROPAGATORS` still selects the trace-context format ([#1](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/1)).
+
 ## [0.2.1] - 2026-09-28
 
 ### Fixed

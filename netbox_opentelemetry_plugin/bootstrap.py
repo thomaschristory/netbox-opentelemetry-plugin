@@ -215,7 +215,8 @@ def reinit_after_fork() -> None:
     LoggerProvider. Idempotent: a second call in the same process does nothing. If this process
     owned its LoggerProvider and the rebuild fails, it detaches the logging handler and points the
     tracer provider at a detached provider rather than keep using the inherited, now-orphaned
-    providers.
+    providers. The module after-fork hooks run whether or not the rebuild succeeded, so the
+    traces module re-applies the baggage-free propagator in every child.
 
     This never calls shutdown() (or anything else) on an object inherited from the parent: any
     lock inside such an object (a threading.Lock, a Condition, an SSL/urllib3 connection pool
@@ -255,9 +256,9 @@ def reinit_after_fork() -> None:
                 # exporter connection, so stop exporting from this process instead of using it.
                 state.owns_logger_provider = False
                 ctx.logger_provider = None
-                for module in state.modules:
-                    with contextlib.suppress(Exception):
-                        module.after_fork(ctx)
+            # Whatever the plugin owns: the logs module detaches its handler when the provider was
+            # dropped above, and the traces module re-wraps a propagator replaced before the fork.
+            _run_modules_after_fork(ctx, state)
 
 
 def set_next_fork_role(role: str | None) -> None:
@@ -398,6 +399,10 @@ def _rebuild_for_child(ctx: Context, state: _State, role_hint: str | None) -> No
         raise
     ctx.role = role
     ctx.resource = resource
+    _run_modules_after_fork(ctx, state)
+
+
+def _run_modules_after_fork(ctx: Context, state: _State) -> None:
     for module in state.modules:
         try:
             module.after_fork(ctx)

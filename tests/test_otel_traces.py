@@ -583,3 +583,189 @@ def test_detached_tracer_provider_ignores_any_parent():
         assert trace.get_current_span().get_span_context().trace_id == 0x1234
     finally:
         context.detach(token)
+
+
+_TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+_TRACESTATE = "vendor=value"
+
+
+def _default_composite():
+    from opentelemetry.baggage.propagation import W3CBaggagePropagator
+    from opentelemetry.propagators.composite import CompositePropagator
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    return CompositePropagator([TraceContextTextMapPropagator(), W3CBaggagePropagator()])
+
+
+def test_baggage_free_extract_keeps_the_trace_context_and_drops_baggage():
+    from opentelemetry import baggage
+
+    propagator = otel.BaggageFreePropagator(_default_composite())
+    ctx = propagator.extract({"traceparent": _TRACEPARENT, "tracestate": _TRACESTATE, "baggage": "leak=secret"})
+    span_ctx = trace.get_current_span(ctx).get_span_context()
+    assert span_ctx.trace_id == 0x0AF7651916CD43DD8448EB211C80319C
+    assert span_ctx.span_id == 0xB7AD6B7169203331
+    assert span_ctx.is_remote is True
+    assert span_ctx.trace_state.to_header() == _TRACESTATE
+    assert dict(baggage.get_all(ctx)) == {}
+
+
+def test_baggage_free_extract_keeps_the_callers_own_baggage_only():
+    from opentelemetry import baggage
+
+    propagator = otel.BaggageFreePropagator(_default_composite())
+    own = baggage.set_baggage("own", "1")
+    ctx = propagator.extract({"traceparent": _TRACEPARENT, "baggage": "own=evil,x=y"}, own)
+    assert dict(baggage.get_all(ctx)) == {"own": "1"}
+
+
+def test_baggage_free_extract_without_a_context_ignores_the_current_baggage():
+    from opentelemetry import baggage, context
+
+    propagator = otel.BaggageFreePropagator(_default_composite())
+    token = context.attach(baggage.set_baggage("current", "1"))
+    try:
+        ctx = propagator.extract({"traceparent": _TRACEPARENT, "baggage": "leak=secret"})
+    finally:
+        context.detach(token)
+    assert dict(baggage.get_all(ctx)) == {}
+
+
+def test_baggage_free_wrapping_an_empty_composite():
+    # OTEL_PROPAGATORS=none: CompositePropagator([]).extract returns its context argument, None here.
+    # extract must then return an empty Context, not the caller's current one (span and baggage).
+    from opentelemetry import baggage, context
+    from opentelemetry.propagators.composite import CompositePropagator
+
+    propagator = otel.BaggageFreePropagator(CompositePropagator([]))
+    token = context.attach(baggage.set_baggage("k", "v", _remote_parent()))
+    try:
+        ctx = propagator.extract({"traceparent": _TRACEPARENT, "baggage": "leak=secret"})
+    finally:
+        context.detach(token)
+    assert isinstance(ctx, context.Context)
+    assert not trace.get_current_span(ctx).get_span_context().is_valid
+    assert dict(baggage.get_all(ctx)) == {}
+
+
+def test_baggage_free_wrapping_an_empty_composite_injects_nothing():
+    from opentelemetry import context
+    from opentelemetry.propagators.composite import CompositePropagator
+
+    carrier: dict = {}
+    token = context.attach(_remote_parent())
+    try:
+        otel.BaggageFreePropagator(CompositePropagator([])).inject(carrier)
+    finally:
+        context.detach(token)
+    assert carrier == {}
+
+
+def _parent_with_baggage():
+    from opentelemetry import baggage
+    from opentelemetry.trace import TraceState
+
+    parent = SpanContext(
+        trace_id=0x1234,
+        span_id=0x5678,
+        is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+        trace_state=TraceState([("vendor", "value")]),
+    )
+    return baggage.set_baggage("leak", "secret", trace.set_span_in_context(NonRecordingSpan(parent)))
+
+
+def test_baggage_free_inject_sends_the_trace_context_without_baggage():
+    from opentelemetry import baggage, context
+
+    propagator = otel.BaggageFreePropagator(_default_composite())
+    token = context.attach(_parent_with_baggage())
+    try:
+        from_current: dict = {}
+        propagator.inject(from_current)
+        assert dict(baggage.get_all()) == {"leak": "secret"}  # the current context is unchanged
+    finally:
+        context.detach(token)
+    explicit: dict = {}
+    propagator.inject(explicit, _parent_with_baggage())
+    for carrier in (from_current, explicit):
+        assert set(carrier) == {"traceparent", "tracestate"}
+        assert carrier["traceparent"].split("-")[1] == f"{0x1234:032x}"
+
+
+class _FakeFormat:
+    """A made-up format that writes a trace header and each baggage entry as an x-bag-<k> header."""
+
+    fields = {"x-trace"}
+
+    def extract(self, carrier, context=None, getter=None):
+        from opentelemetry import baggage
+
+        ctx = context if context is not None else trace.set_span_in_context(trace.INVALID_SPAN)
+        for key, value in carrier.items():
+            if key.startswith("x-bag-"):
+                ctx = baggage.set_baggage(key[len("x-bag-") :], value, ctx)
+        return ctx
+
+    def inject(self, carrier, context=None, setter=None):
+        from opentelemetry import baggage
+
+        carrier["x-trace"] = "t"
+        for key, value in baggage.get_all(context).items():
+            carrier[f"x-bag-{key}"] = str(value)
+
+
+def test_baggage_free_is_format_agnostic():
+    from opentelemetry import baggage
+
+    propagator = otel.BaggageFreePropagator(_FakeFormat())
+    carrier: dict = {}
+    propagator.inject(carrier, _parent_with_baggage())
+    assert carrier == {"x-trace": "t"}
+    assert dict(baggage.get_all(propagator.extract({"x-bag-leak": "secret"}))) == {}
+    assert propagator.fields == {"x-trace"}
+
+
+def test_baggage_free_honours_the_delegate():
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    tracecontext = otel.BaggageFreePropagator(TraceContextTextMapPropagator())
+    carrier: dict = {}
+    tracecontext.inject(carrier, _parent_with_baggage())
+    assert set(carrier) == {"traceparent", "tracestate"}
+    assert tracecontext.fields == TraceContextTextMapPropagator().fields
+
+
+def test_install_baggage_free_propagator_wraps_once():
+    from opentelemetry import propagate
+
+    original = propagate.get_global_textmap()
+    otel.install_baggage_free_propagator()
+    otel.install_baggage_free_propagator()
+    wrapped = propagate.get_global_textmap()
+    assert isinstance(wrapped, otel.BaggageFreePropagator)
+    assert wrapped._delegate is original
+
+
+def test_a_bad_otel_propagators_does_not_break_the_otel_import():
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    script = (
+        "import sys, tests.conftest\n"
+        "import netbox_opentelemetry_plugin.otel, netbox_opentelemetry_plugin.bootstrap\n"
+        "assert 'opentelemetry.propagate' not in sys.modules, 'opentelemetry.propagate was imported'\n"
+        "try:\n"
+        "    netbox_opentelemetry_plugin.otel.install_baggage_free_propagator()\n"
+        "except ValueError:\n"
+        "    pass\n"
+        "else:\n"
+        "    raise AssertionError('install_baggage_free_propagator did not raise')\n"
+    )
+    env = {**os.environ, "OTEL_PROPAGATORS": "doesnotexist"}
+    root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=root, env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr

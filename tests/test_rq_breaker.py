@@ -403,6 +403,71 @@ def test_a_rejected_batch_among_successful_exports_is_not_an_outage(stubs, outco
     assert outcomes.flushed == [["logs"]] * 3
 
 
+def test_a_slow_failed_export_among_successful_exports_is_not_an_outage(stubs, outcomes, as_horse):  # noqa: F811
+    # One batch failed after retrying for 2 s while another batch of the same horse went through.
+    outcomes.results = [{"logs": (True, 2, 1, 2.0)}] * 3
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
+    for _ in range(3):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 3
+
+
+def test_a_mixed_slow_probe_closes_the_breaker(stubs, outcomes, as_horse, monkeypatch, caplog):  # noqa: F811
+    clock = Clock()
+    monkeypatch.setattr(rq_module.time, "monotonic", clock)
+    outcomes.results = [LOGS_DOWN, LOGS_DOWN, {"logs": (True, 2, 1, 2.0)}, LOGS_DOWN]
+    bootstrap.install(
+        {**USER, "rq": {"flush_breaker_threshold": 1, "flush_breaker_cooldown": 10}}, env={}, argv=ARGV_RQ
+    )
+    with caplog.at_level(logging.WARNING, logger="netbox_opentelemetry_plugin"):
+        _run_horse()  # fails, opens
+        _run_horse()  # skipped
+        clock.now += 11
+        _run_horse()  # probe: one slow failure, one success
+        _run_horse()  # full flush again
+    assert outcomes.flushed == [["logs"], [], ["logs"], ["logs"]]
+    assert [r for r in caplog.records if "succeeded again" in r.getMessage()]
+
+
+def test_a_timed_out_flush_that_exported_something_is_not_an_outage(stubs, outcomes, as_horse):  # noqa: F811
+    # For example a large bulk import: the Collector accepts every batch, but not all of them fit
+    # in rq.flush_timeout.
+    outcomes.results = [{"logs": (False, 2, 0)}] * 4
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 1}}, env={}, argv=ARGV_RQ)
+    for _ in range(4):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 4
+
+
+def test_a_timed_out_flush_that_exported_something_neither_resets_nor_adds(stubs, outcomes, as_horse):  # noqa: F811
+    partial = {"logs": (False, 2, 0)}
+    outcomes.results = [LOGS_DOWN, partial, LOGS_DOWN, LOGS_DOWN, LOGS_DOWN]
+    bootstrap.install({**USER, "rq": {"flush_breaker_threshold": 3}}, env={}, argv=ARGV_RQ)
+    for _ in range(5):
+        _run_horse()
+    assert outcomes.flushed == [["logs"]] * 4 + [[]]
+
+
+def test_a_timed_out_probe_that_exported_something_does_not_close_the_breaker(
+    stubs,  # noqa: F811
+    outcomes,
+    as_horse,
+    monkeypatch,
+):
+    clock = Clock()
+    monkeypatch.setattr(rq_module.time, "monotonic", clock)
+    outcomes.results = [LOGS_DOWN, {"logs": (False, 2, 0)}, LOGS_DOWN, LOGS_DOWN]
+    bootstrap.install(
+        {**USER, "rq": {"flush_breaker_threshold": 1, "flush_breaker_cooldown": 10}}, env={}, argv=ARGV_RQ
+    )
+    _run_horse()  # fails, opens
+    clock.now += 11
+    _run_horse()  # probe times out after exporting some: neutral, the breaker stays open
+    _run_horse()  # the cooldown is over, so the next horse probes again, and fails
+    _run_horse()  # skipped
+    assert outcomes.flushed == [["logs"], ["logs"], ["logs"], []]
+
+
 def _external_logger_provider():
     resource = otel.build_resource("ext", {}, service_version="x", plugin_version="x", role="rqworker")
     return otel.build_logger_provider(resource, InMemoryLogRecordExporter(), synchronous=True)

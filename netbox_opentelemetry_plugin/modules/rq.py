@@ -495,11 +495,16 @@ def _record_flush_outcome(breaker: FlushBreaker, signal: str, cfg, completed: bo
     # an unreachable endpoint, a read timeout). A failed export alongside successful ones (for
     # example one oversized batch rejected by a proxy) shows the endpoint is reachable, and an
     # instant rejection (HTTP 400, 401, 413) costs the worker nothing: skipping later flushes would
-    # only drop records. Neither is counted, and neither resets a failure streak.
+    # only drop records. Neither is counted, and neither resets a failure streak. The same goes for
+    # a flush that missed rq.flush_timeout after some of its exports succeeded (a large buffer sent
+    # to a reachable Collector): it is neutral, so that it cannot open the breaker and drop audit
+    # records while the Collector is up, nor close an open breaker.
     failed_slowly = (
         after.failed > before.failed and after.failed_seconds - before.failed_seconds >= breaker.slow_seconds
     )
-    if not completed or (failed_slowly and not exported):
+    if not completed and exported:
+        return
+    if (not completed or failed_slowly) and not exported:
         if breaker.record_failure():
             logger.warning(
                 "OpenTelemetry: the RQ work-horse flush of %s did not finish or failed %s times in a row; "
@@ -548,9 +553,12 @@ class FlushBreaker:
     before forking the next, so there is never more than one writer and no lock is needed. A
     horse that is SIGKILLed mid-update can leave one field stale; the next outcome corrects it.
 
-    After `threshold` consecutive failed flushes (the flush hit rq.flush_timeout, or an export
-    failed), horses skip their flush. Once `cooldown` seconds have passed, the next horse flushes
-    in full: a success closes the breaker, a failure keeps it open for another `cooldown`. Only a
+    After `threshold` consecutive failed flushes (the flush hit rq.flush_timeout, or its failed
+    exports took at least `slow_seconds`, and in both cases none of its exports succeeded; instant
+    rejections, mixed results and a timed-out flush that exported something are neutral), horses
+    skip their flush. Once `cooldown` seconds have passed, the next horse flushes in full: a
+    success closes the breaker, a failure keeps it open for another `cooldown`, and a neutral
+    outcome leaves it open with the cooldown already over, so the next horse flushes in full. Only a
     horse of the process that prepared the breaker uses it (os.getppid() check), so another fork
     of the worker (the rq scheduler), or a process forked by a job, is unaffected; each worker of
     an rq worker pool allocates its own page.

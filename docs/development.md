@@ -23,7 +23,7 @@ The stack is based on the netbox-docker image, with the plugin installed in edit
 | --- | --- |
 | `make dev` | NetBox on Granian, the RQ worker, Postgres, two Valkey instances, the Collector and a webhook sink. |
 | `make dev-gunicorn` | The same, plus NetBox on gunicorn with `--preload`. |
-| `make dev-uwsgi` | The same, plus NetBox on uWSGI (pyuwsgi, master mode). |
+| `make dev-uwsgi` | The same, plus NetBox on uWSGI (pyuwsgi, master mode) behind nginx, laid out like NetBox's `contrib/uwsgi.ini`: uWSGI listens on a uwsgi-protocol socket and nginx forwards to it with `uwsgi_pass`. |
 | `make down` | Stops every service of all profiles. |
 
 To run all three web servers at once, as the scheduled CI job does:
@@ -38,7 +38,7 @@ Ports on the host:
 | --- | --- |
 | 8000 | NetBox on Granian |
 | 8001 | NetBox on gunicorn (profile `gunicorn`) |
-| 8002 | NetBox on uWSGI (profile `uwsgi`) |
+| 8002 | NetBox on uWSGI, through nginx (profile `uwsgi`) |
 | 4317 | Collector, OTLP gRPC |
 | 4318 | Collector, OTLP HTTP |
 

@@ -45,24 +45,6 @@ def _login_records(server: str, start_ns: int):
     ]
 
 
-def _login_with_retry(base_url: str, attempts: int = 5) -> int:
-    """Log in, retrying when the server drops the connection. Returns the number of dropped attempts.
-
-    The dev uWSGI profile recycles workers (--max-requests), and its HTTP router can hand a request
-    to a worker that is exiting, which drops the connection. A dropped attempt may or may not have
-    reached NetBox, so it may or may not have produced a login record. Drops come in short bursts
-    (seen on CI right after the workers start), so attempts are spaced out.
-    """
-    for dropped in range(attempts):
-        try:
-            login(base_url, "admin", "admin")
-        except requests.ConnectionError:
-            time.sleep(1)
-            continue
-        return dropped
-    raise AssertionError(f"login to {base_url} dropped {attempts} times in a row")
-
-
 def _key(resource: dict, record: dict):
     return (record.get("timeUnixNano"), string_attr(resource, "service.instance.id"), str(record.get("body")))
 
@@ -97,7 +79,7 @@ def test_each_worker_exports_with_its_own_identity(server):
 
     # Concurrent logins so that more than one worker process has to serve them.
     with ThreadPoolExecutor(max_workers=6) as pool:
-        dropped = sum(pool.map(lambda _: _login_with_retry(base_url), range(LOGINS)))
+        list(pool.map(lambda _: login(base_url, "admin", "admin"), range(LOGINS)))
 
     deadline = time.monotonic() + 30
     new_records = []
@@ -108,12 +90,8 @@ def test_each_worker_exports_with_its_own_identity(server):
             break
         time.sleep(1)
 
-    # Nothing lost: every successful login is exported. Nothing duplicated: the only extra records
-    # allowed are those of dropped attempts, which may have logged in before the connection dropped.
-    assert LOGINS <= len(new_records) <= LOGINS + dropped, (
-        f"expected {LOGINS} new login records from {server} (up to {dropped} more from dropped attempts), "
-        f"got {len(new_records)}"
-    )
+    # Nothing lost, nothing duplicated: exactly one record per login.
+    assert len(new_records) == LOGINS, f"expected {LOGINS} new login records from {server}, got {len(new_records)}"
     instance_ids = {string_attr(resource, "service.instance.id") for resource, _ in new_records}
     assert len(instance_ids) >= 2, f"all records came from one worker: {instance_ids}"
     roles = {string_attr(resource, "netbox.process.role") for resource, _ in new_records}

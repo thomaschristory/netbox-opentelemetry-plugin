@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+
+- Dev stack: the `uwsgi` profile now runs uWSGI on a uwsgi-protocol socket behind nginx, as NetBox's `contrib/uwsgi.ini` does, instead of uWSGI's built-in HTTP router. The router closed every connection after the response without sending `Connection: close`, so a client that reused the connection could have its next request dropped. The e2e worker test no longer retries dropped logins and expects exactly one login record per login ([#2](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/2)).
+
 ### Fixed
 
 - `dev/scripts/check_dist.py` reports a malformed wheel filename, an unreadable sdist or wheel, or a wheel without `METADATA` as a one-line error and exits non-zero, instead of failing with a traceback ([#9](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/9)).

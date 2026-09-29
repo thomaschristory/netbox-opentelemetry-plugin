@@ -84,23 +84,42 @@ services:
         condition: service_healthy
     environment:
       OTEL_RESOURCE_ATTRIBUTES: deployment.environment.name=dev,netbox.dev.server=uwsgi
+    # Laid out like NetBox's contrib/uwsgi.ini: a uwsgi-protocol socket behind nginx (the
+    # uwsgi-proxy service), master mode, one interpreter. uWSGI's own HTTP router (--http) is not
+    # used: it closes every connection after the response without sending "Connection: close",
+    # so a client that reuses the connection can have its next request dropped (issue #2).
     command:
       - /opt/netbox/venv/bin/uwsgi
+      - --socket=0.0.0.0:8081
       - --master
       - --processes=3
-      # A separate HTTP router process (not --http-socket) fronts the workers, so --max-requests
-      # only recycles workers; the router that accepts connections is never restarted.
-      - --http=0.0.0.0:8080
+      - --single-interpreter
       - --chdir=/opt/netbox/netbox
       - --module=netbox.wsgi
       - --need-app
       - --die-on-term
       - --max-requests=20
-      # Staggers worker recycling (worker_id * delta added to max-requests) so the 3 workers
-      # don't all hit their limit and respawn within the same instant.
+      # Adds worker_id * 5 to each worker's limit. uWSGI also keeps a worker for at least
+      # min-worker-lifetime (10 s by default), so under sustained load the workers still tend to
+      # be recycled together, every 10 s or so.
       - --max-requests-delta=5
+
+  uwsgi-proxy:
+    image: docker.io/nginx:1.29-alpine
+    profiles: ["uwsgi"]
+    depends_on:
+      netbox-uwsgi:
+        condition: service_started
+    volumes:
+      - ./nginx/uwsgi.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "8002:8080"
+    # Healthy once uWSGI has loaded NetBox and answers through nginx, so `up --wait` covers it.
+    healthcheck:
+      test: wget -q -O /dev/null http://127.0.0.1:8080/login/
+      start_period: 300s
+      timeout: 3s
+      interval: 5s
 
   postgres:
     image: docker.io/postgres:18-alpine

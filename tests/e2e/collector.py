@@ -22,9 +22,9 @@ def login(base_url: str, username: str, password: str) -> None:
 def session_login(base_url: str, username: str, password: str) -> requests.Session:
     """Like login(), but returns the authenticated session."""
     session = requests.Session()
-    # Avoid reusing keep-alive connections that a recycling worker may close: without this
-    # header the POST can reuse a now-dead connection and fail with a transient
-    # RemoteDisconnected.
+    # Asks the server to close each connection after the response. The web servers of the dev
+    # stack then send "Connection: close" back, so the client never reuses a connection the
+    # server is closing.
     page = session.get(f"{base_url}/login/", headers={"Connection": "close"}, timeout=10)
     page.raise_for_status()
     token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', page.text).group(1)

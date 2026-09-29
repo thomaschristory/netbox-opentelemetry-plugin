@@ -60,6 +60,12 @@ make dev-uwsgi UI=1
 
 Grafana is on `http://localhost:3000` with anonymous access and the Admin role, so no login is needed. The `admin` user has the password `admin`. The data sources `Loki`, `Tempo` and `Prometheus` are provisioned by the image. NetBox telemetry has the service name `netbox`: in Explore, query Loki with `{service_name="netbox"}`, search Tempo for the service `netbox`, and query Prometheus for metrics such as `http_server_request_duration_seconds_count`. The image keeps its data inside the container, so it is lost when the container is recreated.
 
+![NetBox logs in Grafana Explore, Loki data source](images/grafana-logs.png)
+
+![A NetBox API request trace in Grafana Explore, Tempo data source, with its database and Redis spans](images/grafana-trace.png)
+
+![NetBox HTTP server request rate per route in Grafana Explore, Prometheus data source](images/grafana-metrics.png)
+
 Selecting a Collector configuration is not something a compose profile can do, so the profile comes with an override file. `make dev-ui` runs:
 
 ```bash
@@ -73,9 +79,9 @@ Running `make dev` after `make dev-ui` recreates the Collector with the default 
 The Grafana, Loki, Tempo and Prometheus APIs can be queried through Grafana's data source proxy, without publishing more ports:
 
 ```bash
-curl -s 'http://localhost:3000/api/datasources/proxy/uid/prometheus/api/v1/query' \
+curl -sG 'http://localhost:3000/api/datasources/proxy/uid/prometheus/api/v1/query' \
   --data-urlencode 'query=count by (__name__) ({service_name="netbox"})'
-curl -s 'http://localhost:3000/api/datasources/proxy/uid/loki/loki/api/v1/query_range' \
+curl -sG 'http://localhost:3000/api/datasources/proxy/uid/loki/loki/api/v1/query_range' \
   --data-urlencode 'query={service_name="netbox"}' --data-urlencode 'limit=5'
 curl -s 'http://localhost:3000/api/datasources/proxy/uid/tempo/api/search?tags=service.name%3Dnetbox&limit=5'
 ```

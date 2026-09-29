@@ -15,6 +15,7 @@ import re
 import sys
 import tarfile
 import zipfile
+import zlib
 from email.parser import Parser
 from pathlib import Path
 
@@ -40,7 +41,7 @@ def check_sdist(path: Path, version: str) -> list[str]:
     try:
         with tarfile.open(path, "r:gz") as archive:
             members = archive.getmembers()
-    except (OSError, tarfile.TarError) as exc:
+    except (OSError, EOFError, zlib.error, tarfile.TarError) as exc:
         return [f"{path.name}: cannot read the archive: {exc}"]
     for member in members:
         if member.isdir():
@@ -62,7 +63,7 @@ def check_wheel(path: Path, version: str) -> list[str]:
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
             raw_metadata = archive.read(f"{dist_info}METADATA") if f"{dist_info}METADATA" in names else None
-    except (OSError, zipfile.BadZipFile) as exc:
+    except (OSError, EOFError, zlib.error, zipfile.BadZipFile) as exc:
         return [f"{path.name}: cannot read the archive: {exc}"]
     for name in names:
         if name.startswith(dist_info) and name[len(dist_info) :] in allowed_info:

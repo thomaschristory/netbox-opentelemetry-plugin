@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import random
 import tarfile
 import zipfile
 from pathlib import Path
@@ -90,3 +91,37 @@ def test_sdist_and_wheel_version_mismatch_is_reported(tmp_path, capsys):
     _wheel(tmp_path, f"{NAME}-1.2.3-py3-none-any.whl", "1.2.3")
     assert check_dist.main([str(tmp_path)]) == 1
     assert "sdist and wheel versions differ" in capsys.readouterr().out
+
+
+def test_truncated_sdist_is_reported(tmp_path, capsys):
+    _wheel(tmp_path, f"{NAME}-1.2.3-py3-none-any.whl", "1.2.3")
+    path = tmp_path / f"{NAME}-1.2.3.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        data = random.Random(0).randbytes(200_000)
+        info = tarfile.TarInfo(f"{NAME}-1.2.3/{NAME}/__init__.py")
+        info.size = len(data)
+        archive.addfile(info, io.BytesIO(data))
+    path.write_bytes(path.read_bytes()[: path.stat().st_size // 2])
+    assert check_dist.main([str(tmp_path)]) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 1
+    assert out[0].startswith(f"{path.name}: cannot read the archive: ")
+
+
+def test_corrupt_wheel_member_data_is_reported(tmp_path, capsys):
+    _sdist(tmp_path, "1.2.3")
+    path = tmp_path / f"{NAME}-1.2.3-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{NAME}-1.2.3.dist-info/METADATA", METADATA * 50)
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(f"{NAME}-1.2.3.dist-info/METADATA")
+    raw = bytearray(path.read_bytes())
+    # The member data follows the 30-byte local header, the filename and the extra field.
+    start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+    for offset in range(start, start + 20):
+        raw[offset] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    assert check_dist.main([str(tmp_path)]) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 1
+    assert out[0].startswith(f"{path.name}: cannot read the archive: ")

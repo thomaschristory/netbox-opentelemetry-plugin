@@ -5,6 +5,7 @@ so no pytest machinery runs in the child.
 """
 
 import atexit
+import collections
 import contextlib
 import json
 import logging
@@ -354,8 +355,9 @@ def test_lock_is_free_in_child(exporters):
 
 
 # test_fork_while_batch_worker_lock_is_held reaches into private SDK attributes to hold the batch
-# worker's lock. When they move, that test skips instead of failing, so the guard below fails
-# whenever the pinned SDK minor version changes, until someone checks the path and updates both.
+# worker's lock, and test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver to read the batch
+# queues a child inherits. When they move, those tests skip instead of failing, so the guard below
+# fails whenever the pinned SDK minor version changes, until someone checks the paths and updates them.
 REVIEWED_OTEL_SDK = "1.44"
 BATCH_WORKER_CONDITION_PATH = (
     "LoggerProvider._multi_log_record_processor._log_record_processors[0]._batch_processor._worker_awaken._cond"
@@ -372,6 +374,34 @@ def _batch_worker_condition(provider):
     return cond if isinstance(cond, threading.Condition) else None
 
 
+# The gRPC fork test reads the queues of the parent's batch processors, as each child inherits them.
+BATCH_QUEUE_PATHS = (
+    "LoggerProvider._multi_log_record_processor._log_record_processors[*]._batch_processor._queue",
+    "TracerProvider._active_span_processor._span_processors[*]._delegate._batch_processor._queue",
+)
+
+
+def _batch_queues(logger_provider, tracer_provider):
+    """The queues of the SDK batch processors behind both providers, or None if the SDK moved them.
+
+    `tracer_provider` is the SDK TracerProvider (the delegate of the plugin's switchable provider).
+    Each of its span processors is the plugin's RedactingSpanProcessor around the batch processor.
+    """
+    try:
+        logs = [p._batch_processor._queue for p in logger_provider._multi_log_record_processor._log_record_processors]
+        spans = [p._delegate._batch_processor._queue for p in tracer_provider._active_span_processor._span_processors]
+    except AttributeError:
+        return None
+    queues = {"logs": logs, "traces": spans}
+    if not all(qs and all(isinstance(q, collections.deque) for q in qs) for qs in queues.values()):
+        return None
+    return queues
+
+
+def _queue_lengths(queues) -> dict[str, list[int]]:
+    return {kind: [len(q) for q in qs] for kind, qs in queues.items()}
+
+
 def _minor(version: str) -> str:
     return ".".join(version.split(".")[:2])
 
@@ -385,15 +415,20 @@ def test_sdk_internals_used_by_the_fork_lock_test_were_reviewed_for_this_sdk(exp
     hint = (
         f"The OpenTelemetry SDK pin changed ({pins[0]!r}, installed {otel_sdk_version.__version__}); "
         f"tests/test_fork.py was last reviewed against {REVIEWED_OTEL_SDK}. Check that "
-        f"test_fork_while_batch_worker_lock_is_held still reaches {BATCH_WORKER_CONDITION_PATH} (it skips "
-        "when not), then set REVIEWED_OTEL_SDK. See docs/development.md, 'Updating OpenTelemetry'."
+        f"test_fork_while_batch_worker_lock_is_held still reaches {BATCH_WORKER_CONDITION_PATH} and that "
+        f"test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver still reaches {BATCH_QUEUE_PATHS} "
+        "(both skip when not), then set REVIEWED_OTEL_SDK. See docs/development.md, 'Updating OpenTelemetry'."
     )
     assert pinned == REVIEWED_OTEL_SDK, hint
     assert _minor(otel_sdk_version.__version__) == REVIEWED_OTEL_SDK, hint
-    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
     assert _batch_worker_condition(ctx.logger_provider) is not None, (
         f"{BATCH_WORKER_CONDITION_PATH} is not reachable on the reviewed SDK {otel_sdk_version.__version__}, so "
         "test_fork_while_batch_worker_lock_is_held skips. Update _batch_worker_condition."
+    )
+    assert _batch_queues(ctx.logger_provider, ctx.tracer_provider.delegate) is not None, (
+        f"{BATCH_QUEUE_PATHS} are not reachable on the reviewed SDK {otel_sdk_version.__version__}, so "
+        "test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver skips. Update _batch_queues."
     )
 
 
@@ -1010,16 +1045,26 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
     def expected(tag: str) -> set[tuple[str, str]]:
         return {("logs", f"log {tag}"), ("traces", f"span {tag}"), ("metrics", "netbox.object_changes")}
 
+    # The parent's SDK batch processors. Each child inherits copies of them, with the parent's gRPC
+    # exporters, which the child's own pipeline replaces but does not flush or shut down.
+    parent_queues = _batch_queues(ctx.logger_provider, ctx.tracer_provider.delegate)
+    if parent_queues is None:
+        pytest.skip(
+            f"opentelemetry-sdk {otel_sdk_version.__version__}: {BATCH_QUEUE_PATHS} are not reachable (this test "
+            f"was last reviewed against {REVIEWED_OTEL_SDK}.x). Update _batch_queues and REVIEWED_OTEL_SDK "
+            "(see docs/development.md)."
+        )
+
     assert emit("parent")
     assert not grpc_receiver.missing(parent_id, expected("parent"))
-    # Left unflushed in the parent's batch queues when the children are forked. They carry the parent's
-    # Resource, so a child that exported the inherited queue would deliver them under parent_id, not
-    # under its own id. The final check therefore counts every delivery, whatever its instance id.
+    # Left unflushed in the parent's batch queues when the children are forked.
     pending = (("logs", "log parent pending"), ("traces", "span parent pending"))
     lg.info("log parent pending")
     with tracer.start_as_current_span("span parent pending", kind=SpanKind.SERVER):
         pass
     assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[], []]
+    # Queued in the parent, so the empty-queue check in each child below can fail.
+    assert _queue_lengths(parent_queues) == {"logs": [1], "traces": [1]}
 
     for n in range(GRPC_CHILDREN):
         tag = f"child {n}"
@@ -1033,6 +1078,8 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
                 "built": {kind: len(exporters) for kind, exporters in built.items()},
                 "fresh": all(exporters[-1] is not exporters[0] for exporters in built.values()),
                 "modules": sorted({type(exporters[-1]).__module__ for exporters in built.values()}),
+                # The child's copies of the parent's queues, read after its own flush.
+                "inherited_queues": _queue_lengths(parent_queues),
             }
 
         result = _run_in_child(probe)
@@ -1043,10 +1090,15 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
         assert result["instance_id"].endswith(f"-{result['pid']}")
         assert result["instance_id"] != parent_id
         assert not grpc_receiver.missing(result["instance_id"], expected(tag))
-        # The child's own pipeline sent nothing of the parent's. This only covers records tagged with
-        # the child's id; a resend of the inherited queue is caught by the delivery count at the end.
+        # The child's own pipeline sent nothing of the parent's under the child's id.
         assert not {name for _, name in grpc_receiver.names(result["instance_id"]) if "parent" in name}
-        # Still only queued in the parent: neither the parent nor any child has delivered them.
+        # The inherited batch processors hold nothing of the parent's. The SDK clears their queues in
+        # the child at fork. Without that, their restarted workers would export the parent's pending
+        # records over the parent's gRPC channel on their schedule (1 s for logs and 5 s for spans by
+        # default) in a long-lived worker. This child never reaches the 3600 s schedule set above and
+        # leaves with os._exit, so the delivery counts cannot show such a resend; the queues can.
+        assert result["inherited_queues"] == {"logs": [0], "traces": [0]}
+        # No delivery yet of the pending records, under any id.
         assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[], []]
 
     # The metric name carries no tag and was already received from the parent, so the name check alone
@@ -1057,10 +1109,11 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
     assert grpc_receiver.wait_count(parent_id, "metrics", metrics_before + 1) > metrics_before
     # The parent still delivers the records it held across the forks, under its own identity.
     assert not grpc_receiver.missing(parent_id, set(pending))
-    # Each pending record was delivered exactly once, by the parent. The children have exited
-    # (_run_in_child waits for them), so any resend of theirs was already sent; the parent's flush
-    # returned after its own export. A short settle covers the receiver's stdout pipe.
+    # Each pending record was delivered exactly once, by the parent, and the parent's queues were
+    # emptied by that flush. A child resend is covered by the inherited-queue check above, not here.
+    # A short settle covers the receiver's stdout pipe.
     time.sleep(1)
+    assert _queue_lengths(parent_queues) == {"logs": [0], "traces": [0]}
     assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[parent_id], [parent_id]]
     assert {kind: len(exporters) for kind, exporters in built.items()} == {"logs": 1, "traces": 1, "metrics": 1}
 

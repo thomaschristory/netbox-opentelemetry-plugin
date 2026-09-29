@@ -94,13 +94,13 @@ GitHub disables scheduled workflows in a public repository after 60 days without
 
 ## Updating OpenTelemetry
 
-The OpenTelemetry packages are pinned in `pyproject.toml` (`~=` for the API, SDK and exporters, `==` for the instrumentations). The fork handling depends on how the SDK behaves in a forked child (see [How it works](how-it-works.md)), and one unit test reaches into private SDK attributes. On every bump of the SDK minor version:
+The OpenTelemetry packages are pinned in `pyproject.toml` (`~=` for the API, SDK and exporters, `==` for the instrumentations). The fork handling depends on how the SDK behaves in a forked child (see [How it works](how-it-works.md)), and two unit tests reach into private SDK attributes. On every bump of the SDK minor version:
 
 1. Update the pins and `uv.lock` (`uv lock`), then run `make test`.
-2. `test_sdk_internals_used_by_the_fork_lock_test_were_reviewed_for_this_sdk` in `tests/test_fork.py` fails until the next two steps are done. Its message names the SDK attribute path in question.
-3. Check that `test_fork_while_batch_worker_lock_is_held` still runs rather than skips (`uv run pytest tests/test_fork.py -rs`). It holds the lock the SDK's log batch worker waits on, found through `_batch_worker_condition`. If the SDK moved that lock, update `_batch_worker_condition` and `BATCH_WORKER_CONDITION_PATH`.
+2. `test_sdk_internals_used_by_the_fork_lock_test_were_reviewed_for_this_sdk` in `tests/test_fork.py` fails until the next two steps are done. Its message names the SDK attribute paths in question.
+3. Check that `test_fork_while_batch_worker_lock_is_held` still runs rather than skips (`uv run pytest tests/test_fork.py -rs`). It holds the lock the SDK's log batch worker waits on, found through `_batch_worker_condition`. If the SDK moved that lock, update `_batch_worker_condition` and `BATCH_WORKER_CONDITION_PATH`. Check the same for `test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver`, which reads the queues of the batch processors a forked child inherits, found through `_batch_queues`. If the SDK moved them, update `_batch_queues` and `BATCH_QUEUE_PATHS`.
 4. Set `REVIEWED_OTEL_SDK` in `tests/test_fork.py` to the new minor version.
-5. Check that the statements about the SDK in section 4.2 of `SPEC.md` still hold: the SDK re-initialises its batch processors in a forked child, keeps the parent's Resource and shares the parent's exporter. The fork tests in `tests/test_fork.py`, including the one with a real gRPC receiver, cover the plugin side of this.
+5. Check that the statements about the SDK in section 4.2 of `SPEC.md` still hold: the SDK re-initialises its batch processors in a forked child and clears their queues, keeps the parent's Resource and shares the parent's exporter. The fork tests in `tests/test_fork.py`, including the one with a real gRPC receiver, cover the plugin side of this.
 
 ## Releasing
 

@@ -182,7 +182,8 @@ services:
     healthcheck:
       test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
       start_period: 180s
-      timeout: 3s
+      # The script queries five endpoints in turn; room for a loaded host.
+      timeout: 10s
       interval: 5s
 
   # Receives the e2e test's webhook, so the outbound request of the job succeeds.

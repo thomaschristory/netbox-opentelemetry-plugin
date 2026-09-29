@@ -781,13 +781,28 @@ def test_a_failed_delegate_swap_shuts_down_the_new_metrics_pipeline(
     state = bootstrap._state
     parent_pipeline = state.metrics_pipeline
 
+    built = []
+    real_build = bootstrap._build_metrics_pipeline
+
+    def build(settings, resource):
+        built.append(real_build(settings, resource))
+        return built[-1]
+
     def fail(self, provider):
         raise RuntimeError("swap failed")
 
+    monkeypatch.setattr(bootstrap, "_build_metrics_pipeline", build)
     monkeypatch.setattr(otel.SwitchableTracerProvider, "set_delegate", fail)
     with pytest.raises(RuntimeError):
         bootstrap._rebuild_for_child(ctx, state, None)
     assert len(metric_exporters) == 2  # the new pipeline was built
     assert metric_exporters[1].shutdown_called is True
     assert state.metrics_pipeline is parent_pipeline
-    assert [t.name for t in threading.enumerate()].count("otel-metrics") == 1
+    # The failure path calls shutdown(0): the thread is told to stop but not joined, so it can
+    # still be alive for a moment. Wait for that thread itself (identified by identity, not by a
+    # count of every thread named otel-metrics). With a 3600 s interval it only exits this soon
+    # because it was stopped.
+    (new_pipeline,) = built
+    new_pipeline._thread.join(5)
+    assert not new_pipeline._thread.is_alive()
+    assert parent_pipeline._thread.is_alive()

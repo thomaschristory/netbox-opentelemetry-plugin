@@ -1,0 +1,17 @@
+# Overlay for the `ui` compose profile, merged over config.yaml by a second --config flag
+# (dev/docker-compose.ui.yml). Maps merge key by key and lists replace, so each pipeline repeats
+# the exporters of config.yaml and adds the OTLP exporter to grafana/otel-lgtm.
+exporters:
+  otlp_grpc/lgtm:
+    endpoint: otel-lgtm:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    logs:
+      exporters: [debug, file/logs, otlp_grpc/lgtm]
+    traces:
+      exporters: [debug, file/traces, otlp_grpc/lgtm]
+    metrics:
+      exporters: [debug, file/metrics, otlp_grpc/lgtm]

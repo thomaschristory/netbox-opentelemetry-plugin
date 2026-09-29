@@ -1,6 +1,10 @@
 COMPOSE = docker compose -f dev/docker-compose.yml
+# The `ui` profile (grafana/otel-lgtm) with the override that makes the Collector forward to it.
+# UI=1 adds it to any dev target, for example `make dev-gunicorn UI=1`.
+COMPOSE_UI = -f dev/docker-compose.ui.yml --profile ui
+UI_FLAGS = $(if $(filter 1 true yes,$(UI)),$(COMPOSE_UI))
 
-.PHONY: test test-netbox lint format dev dev-gunicorn dev-uwsgi down logs-collector e2e dist docs docs-serve
+.PHONY: test test-netbox lint format dev dev-gunicorn dev-uwsgi dev-ui down logs-collector e2e dist docs docs-serve
 
 test:
 	uv run pytest -W error::DeprecationWarning
@@ -23,16 +27,19 @@ dist:
 	python3 dev/scripts/check_dist.py dist
 
 dev:
-	$(COMPOSE) up -d --build
+	$(COMPOSE) $(UI_FLAGS) up -d --build
 
 dev-gunicorn:
-	$(COMPOSE) --profile gunicorn up -d --build
+	$(COMPOSE) $(UI_FLAGS) --profile gunicorn up -d --build
 
 dev-uwsgi:
-	$(COMPOSE) --profile uwsgi up -d --build
+	$(COMPOSE) $(UI_FLAGS) --profile uwsgi up -d --build
+
+dev-ui:
+	$(COMPOSE) $(COMPOSE_UI) up -d --build
 
 down:
-	$(COMPOSE) --profile gunicorn --profile uwsgi down
+	$(COMPOSE) $(COMPOSE_UI) --profile gunicorn --profile uwsgi down
 
 logs-collector:
 	$(COMPOSE) logs -f otel-collector

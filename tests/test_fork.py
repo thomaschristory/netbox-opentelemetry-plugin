@@ -873,10 +873,12 @@ class _GrpcReceiver:
             [sys.executable, str(GRPC_RECEIVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
         )
         ready, _, _ = select.select([self._proc.stdout], [], [], 30)
-        if not ready:
+        first_line = self._proc.stdout.readline() if ready else ""
+        if not first_line:
+            # Timed out, or the receiver exited before printing its port (its stderr is in the output).
             self.close()
-            pytest.fail("the gRPC receiver did not start within 30 s")
-        self.endpoint = f"http://127.0.0.1:{json.loads(self._proc.stdout.readline())['port']}"
+            pytest.fail("the gRPC receiver did not report its port within 30 s")
+        self.endpoint = f"http://127.0.0.1:{json.loads(first_line)['port']}"
         self._received = []
         self._cond = threading.Condition()
         self._reader = threading.Thread(target=self._read, name="grpc-receiver-reader", daemon=True)

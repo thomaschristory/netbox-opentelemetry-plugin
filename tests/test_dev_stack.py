@@ -6,6 +6,7 @@ at otel-lgtm, so it neither fails nor logs export errors when otel-lgtm is not r
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -17,6 +18,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DEV = ROOT / "dev"
 LGTM_EXPORTER = "otlp_grpc/lgtm"
+# Make reads UI from the environment, and a `make test UI=1` passes it on to child makes through
+# MAKEFLAGS. Dropping these keeps the dry runs independent of the caller; a test that wants the ui
+# profile passes UI=1 as a make argument.
+_MAKE_ENV_DROP = {"UI", "MAKEFLAGS", "MAKELEVEL", "MFLAGS"}
 
 
 def _load(path: Path) -> dict:
@@ -36,7 +41,8 @@ def _merge(base, overlay):
 def _make_dry_run(*args: str) -> str:
     if shutil.which("make") is None:
         pytest.skip("make is not installed")
-    result = subprocess.run(["make", "-n", "-s", *args], cwd=ROOT, capture_output=True, text=True, check=True)
+    env = {key: value for key, value in os.environ.items() if key not in _MAKE_ENV_DROP}
+    result = subprocess.run(["make", "-n", "-s", *args], cwd=ROOT, capture_output=True, text=True, check=True, env=env)
     return result.stdout
 
 
@@ -83,6 +89,16 @@ def test_ui_override_loads_the_overlay_in_the_collector():
 
 
 def test_make_dev_does_not_use_the_ui_profile():
+    command = _make_dry_run("dev")
+    assert "docker-compose.ui.yml" not in command
+    assert "--profile ui" not in command
+
+
+@pytest.mark.parametrize("var", ["UI", "MAKEFLAGS"])
+def test_make_dry_run_ignores_ui_from_the_callers_environment(monkeypatch, var):
+    # `export UI=1` or `make test UI=1` (which reaches pytest through MAKEFLAGS) must not change
+    # what the dry-run tests see: they check the Makefile, not the developer's shell.
+    monkeypatch.setenv(var, "UI=1" if var == "MAKEFLAGS" else "1")
     command = _make_dry_run("dev")
     assert "docker-compose.ui.yml" not in command
     assert "--profile ui" not in command

@@ -50,45 +50,62 @@ def _span(provider):
     provider.get_tracer("t").start_span("work").end()
 
 
-def test_successful_log_and_span_exports_are_counted(resource):
-    logs = otel.build_logger_provider(resource, InMemoryLogRecordExporter(), synchronous=True)
+# Horses use the batch processors (synchronous=False); the simple ones are covered too.
+SYNC = pytest.mark.parametrize("synchronous", [False, True], ids=["batch", "simple"])
+
+
+@SYNC
+def test_successful_log_and_span_exports_are_counted(resource, synchronous):
+    logs = otel.build_logger_provider(resource, InMemoryLogRecordExporter(), synchronous=synchronous)
     spans = otel.build_tracer_provider(
-        resource, InMemorySpanExporter(), otel.build_sampler("always_on", 1.0), synchronous=True
+        resource, InMemorySpanExporter(), otel.build_sampler("always_on", 1.0), synchronous=synchronous
     )
-    before_logs, before_spans = otel.export_outcomes("logs"), otel.export_outcomes("traces")
-    _emit(logs)
-    after_logs = otel.export_outcomes("logs")
-    assert after_logs.succeeded - before_logs.succeeded == 1
-    assert otel.export_outcomes("traces") == before_spans
-    _span(spans)
-    after_spans = otel.export_outcomes("traces")
-    assert after_spans.succeeded - before_spans.succeeded == 1
-    assert otel.export_outcomes("logs") == after_logs
-    assert after_logs.failed == before_logs.failed
-    assert after_spans.failed == before_spans.failed
-    logs.shutdown()
-    spans.shutdown()
+    try:
+        before_logs, before_spans = otel.export_outcomes("logs"), otel.export_outcomes("traces")
+        _emit(logs)
+        assert logs.force_flush()
+        after_logs = otel.export_outcomes("logs")
+        assert after_logs.succeeded - before_logs.succeeded == 1
+        assert otel.export_outcomes("traces") == before_spans
+        _span(spans)
+        assert spans.force_flush()
+        after_spans = otel.export_outcomes("traces")
+        assert after_spans.succeeded - before_spans.succeeded == 1
+        assert otel.export_outcomes("logs") == after_logs
+        assert after_logs.failed == before_logs.failed
+        assert after_spans.failed == before_spans.failed
+    finally:
+        logs.shutdown()
+        spans.shutdown()
 
 
+@SYNC
 @pytest.mark.parametrize("exporter_cls", [_Failing, _Raising])
-def test_failed_or_raising_log_exports_are_counted(resource, exporter_cls):
-    logs = otel.build_logger_provider(resource, exporter_cls(), synchronous=True)
-    before = otel.export_outcomes("logs")
-    _emit(logs)
-    after = otel.export_outcomes("logs")
-    assert after.failed - before.failed == 1
-    assert after.succeeded == before.succeeded
-    logs.shutdown()
+def test_failed_or_raising_log_exports_are_counted(resource, exporter_cls, synchronous):
+    logs = otel.build_logger_provider(resource, exporter_cls(), synchronous=synchronous)
+    try:
+        before = otel.export_outcomes("logs")
+        _emit(logs)
+        logs.force_flush()
+        after = otel.export_outcomes("logs")
+        assert after.failed - before.failed == 1
+        assert after.succeeded == before.succeeded
+    finally:
+        logs.shutdown()
 
 
-def test_failed_span_exports_are_counted(resource):
+@SYNC
+def test_failed_span_exports_are_counted(resource, synchronous):
     spans = otel.build_tracer_provider(
-        resource, _FailingSpans(), otel.build_sampler("always_on", 1.0), synchronous=True
+        resource, _FailingSpans(), otel.build_sampler("always_on", 1.0), synchronous=synchronous
     )
-    before = otel.export_outcomes("traces")
-    _span(spans)
-    assert otel.export_outcomes("traces").failed - before.failed == 1
-    spans.shutdown()
+    try:
+        before = otel.export_outcomes("traces")
+        _span(spans)
+        spans.force_flush()
+        assert otel.export_outcomes("traces").failed - before.failed == 1
+    finally:
+        spans.shutdown()
 
 
 def test_counting_keeps_the_exporter_usable(resource):

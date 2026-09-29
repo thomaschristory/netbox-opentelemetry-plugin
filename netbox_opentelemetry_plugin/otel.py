@@ -208,13 +208,55 @@ def _severity_number(levelno: int) -> SeverityNumber:
     return SeverityNumber.FATAL
 
 
+# Name of the attribute RequestSpanMiddleware sets on the HttpRequest. Django writes some records
+# (django.request "Not Found: ..." and friends) after the request's span has ended, with the
+# request in extra=; the handler reads the span context back from there.
+REQUEST_SPAN_CONTEXT_ATTR = "_netbox_otel_span_context"
+
+
+def remember_request_span_context(request) -> None:
+    """Store the current span's context on the request, if it is valid.
+
+    The immutable SpanContext is stored, never the Span, so nothing keeps the span's attributes
+    alive. Validity rather than recording is checked: a sampled-out request still gets its trace
+    id (with flags 0), as records written inside it already do.
+    """
+    span_context = trace.get_current_span().get_span_context()
+    if span_context.is_valid:
+        setattr(request, REQUEST_SPAN_CONTEXT_ATTR, span_context)
+
+
+def _request_span_context(record: logging.LogRecord) -> trace.SpanContext | None:
+    # record.request can be anything a caller passed in extra= (django.server passes a socket), so
+    # the lookup is guarded and only a valid SpanContext is accepted.
+    try:
+        span_context = getattr(getattr(record, "request", None), REQUEST_SPAN_CONTEXT_ATTR, None)
+        if isinstance(span_context, trace.SpanContext) and span_context.is_valid:
+            return span_context
+    except Exception:
+        pass
+    return None
+
+
+def _record_context(record: logging.LogRecord) -> Context:
+    current = opentelemetry.context.get_current()
+    # A current span always wins, including an outer span started by other instrumentation.
+    if trace.get_current_span(current).get_span_context().is_valid:
+        return current
+    span_context = _request_span_context(record)
+    if span_context is None:
+        return current
+    return trace.set_span_in_context(trace.NonRecordingSpan(span_context), current)
+
+
 class AllowlistLoggingHandler(logging.Handler):
     """Exports stdlib LogRecords over the OTel logs API, restricted to an attribute allowlist.
 
     Implemented locally (not a subclass of opentelemetry-instrumentation-logging's handler) so
     that only LOG_ATTRIBUTE_ALLOWLIST attributes are ever built, and so that emit() can never
     raise into NetBox: any failure is handed to logging.Handler.handleError, which is the
-    standard library's own "print to stderr and keep going" behaviour.
+    standard library's own "print to stderr and keep going" behaviour. When no span is current,
+    a record whose extra= request carries the request span context gets that trace and span id.
     """
 
     # Class-level so recursion is guarded across every instance and every thread: if building or
@@ -255,7 +297,7 @@ class AllowlistLoggingHandler(logging.Handler):
         return LogRecord(
             timestamp=int(record.created * 1e9),
             observed_timestamp=time.time_ns(),
-            context=opentelemetry.context.get_current(),
+            context=_record_context(record),
             severity_number=_severity_number(record.levelno),
             severity_text=_SEVERITY_TEXT.get(record.levelname, record.levelname),
             body=body,

@@ -4,6 +4,8 @@ import os
 import socket
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from opentelemetry import trace
@@ -184,6 +186,126 @@ def test_records_inside_span_carry_trace_id(pipeline):
     record = exporter.get_finished_logs()[0]
     assert record.log_record.trace_id == span.get_span_context().trace_id
     tracer_provider.shutdown()
+
+
+_STORED = trace.SpanContext(
+    trace_id=0x0AF7651916CD43DD8448EB211C80319C,
+    span_id=0xB7AD6B7169203331,
+    is_remote=False,
+    trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED),
+)
+
+
+def _request_with(span_context):
+    request = SimpleNamespace()
+    setattr(request, otel.REQUEST_SPAN_CONTEXT_ATTR, span_context)
+    return request
+
+
+def test_record_after_the_span_uses_the_request_span_context(pipeline):
+    exporter, handler = pipeline
+    with _logger("django.request", handler) as lg:
+        lg.warning("Not Found: /api/x/", extra={"request": _request_with(_STORED)})
+    record = exporter.get_finished_logs()[0].log_record
+    assert record.trace_id == _STORED.trace_id
+    assert record.span_id == _STORED.span_id
+    assert record.trace_flags == _STORED.trace_flags
+
+
+def test_current_span_wins_over_the_request_span_context(pipeline):
+    exporter, handler = pipeline
+    tracer_provider = TracerProvider()
+    span = tracer_provider.get_tracer(__name__).start_span("outer")
+    try:
+        with trace.use_span(span), _logger("django.request", handler) as lg:
+            lg.warning("Not Found: /api/x/", extra={"request": _request_with(_STORED)})
+    finally:
+        span.end()
+    record = exporter.get_finished_logs()[0].log_record
+    assert record.trace_id == span.get_span_context().trace_id
+    assert record.span_id == span.get_span_context().span_id
+    tracer_provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    "request_obj",
+    [
+        SimpleNamespace(),
+        _request_with("not a span context"),
+        _request_with(trace.INVALID_SPAN_CONTEXT),
+        _request_with(SimpleNamespace(is_valid=True, trace_id=1, span_id=1, trace_flags=0)),
+        Mock(),
+        None,
+    ],
+    ids=["missing", "string", "invalid", "look-alike", "permissive", "none"],
+)
+def test_record_without_a_usable_request_span_context_has_no_ids(pipeline, request_obj, monkeypatch):
+    # "look-alike" and "permissive" get past the attribute lookups without raising, so only the
+    # SpanContext type check keeps their values out of the record (and out of the batch encoder).
+    exporter, handler = pipeline
+    handled = []
+    monkeypatch.setattr(handler, "handleError", handled.append)
+    with _logger("django.request", handler) as lg:
+        lg.warning("Not Found: /api/x/", extra={"request": request_obj})
+    record = exporter.get_finished_logs()[0].log_record
+    assert not record.trace_id
+    assert not record.span_id
+    assert handled == []
+
+
+class _HostileRequest:
+    def __getattr__(self, name):
+        raise RuntimeError("no attribute access here")
+
+
+def test_hostile_request_object_is_exported_without_ids(pipeline, monkeypatch):
+    exporter, handler = pipeline
+    handled = []
+    monkeypatch.setattr(handler, "handleError", handled.append)
+    with _logger("django.request", handler) as lg:
+        lg.warning("Not Found: /api/x/", extra={"request": _HostileRequest()})
+    record = exporter.get_finished_logs()[0].log_record
+    assert not record.trace_id
+    assert handled == []
+
+
+def test_request_span_context_is_read_from_another_thread(pipeline):
+    exporter, handler = pipeline
+    with _logger("django.request", handler) as lg:
+        thread = threading.Thread(
+            target=lg.warning, args=("Not Found: /api/x/",), kwargs={"extra": {"request": _request_with(_STORED)}}
+        )
+        thread.start()
+        thread.join()
+    record = exporter.get_finished_logs()[0].log_record
+    assert record.trace_id == _STORED.trace_id
+    assert record.span_id == _STORED.span_id
+
+
+def test_request_is_not_exported_as_an_attribute(pipeline):
+    exporter, handler = pipeline
+    with _logger("django.request", handler) as lg:
+        lg.warning("Not Found: /api/x/", extra={"request": _request_with(_STORED), "status_code": 404})
+    attrs = dict(exporter.get_finished_logs()[0].log_record.attributes)
+    assert set(attrs) <= otel.LOG_ATTRIBUTE_ALLOWLIST
+    assert "request" not in attrs
+    assert "status_code" not in attrs
+
+
+def test_django_log_response_carries_the_request_span_context(pipeline):
+    from django.utils.log import log_response
+
+    exporter, handler = pipeline
+    request = _request_with(_STORED)
+    request.path = "/api/dcim/devices/1/"
+    response = SimpleNamespace(status_code=404, reason_phrase="Not Found")
+    with _logger("django.request", handler):
+        log_response("%s: %s", "Not Found", request.path, response=response, request=request)
+    record = exporter.get_finished_logs()[0].log_record
+    assert record.body == "Not Found: /api/dcim/devices/1/"
+    assert record.severity_text == "WARN"
+    assert record.trace_id == _STORED.trace_id
+    assert record.span_id == _STORED.span_id
 
 
 def test_grpc_insecure_none_is_inferred_from_http_scheme():

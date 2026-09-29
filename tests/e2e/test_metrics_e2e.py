@@ -57,8 +57,8 @@ def _points(name, role=None, **attributes):
 def _total(name, **attributes):
     """Sum over processes of each series' latest cumulative value (max, since values only grow).
 
-    A restarted container can reuse a service.instance.id (same hostname and PID), so the series is
-    also keyed on its start time: the new process's counter starts again from zero.
+    The series is also keyed on its start time, so a counter that starts again from zero under the
+    same service.instance.id would still be counted separately.
     """
     latest = {}
     for resource, point in _points(name, **attributes):

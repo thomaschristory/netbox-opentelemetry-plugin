@@ -22,7 +22,7 @@ Every span, log record and metric point the plugin exports carries a Resource wi
 
 - `service.name`, the configured `service_name`, which falls back to the environment variable `OTEL_SERVICE_NAME` if unset, and to `netbox` if neither is set.
 - `service.version`, the running NetBox version.
-- `service.instance.id`, `<hostname>-<pid>`, rebuilt with the new PID whenever the process forks.
+- `service.instance.id`, `<hostname>-<pid>-<6 hex>`, for example `netbox-7f9c-1-a3f09c`. The last part is random, generated once per process and again whenever the process forks. See [instance identity across restarts](#instance-identity-across-restarts).
 - `netbox.plugin.version`, this plugin's own version.
 - `netbox.process.role`, the role above.
 - Whatever is set in `resource_attributes` in `PLUGINS_CONFIG`.
@@ -31,7 +31,11 @@ The OpenTelemetry SDK also merges in `OTEL_RESOURCE_ATTRIBUTES` from the environ
 
 ## Instance identity across restarts
 
-A restarted container very often gets the same hostname and reuses low process IDs, so a fresh container can end up reporting the exact same `service.instance.id` as the one it replaced. This mostly does not matter for logs, audit records or traces. It does matter for a cumulative metric (a counter, or a histogram's counts), because those are keyed by their identifying attributes, `service.instance.id` included: a restarted process resumes the same series under the same identity rather than starting a new one, and a naive reader could mistake the drop back to zero for a large negative delta. The only way to tell the two runs apart from the data alone is by the series' own start time, which the OTLP metric data point carries.
+A restarted container very often gets the same hostname and reuses low process IDs (often PID 1). Hostname and PID alone would therefore give a fresh container the same identity as the one it replaced, and a cumulative metric (a counter, or a histogram's counts) would restart from zero under the same series key. The OpenTelemetry semantic conventions require `service.instance.id` to be unique for each instance of a service, and recommend a random value.
+
+The plugin therefore appends 6 random hex digits to `<hostname>-<pid>`. They come from the operating system's random source, are generated once when the process sets up and again in every forked child (gunicorn and uWSGI workers, RQ work-horses and any other fork), and are never written to disk. A restarted container, a recycled worker and a new work-horse each report a new identity. Hostname and PID stay in the id so that a process can still be traced back to its host and PID; the plugin does not set `host.name` or `process.pid`.
+
+The cost is series churn: every process start begins new metric series, including a container restart that previously kept the same identity. Over time a backend sees one set of series per process that ever ran, and for a short while after a restart both the old and the new series are present until the backend marks the old ones stale. Budget active series for the number of processes, not containers, and aggregate across `service.instance.id` in dashboards and alerts rather than select one identity. There is no setting to go back to the old `<hostname>-<pid>` format.
 
 ## Forking web servers
 

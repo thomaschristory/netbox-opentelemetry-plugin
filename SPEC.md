@@ -80,8 +80,9 @@ ready()  -> super().ready()
 - Management commands other than `rqworker` (`migrate`, `nbshell`, ...) install only logs and audit. Traces and metrics are skipped so short commands do not start exporter threads: like traces, metrics are only set up in the roles `web` and `rqworker`.
 - The `runserver` autoreloader parent installs nothing; the serving child does.
 - Provider detection: if a non-default global TracerProvider, MeterProvider or LoggerProvider is already set, reuse it and do not install instrumentors that report `is_instrumented_by_opentelemetry`. A reused MeterProvider is wrapped (so the plugin's own instruments record into a no-op in a forked work-horse) but not filtered: the plugin's metric allowlist (6.4) applies only to the MeterProvider it builds itself.
-- The plugin's own Resource: `service.name`, `service.version` (NetBox version), `service.instance.id` (hostname + PID, regenerated after fork), `netbox.plugin.version`, `netbox.process.role`, plus configured resource attributes.
-- A restarted container often gets the same hostname and PID, so it reuses `service.instance.id`; a cumulative metric series then restarts under the same identity, told apart only by its start time.
+- The plugin's own Resource: `service.name`, `service.version` (NetBox version), `service.instance.id`, `netbox.plugin.version`, `netbox.process.role`, plus configured resource attributes.
+- `service.instance.id` is `<hostname>-<pid>-<6 hex>`. The OpenTelemetry semantic conventions require it to be unique per `service.namespace`/`service.name`; hostname and PID alone are not, since a restarted container usually gets the same hostname and PID. The 6 hex digits (24 bits) come from `os.urandom` (via `secrets`), are generated once per process and again in every forked child (keyed on the PID), so a restarted container, a recycled worker and a work-horse each report a new identity. Hostname and PID stay readable in the id because the plugin sets no `host.name` or `process.pid` attribute.
+- Cost: every process start, including a container restart, begins new metric series. There is no option to restore the old `<hostname>-<pid>` format: it breaks the uniqueness requirement, and reusing an identity makes a cumulative series restart under the same key.
 
 ### 4.2 Fork handling
 

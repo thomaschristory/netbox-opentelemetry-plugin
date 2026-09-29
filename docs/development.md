@@ -23,7 +23,7 @@ The stack is based on the netbox-docker image, with the plugin installed in edit
 | --- | --- |
 | `make dev` | NetBox on Granian, the RQ worker, Postgres, two Valkey instances, the Collector and a webhook sink. |
 | `make dev-gunicorn` | The same, plus NetBox on gunicorn with `--preload`. |
-| `make dev-uwsgi` | The same, plus NetBox on uWSGI (pyuwsgi, master mode). |
+| `make dev-uwsgi` | The same, plus NetBox on uWSGI (pyuwsgi, master mode) behind nginx, laid out like NetBox's `contrib/uwsgi.ini`: uWSGI listens on a uwsgi-protocol socket and nginx forwards to it with `uwsgi_pass`. |
 | `make down` | Stops every service of all profiles. |
 
 To run all three web servers at once, as the scheduled CI job does:
@@ -38,7 +38,7 @@ Ports on the host:
 | --- | --- |
 | 8000 | NetBox on Granian |
 | 8001 | NetBox on gunicorn (profile `gunicorn`) |
-| 8002 | NetBox on uWSGI (profile `uwsgi`) |
+| 8002 | NetBox on uWSGI, through nginx (profile `uwsgi`) |
 | 4317 | Collector, OTLP gRPC |
 | 4318 | Collector, OTLP HTTP |
 
@@ -52,7 +52,7 @@ The Collector writes everything it receives to `dev/data/collector/` (`logs.json
 | --- | --- |
 | `make test` | Unit tests, with `DeprecationWarning` turned into errors. No stack needed. |
 | `make test-netbox` | Integration tests in `tests_netbox/`, inside the running `netbox` container. |
-| `make e2e` | End-to-end tests in `tests/e2e/` against the running stack. The worker test covers each web server that is running and skips the others. |
+| `make e2e` | End-to-end tests in `tests/e2e/` against the running stack. The worker test covers each web server that is running and skips the ones that refuse the connection; a server that answers `/login/` with anything but 200 fails the test. |
 | `make lint` | `ruff check` and `ruff format --check`. |
 | `make format` | Applies ruff fixes and formatting. |
 

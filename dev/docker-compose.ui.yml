@@ -1,0 +1,15 @@
+# Override for the `ui` profile: the Collector also loads otelcol/ui.yaml and forwards logs,
+# traces and metrics to otel-lgtm. Use it together with the profile:
+#   docker compose -f dev/docker-compose.yml -f dev/docker-compose.ui.yml --profile ui up -d
+# (make dev-ui). Without this file the Collector config is the default one, so the stack works
+# the same whether otel-lgtm runs or not.
+services:
+  otel-collector:
+    command: ["--config=/etc/otelcol/config.yaml", "--config=/etc/otelcol/ui.yaml"]
+    volumes:
+      - ./otelcol/ui.yaml:/etc/otelcol/ui.yaml:ro
+    # Healthy, not only started: otel-lgtm takes several seconds to open its OTLP port, and the
+    # Collector would log refused connections and retry exports until then.
+    depends_on:
+      otel-lgtm:
+        condition: service_healthy

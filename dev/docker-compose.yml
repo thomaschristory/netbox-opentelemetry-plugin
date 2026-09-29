@@ -163,6 +163,29 @@ services:
       - ./otelcol/config.yaml:/etc/otelcol/config.yaml:ro
       - ./data/collector:/data
 
+  # Grafana with Loki, Tempo and Prometheus in one container, for looking at the telemetry in a
+  # browser. Only started with the `ui` profile; the Collector forwards to it only when
+  # docker-compose.ui.yml is added as well (make dev-ui). OTLP ports stay internal, since the
+  # Collector already publishes 4317 and 4318 on the host.
+  otel-lgtm:
+    image: docker.io/grafana/otel-lgtm:0.34.0
+    profiles: ["ui"]
+    environment:
+      # The image defaults, stated here: anonymous access with the Admin role, no login needed.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    # Loopback only: anyone reaching the port is a Grafana admin.
+    ports:
+      - "127.0.0.1:3000:3000"
+    # The image's own check (ready file, then each component's health endpoint), polled more
+    # often than the image's 30 s so `up --wait` returns soon after the stack is ready.
+    healthcheck:
+      test: ["CMD", "/otel-lgtm/docker/healthcheck.sh"]
+      start_period: 180s
+      # The script queries five endpoints in turn; room for a loaded host.
+      timeout: 10s
+      interval: 5s
+
   # Receives the e2e test's webhook, so the outbound request of the job succeeds.
   webhook-sink:
     image: docker.io/python:3.12-alpine

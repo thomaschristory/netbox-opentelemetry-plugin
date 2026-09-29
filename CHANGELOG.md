@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- `dev/scripts/check_dist.py` reports a malformed wheel filename, an unreadable sdist or wheel, or a wheel without `METADATA` as a one-line error and exits non-zero, instead of failing with a traceback ([#9](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/9)).
+
 ## [0.2.2] - 2026-09-29
 
 ### Fixed

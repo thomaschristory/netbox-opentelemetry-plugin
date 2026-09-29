@@ -22,21 +22,35 @@ NAME = "netbox_opentelemetry_plugin"
 PACKAGE_FILE = re.compile(rf"^{NAME}/(?:[a-z_]+/)*[a-z_]+\.py$")
 SDIST_EXTRA = {"README.md", "CHANGELOG.md", "LICENSE", "pyproject.toml", "PKG-INFO", ".gitignore"}
 RELATIVE_LINK = re.compile(r"\]\((?!https?://|#)[^)]+\)")
+# {distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl; no field contains a hyphen.
+WHEEL_NAME = re.compile(r"^(?P<dist>[^-]+)-(?P<version>[^-]+)(?:-\d[^-]*)?-[^-]+-[^-]+-[^-]+\.whl$")
+
+
+def wheel_version(name: str) -> str | None:
+    """Return the version from a wheel filename of this package, or None if it is malformed."""
+    match = WHEEL_NAME.match(name)
+    if match is None or match["dist"] != NAME:
+        return None
+    return match["version"]
 
 
 def check_sdist(path: Path, version: str) -> list[str]:
     problems = []
     prefix = f"{NAME}-{version}/"
-    with tarfile.open(path) as archive:
-        for member in archive.getmembers():
-            if member.isdir():
-                continue
-            if not member.name.startswith(prefix):
-                problems.append(f"{path.name}: unexpected path {member.name}")
-                continue
-            inner = member.name[len(prefix) :]
-            if inner not in SDIST_EXTRA and not PACKAGE_FILE.match(inner):
-                problems.append(f"{path.name}: not allowed: {inner}")
+    try:
+        with tarfile.open(path, "r:gz") as archive:
+            members = archive.getmembers()
+    except (OSError, tarfile.TarError) as exc:
+        return [f"{path.name}: cannot read the archive: {exc}"]
+    for member in members:
+        if member.isdir():
+            continue
+        if not member.name.startswith(prefix):
+            problems.append(f"{path.name}: unexpected path {member.name}")
+            continue
+        inner = member.name[len(prefix) :]
+        if inner not in SDIST_EXTRA and not PACKAGE_FILE.match(inner):
+            problems.append(f"{path.name}: not allowed: {inner}")
     return problems
 
 
@@ -44,16 +58,23 @@ def check_wheel(path: Path, version: str) -> list[str]:
     problems = []
     dist_info = f"{NAME}-{version}.dist-info/"
     allowed_info = {"METADATA", "WHEEL", "RECORD", "licenses/LICENSE"}
-    with zipfile.ZipFile(path) as archive:
-        names = archive.namelist()
-        for name in names:
-            if name.startswith(dist_info) and name[len(dist_info) :] in allowed_info:
-                continue
-            if not PACKAGE_FILE.match(name):
-                problems.append(f"{path.name}: not allowed: {name}")
-        if f"{dist_info}licenses/LICENSE" not in names:
-            problems.append(f"{path.name}: LICENSE missing from dist-info")
-        metadata = Parser().parsestr(archive.read(f"{dist_info}METADATA").decode())
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            raw_metadata = archive.read(f"{dist_info}METADATA") if f"{dist_info}METADATA" in names else None
+    except (OSError, zipfile.BadZipFile) as exc:
+        return [f"{path.name}: cannot read the archive: {exc}"]
+    for name in names:
+        if name.startswith(dist_info) and name[len(dist_info) :] in allowed_info:
+            continue
+        if not PACKAGE_FILE.match(name):
+            problems.append(f"{path.name}: not allowed: {name}")
+    if f"{dist_info}licenses/LICENSE" not in names:
+        problems.append(f"{path.name}: LICENSE missing from dist-info")
+    if raw_metadata is None:
+        problems.append(f"{path.name}: METADATA missing from dist-info")
+        return problems
+    metadata = Parser().parsestr(raw_metadata.decode("utf-8", errors="replace"))
     if metadata.get("License-Expression") != "Apache-2.0":
         problems.append(f"{path.name}: License-Expression is {metadata.get('License-Expression')!r}")
     if metadata.get("License-File") != "LICENSE":
@@ -73,7 +94,10 @@ def main(argv: list[str] | None = None) -> int:
     if len(sdists) != 1 or len(wheels) != 1:
         print(f"expected one sdist and one wheel in {args.dist}, found {len(sdists)} and {len(wheels)}")
         return 1
-    version = wheels[0].name.split("-")[1]
+    version = wheel_version(wheels[0].name)
+    if version is None:
+        print(f"malformed wheel filename: {wheels[0].name} (expected {NAME}-VERSION-PYTHON-ABI-PLATFORM.whl)")
+        return 1
     problems = check_sdist(sdists[0], version) + check_wheel(wheels[0], version)
     if sdists[0].name != f"{NAME}-{version}.tar.gz":
         problems.append(f"sdist and wheel versions differ: {sdists[0].name}, {wheels[0].name}")

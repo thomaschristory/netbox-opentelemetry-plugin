@@ -4,17 +4,26 @@ Each child runs a probe function, sends a JSON result back over a pipe and leave
 so no pytest machinery runs in the child.
 """
 
+import atexit
+import collections
 import contextlib
 import json
 import logging
 import os
+import re
 import select
 import signal
+import subprocess
+import sys
 import threading
 import time
+import tomllib
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from opentelemetry import trace
+from opentelemetry.sdk import version as otel_sdk_version
 from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import NonRecordingSpan, SpanContext, SpanKind, TraceFlags
@@ -345,6 +354,84 @@ def test_lock_is_free_in_child(exporters):
     assert _run_in_child(probe) == {"acquired": True}
 
 
+# test_fork_while_batch_worker_lock_is_held reaches into private SDK attributes to hold the batch
+# worker's lock, and test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver to read the batch
+# queues a child inherits. When they move, those tests skip instead of failing, so the guard below
+# fails whenever the pinned SDK minor version changes, until someone checks the paths and updates them.
+REVIEWED_OTEL_SDK = "1.44"
+BATCH_WORKER_CONDITION_PATH = (
+    "LoggerProvider._multi_log_record_processor._log_record_processors[0]._batch_processor._worker_awaken._cond"
+)
+
+
+def _batch_worker_condition(provider):
+    """The threading.Condition the SDK's log batch worker waits on, or None if the SDK moved it."""
+    try:
+        batch_processor = provider._multi_log_record_processor._log_record_processors[0]._batch_processor
+        cond = batch_processor._worker_awaken._cond
+    except (AttributeError, IndexError):
+        return None
+    return cond if isinstance(cond, threading.Condition) else None
+
+
+# The gRPC fork test reads the queues of the parent's batch processors, as each child inherits them.
+BATCH_QUEUE_PATHS = (
+    "LoggerProvider._multi_log_record_processor._log_record_processors[*]._batch_processor._queue",
+    "TracerProvider._active_span_processor._span_processors[*]._delegate._batch_processor._queue",
+)
+
+
+def _batch_queues(logger_provider, tracer_provider):
+    """The queues of the SDK batch processors behind both providers, or None if the SDK moved them.
+
+    `tracer_provider` is the SDK TracerProvider (the delegate of the plugin's switchable provider).
+    Each of its span processors is the plugin's RedactingSpanProcessor around the batch processor.
+    """
+    try:
+        logs = [p._batch_processor._queue for p in logger_provider._multi_log_record_processor._log_record_processors]
+        spans = [p._delegate._batch_processor._queue for p in tracer_provider._active_span_processor._span_processors]
+    except AttributeError:
+        return None
+    queues = {"logs": logs, "traces": spans}
+    if not all(qs and all(isinstance(q, collections.deque) for q in qs) for qs in queues.values()):
+        return None
+    return queues
+
+
+def _queue_lengths(queues) -> dict[str, list[int]]:
+    return {kind: [len(q) for q in qs] for kind, qs in queues.items()}
+
+
+def _minor(version: str) -> str:
+    return ".".join(version.split(".")[:2])
+
+
+def test_sdk_internals_used_by_the_fork_lock_test_were_reviewed_for_this_sdk(exporters):
+    """Fails on an OpenTelemetry bump until test_fork_while_batch_worker_lock_is_held is revisited."""
+    pyproject = tomllib.loads((Path(__file__).resolve().parent.parent / "pyproject.toml").read_text())
+    pins = [d for d in pyproject["project"]["dependencies"] if re.match(r"opentelemetry-sdk\s*[~=<>!]", d)]
+    assert len(pins) == 1, pins
+    pinned = re.search(r"(\d+\.\d+)", pins[0]).group(1)
+    hint = (
+        f"The OpenTelemetry SDK pin changed ({pins[0]!r}, installed {otel_sdk_version.__version__}); "
+        f"tests/test_fork.py was last reviewed against {REVIEWED_OTEL_SDK}. Check that "
+        f"test_fork_while_batch_worker_lock_is_held still reaches {BATCH_WORKER_CONDITION_PATH} and that "
+        f"test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver still reaches {BATCH_QUEUE_PATHS} "
+        "(both skip when not), then set REVIEWED_OTEL_SDK. See docs/development.md, 'Updating OpenTelemetry'."
+    )
+    assert pinned == REVIEWED_OTEL_SDK, hint
+    assert _minor(otel_sdk_version.__version__) == REVIEWED_OTEL_SDK, hint
+    ctx = bootstrap.install(TRACES_USER, env={}, argv=ARGV_WEB)
+    assert _batch_worker_condition(ctx.logger_provider) is not None, (
+        f"{BATCH_WORKER_CONDITION_PATH} is not reachable on the reviewed SDK {otel_sdk_version.__version__}, so "
+        "test_fork_while_batch_worker_lock_is_held skips. Update _batch_worker_condition."
+    )
+    assert _batch_queues(ctx.logger_provider, ctx.tracer_provider.delegate) is not None, (
+        f"{BATCH_QUEUE_PATHS} are not reachable on the reviewed SDK {otel_sdk_version.__version__}, so "
+        "test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver skips. Update _batch_queues."
+    )
+
+
 def test_fork_while_batch_worker_lock_is_held(exporters):
     """Forking while a parent thread holds the batch processor's condition lock must not hang.
 
@@ -355,12 +442,13 @@ def test_fork_while_batch_worker_lock_is_held(exporters):
     roughly once a second.
     """
     ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
-    provider = ctx.logger_provider
-    try:
-        batch_processor = provider._multi_log_record_processor._log_record_processors[0]._batch_processor
-        cond = batch_processor._worker_awaken._cond
-    except (AttributeError, IndexError):
-        pytest.skip("SDK internals changed")
+    cond = _batch_worker_condition(ctx.logger_provider)
+    if cond is None:
+        pytest.skip(
+            f"opentelemetry-sdk {otel_sdk_version.__version__}: {BATCH_WORKER_CONDITION_PATH} is not reachable "
+            f"(this test was last reviewed against {REVIEWED_OTEL_SDK}.x). Find the lock the SDK's batch worker "
+            "holds while it waits, update _batch_worker_condition and REVIEWED_OTEL_SDK (see docs/development.md)."
+        )
 
     started = threading.Event()
 
@@ -806,3 +894,379 @@ def test_a_failed_delegate_swap_shuts_down_the_new_metrics_pipeline(
     new_pipeline._thread.join(5)
     assert not new_pipeline._thread.is_alive()
     assert parent_pipeline._thread.is_alive()
+
+
+GRPC_RECEIVER = Path(__file__).resolve().parent / "grpc_receiver.py"
+RECEIVE_TIMEOUT = 15
+
+
+class _GrpcReceiver:
+    """A real OTLP/gRPC receiver in its own process (tests/grpc_receiver.py) and what it received."""
+
+    def __init__(self) -> None:
+        self._proc = subprocess.Popen(
+            [sys.executable, str(GRPC_RECEIVER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+        )
+        ready, _, _ = select.select([self._proc.stdout], [], [], 30)
+        first_line = self._proc.stdout.readline() if ready else ""
+        if not first_line:
+            # Timed out, or the receiver exited before printing its port (its stderr is in the output).
+            self.close()
+            pytest.fail("the gRPC receiver did not report its port within 30 s")
+        self.endpoint = f"http://127.0.0.1:{json.loads(first_line)['port']}"
+        self._received = []
+        self._cond = threading.Condition()
+        self._reader = threading.Thread(target=self._read, name="grpc-receiver-reader", daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        for line in self._proc.stdout:
+            with self._cond:
+                self._received.append(json.loads(line))
+                self._cond.notify_all()
+
+    def names(self, instance_id: str) -> set[tuple[str, str]]:
+        with self._cond:
+            return {(r["signal"], n) for r in self._received if r["instance_id"] == instance_id for n in r["names"]}
+
+    def occurrences(self, signal: str, name: str) -> list[str]:
+        """The instance id of every delivery of `name` for `signal`, from any sender, repeats included."""
+        with self._cond:
+            return [r["instance_id"] for r in self._received if r["signal"] == signal for n in r["names"] if n == name]
+
+    def count(self, instance_id: str, signal: str) -> int:
+        """How many resources of `signal` arrived from `instance_id` (one per resource in each Export request)."""
+        with self._cond:
+            return sum(1 for r in self._received if r["instance_id"] == instance_id and r["signal"] == signal)
+
+    def wait_count(self, instance_id: str, signal: str, minimum: int) -> int:
+        """Wait until at least `minimum` resources of `signal` arrived from `instance_id`; return the count."""
+        deadline = time.monotonic() + RECEIVE_TIMEOUT
+        with self._cond:
+            while True:
+                received = self.count(instance_id, signal)
+                remaining = deadline - time.monotonic()
+                if received >= minimum or remaining <= 0:
+                    return received
+                self._cond.wait(remaining)
+
+    def missing(self, instance_id: str, expected: set[tuple[str, str]]) -> set[tuple[str, str]]:
+        """Wait until every (signal, name) in `expected` arrived from `instance_id`; return what did not."""
+        deadline = time.monotonic() + RECEIVE_TIMEOUT
+        with self._cond:
+            while True:
+                missing = expected - self.names(instance_id)
+                remaining = deadline - time.monotonic()
+                if not missing or remaining <= 0:
+                    return missing
+                self._cond.wait(remaining)
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._proc.stdin.close()
+        try:
+            self._proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self._proc.kill()
+            self._proc.wait()
+        # The reader sees end of file once the receiver has exited.
+        reader = getattr(self, "_reader", None)
+        if reader is not None:
+            reader.join(5)
+        if reader is None or not reader.is_alive():
+            self._proc.stdout.close()
+
+
+@pytest.fixture
+def grpc_receiver():
+    receiver = _GrpcReceiver()
+    yield receiver
+    # Shut down while the receiver still answers; afterwards the exporters would retry until timeout.
+    bootstrap.shutdown()
+    receiver.close()
+
+
+def _spy_on_exporter_builders(monkeypatch) -> dict[str, list]:
+    """Build real exporters and remember every one built (in this process or, after fork, in the child)."""
+    built = {"logs": [], "traces": [], "metrics": []}
+    builders = (("logs", "build_log_exporter"), ("traces", "build_span_exporter"), ("metrics", "build_metric_exporter"))
+    for kind, attr in builders:
+        real = getattr(otel, attr)
+
+        def spy(cfg, real=real, created=built[kind]):
+            exporter = real(cfg)
+            created.append(exporter)
+            return exporter
+
+        monkeypatch.setattr(otel, attr, spy)
+    return built
+
+
+GRPC_CHILDREN = 5
+
+
+def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver, monkeypatch):
+    """Real OTLP/gRPC exporters built in the parent, then several children forked from it.
+
+    The parent exports once before the first fork, so its gRPC channels are connected (and idle) when
+    the children inherit them. Each child must build its own exporter per signal and deliver its own
+    records to a real receiver under its own service.instance.id; the parent must still deliver after
+    the forks. gRPC does not support a channel used on both sides of a fork (GRPC_ENABLE_FORK_SUPPORT
+    is off by default), which is why the child never touches the inherited one.
+    """
+    built = _spy_on_exporter_builders(monkeypatch)
+    # Batch processors that never export on their own schedule (the defaults are 1 s for logs and 5 s
+    # for spans), so a record left unflushed is still queued at every fork below. Only an explicit
+    # force_flush exports. The SDK reads these when each processor is built, in the parent and in
+    # every child.
+    monkeypatch.setenv("OTEL_BLRP_SCHEDULE_DELAY", "3600000")
+    monkeypatch.setenv("OTEL_BSP_SCHEDULE_DELAY", "3600000")
+    user = {
+        "exporter": {"endpoint": grpc_receiver.endpoint, "protocol": "grpc", "timeout": 10},
+        "logs": {"loggers": ["t.fork.grpc"]},
+        "traces": {"enabled": True, "instrument": []},
+        "metrics": {"enabled": True, "export_interval": 3600},
+    }
+    ctx = bootstrap.install(user, env={}, argv=ARGV_WEB)
+    assert {kind: len(exporters) for kind, exporters in built.items()} == {"logs": 1, "traces": 1, "metrics": 1}
+    parent_id = ctx.resource.attributes["service.instance.id"]
+    lg = logging.getLogger("t.fork.grpc")
+    lg.setLevel(logging.INFO)
+    tracer = ctx.tracer_provider.get_tracer("t")
+    counter = ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes")
+
+    def emit(tag: str) -> bool:
+        lg.info(f"log {tag}")
+        with tracer.start_as_current_span(f"span {tag}", kind=SpanKind.SERVER):
+            pass
+        counter.add(1)
+        return bootstrap.force_flush(RECEIVE_TIMEOUT)
+
+    def expected(tag: str) -> set[tuple[str, str]]:
+        return {("logs", f"log {tag}"), ("traces", f"span {tag}"), ("metrics", "netbox.object_changes")}
+
+    # The parent's SDK batch processors. Each child inherits copies of them, with the parent's gRPC
+    # exporters, which the child's own pipeline replaces but does not flush or shut down.
+    parent_queues = _batch_queues(ctx.logger_provider, ctx.tracer_provider.delegate)
+    if parent_queues is None:
+        pytest.skip(
+            f"opentelemetry-sdk {otel_sdk_version.__version__}: {BATCH_QUEUE_PATHS} are not reachable (this test "
+            f"was last reviewed against {REVIEWED_OTEL_SDK}.x). Update _batch_queues and REVIEWED_OTEL_SDK "
+            "(see docs/development.md)."
+        )
+
+    assert emit("parent")
+    assert not grpc_receiver.missing(parent_id, expected("parent"))
+    # Left unflushed in the parent's batch queues when the children are forked.
+    pending = (("logs", "log parent pending"), ("traces", "span parent pending"))
+    lg.info("log parent pending")
+    with tracer.start_as_current_span("span parent pending", kind=SpanKind.SERVER):
+        pass
+    assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[], []]
+    # Queued in the parent, so the empty-queue check in each child below can fail.
+    assert _queue_lengths(parent_queues) == {"logs": [1], "traces": [1]}
+
+    for n in range(GRPC_CHILDREN):
+        tag = f"child {n}"
+
+        def probe(tag=tag):
+            flushed = emit(tag)
+            return {
+                "pid": os.getpid(),
+                "instance_id": ctx.resource.attributes["service.instance.id"],
+                "flushed": flushed,
+                "built": {kind: len(exporters) for kind, exporters in built.items()},
+                "fresh": all(exporters[-1] is not exporters[0] for exporters in built.values()),
+                "modules": sorted({type(exporters[-1]).__module__ for exporters in built.values()}),
+                # The child's copies of the parent's queues, read after its own flush.
+                "inherited_queues": _queue_lengths(parent_queues),
+            }
+
+        result = _run_in_child(probe)
+        assert result["flushed"] is True
+        assert result["built"] == {"logs": 2, "traces": 2, "metrics": 2}
+        assert result["fresh"] is True
+        assert all(m.startswith("opentelemetry.exporter.otlp.proto.grpc.") for m in result["modules"]), result
+        assert result["instance_id"].endswith(f"-{result['pid']}")
+        assert result["instance_id"] != parent_id
+        assert not grpc_receiver.missing(result["instance_id"], expected(tag))
+        # The child's own pipeline sent nothing of the parent's under the child's id.
+        assert not {name for _, name in grpc_receiver.names(result["instance_id"]) if "parent" in name}
+        # The inherited batch processors hold nothing of the parent's. The SDK clears their queues in
+        # the child at fork. Without that, their restarted workers would export the parent's pending
+        # records over the parent's gRPC channel on their schedule (1 s for logs and 5 s for spans by
+        # default) in a long-lived worker. This child never reaches the 3600 s schedule set above and
+        # leaves with os._exit, so the delivery counts cannot show such a resend; the queues can.
+        assert result["inherited_queues"] == {"logs": [0], "traces": [0]}
+        # No delivery yet of the pending records, under any id.
+        assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[], []]
+
+    # The metric name carries no tag and was already received from the parent, so the name check alone
+    # would pass without a new export. Require one more metrics export from the parent.
+    metrics_before = grpc_receiver.count(parent_id, "metrics")
+    assert emit("parent after forks")
+    assert not grpc_receiver.missing(parent_id, expected("parent after forks"))
+    assert grpc_receiver.wait_count(parent_id, "metrics", metrics_before + 1) > metrics_before
+    # The parent still delivers the records it held across the forks, under its own identity.
+    assert not grpc_receiver.missing(parent_id, set(pending))
+    # Each pending record was delivered exactly once, by the parent, and the parent's queues were
+    # emptied by that flush. A child resend is covered by the inherited-queue check above, not here.
+    # A short settle covers the receiver's stdout pipe.
+    time.sleep(1)
+    assert _queue_lengths(parent_queues) == {"logs": [0], "traces": [0]}
+    assert [grpc_receiver.occurrences(signal, name) for signal, name in pending] == [[parent_id], [parent_id]]
+    assert {kind: len(exporters) for kind, exporters in built.items()} == {"logs": 1, "traces": 1, "metrics": 1}
+
+
+class _ShutdownRecordingLogExporter(InMemoryLogRecordExporter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.shutdown_called = False
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+        super().shutdown()
+
+
+class _ShutdownRecordingSpanExporter(InMemorySpanExporter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.shutdown_called = False
+
+    def shutdown(self) -> None:
+        self.shutdown_called = True
+        super().shutdown()
+
+
+RESPAWN_USER = {**TRACES_USER, "metrics": {"enabled": True, "export_interval": 3600}}
+
+
+@pytest.mark.parametrize(
+    "hooks",
+    [
+        # gunicorn forks with os.fork(): only Python's at-fork hooks run.
+        "at_fork",
+        # uWSGI without py-call-osafterfork: only uwsgi.post_fork_hook runs.
+        "uwsgi_post_fork",
+        # uWSGI with py-call-osafterfork: both run, and the second one must do nothing.
+        "both",
+    ],
+)
+def test_respawned_worker_starts_from_the_master_not_from_the_worker_it_replaces(monkeypatch, hooks):
+    """gunicorn --max-requests with preload_app, or uWSGI max-requests without lazy-apps.
+
+    A worker leaves after serving its requests and the master forks a replacement. The replacement
+    is a child of the master, so it must start from the master's state: its own exporter per signal,
+    its own service.instance.id, none of the old worker's records or metric values. The old worker's
+    exit (a normal interpreter exit, so atexit runs) shuts down only what that worker built and
+    leaves the master's pipeline running and untouched.
+    """
+    logs, spans, metrics = [], [], []
+
+    def make(created, factory):
+        def build(cfg):
+            created.append(factory())
+            return created[-1]
+
+        return build
+
+    monkeypatch.setattr(otel, "build_log_exporter", make(logs, _ShutdownRecordingLogExporter))
+    monkeypatch.setattr(otel, "build_span_exporter", make(spans, _ShutdownRecordingSpanExporter))
+    monkeypatch.setattr(otel, "build_metric_exporter", make(metrics, RecordingMetricExporter))
+    fake_uwsgi = SimpleNamespace(opt={"enable-threads": True})
+    if hooks != "at_fork":
+        monkeypatch.setattr(bootstrap, "_uwsgi_module", lambda: fake_uwsgi)
+    real_reinit = bootstrap.reinit_after_fork
+    if hooks == "uwsgi_post_fork":
+        # The registered at-fork hook looks reinit_after_fork up when it runs, so this turns it off
+        # in the children, as uWSGI does without py-call-osafterfork.
+        monkeypatch.setattr(bootstrap, "reinit_after_fork", lambda: None)
+
+    ctx = bootstrap.install(RESPAWN_USER, env={}, argv=ARGV_WEB)
+    state = bootstrap._state
+    master = {
+        "instance": ctx.resource.attributes["service.instance.id"],
+        "logger_provider": ctx.logger_provider,
+        "tracer_delegate": ctx.tracer_provider.delegate,
+        "pipeline": state.metrics_pipeline,
+    }
+    lg = logging.getLogger("t.fork")
+    lg.setLevel(logging.INFO)
+    tracer = ctx.tracer_provider.get_tracer("t")
+    counter = ctx.meter_provider.get_meter("t").create_counter("netbox.object_changes")
+    counter.add(5)  # recorded in the master before any worker exists
+    lg.info("master unflushed")
+
+    def serve_then_exit(name: str) -> dict:
+        def probe():
+            built_before_hook = [len(logs), len(spans), len(metrics)]
+            if hooks != "at_fork":
+                bootstrap.reinit_after_fork = real_reinit  # this child's memory only
+                fake_uwsgi.post_fork_hook()
+            lg.info(f"request in {name}")
+            with tracer.start_as_current_span(f"span in {name}", kind=SpanKind.SERVER):
+                pass
+            counter.add(1)
+            seen = {
+                "pid": os.getpid(),
+                "instance": ctx.resource.attributes["service.instance.id"],
+                "built_before_hook": built_before_hook,
+                "built": [len(logs), len(spans), len(metrics)],
+                "new_objects": [
+                    ctx.logger_provider is not master["logger_provider"],
+                    ctx.tracer_provider.delegate is not master["tracer_delegate"],
+                    bootstrap._state.metrics_pipeline is not master["pipeline"],
+                ],
+            }
+            own = (logs[-1], spans[-1], metrics[-1])
+            # Leave the way a gunicorn or uWSGI worker does at max-requests: a normal interpreter
+            # exit, so atexit handlers run (an RQ work-horse, by contrast, leaves with os._exit).
+            atexit._run_exitfuncs()
+            seen.update(
+                own_shut_down=[e.shutdown_called for e in own],
+                inherited_shut_down=[logs[0].shutdown_called, spans[0].shutdown_called, metrics[0].shutdown_called],
+                bodies=[r.log_record.body for r in logs[-1].get_finished_logs()],
+                record_instances=sorted(
+                    {r.resource.attributes["service.instance.id"] for r in logs[-1].get_finished_logs()}
+                ),
+                span_names=[s.name for s in spans[-1].get_finished_spans()],
+                counter=[p.value for p in all_batches_points(metrics[-1], "netbox.object_changes")],
+            )
+            return seen
+
+        return _run_in_child(probe)
+
+    first = serve_then_exit("first")
+
+    # The master is untouched by the first worker's life and exit.
+    assert bootstrap._state is state and state.pid == os.getpid()
+    assert ctx.resource.attributes["service.instance.id"] == master["instance"]
+    assert ctx.logger_provider is master["logger_provider"]
+    assert ctx.tracer_provider.delegate is master["tracer_delegate"]
+    assert state.metrics_pipeline is master["pipeline"] and master["pipeline"]._thread.is_alive()
+    assert [len(logs), len(spans), len(metrics)] == [1, 1, 1]
+    assert not any(e.shutdown_called for e in (logs[0], spans[0], metrics[0]))
+
+    second = serve_then_exit("second")
+
+    for worker, name in ((first, "first"), (second, "second")):
+        assert worker["instance"].endswith(f"-{worker['pid']}")
+        assert worker["instance"] != master["instance"]
+        if hooks == "uwsgi_post_fork":
+            assert worker["built_before_hook"] == [1, 1, 1]  # the at-fork hook really was off
+        # One new exporter per signal on top of the master's: built from the master's state, once.
+        assert worker["built"] == [2, 2, 2]
+        assert worker["new_objects"] == [True, True, True]
+        assert worker["own_shut_down"] == [True, True, True]
+        assert worker["inherited_shut_down"] == [False, False, False]
+        assert worker["bodies"] == [f"request in {name}"]
+        assert worker["record_instances"] == [worker["instance"]]
+        assert worker["span_names"] == [f"span in {name}"]
+        assert worker["counter"] == [1]  # neither the master's 5 nor the first worker's 1
+    assert first["instance"] != second["instance"]
+
+    # Nothing from either worker reached the master's exporters, and the master still exports.
+    assert bootstrap.force_flush(5.0)
+    assert [r.log_record.body for r in logs[0].get_finished_logs()] == ["master unflushed"]
+    assert len(spans[0].get_finished_spans()) == 0
+    assert [p.value for p in all_batches_points(metrics[0], "netbox.object_changes")] == [5]

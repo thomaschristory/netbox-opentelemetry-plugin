@@ -8,6 +8,8 @@ services:
     command: ["--config=/etc/otelcol/config.yaml", "--config=/etc/otelcol/ui.yaml"]
     volumes:
       - ./otelcol/ui.yaml:/etc/otelcol/ui.yaml:ro
+    # Healthy, not only started: otel-lgtm takes several seconds to open its OTLP port, and the
+    # Collector would log refused connections and retry exports until then.
     depends_on:
       otel-lgtm:
-        condition: service_started
+        condition: service_healthy

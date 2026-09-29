@@ -79,7 +79,7 @@ def test_ui_override_loads_the_overlay_in_the_collector():
         "--config=/etc/otelcol/ui.yaml",
     ]
     assert "./otelcol/ui.yaml:/etc/otelcol/ui.yaml:ro" in collector["volumes"]
-    assert "otel-lgtm" in collector["depends_on"]
+    assert collector["depends_on"]["otel-lgtm"]["condition"] == "service_healthy"
 
 
 def test_make_dev_does_not_use_the_ui_profile():

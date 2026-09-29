@@ -1,7 +1,7 @@
 """M2 acceptance: every worker exports with its own identity, nothing is duplicated or lost.
 
 Needs `make dev` (Granian); the gunicorn and uWSGI cases also need `make dev-gunicorn` and
-`make dev-uwsgi`. A server that is not running is skipped.
+`make dev-uwsgi`. A server that is not running is skipped; one that answers with an error fails.
 
 The Collector's log file is append-only and shared across test runs, so this test does not just
 count matching records in a trailing time window (a previous run's login can still be inside that
@@ -29,10 +29,14 @@ LOGINS = 12
 
 
 def _reachable(base_url: str) -> bool:
+    """False when nothing answers on the port. A server that answers with anything but 200 fails
+    the test instead of skipping it, so a broken proxy in front of a running server is not hidden."""
     try:
-        return requests.get(f"{base_url}/login/", timeout=5).status_code == 200
-    except requests.RequestException:
+        response = requests.get(f"{base_url}/login/", timeout=5)
+    except requests.ConnectionError:
         return False
+    assert response.status_code == 200, f"{base_url}/login/ answered {response.status_code}"
+    return True
 
 
 def _login_records(server: str, start_ns: int):

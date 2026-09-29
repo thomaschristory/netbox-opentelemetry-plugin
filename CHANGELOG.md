@@ -8,7 +8,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
-- Dev stack: the `uwsgi` profile now runs uWSGI on a uwsgi-protocol socket behind nginx, as NetBox's `contrib/uwsgi.ini` does, instead of uWSGI's built-in HTTP router. The router closed every connection after the response without sending `Connection: close`, so a client that reused the connection could have its next request dropped. The e2e worker test no longer retries dropped logins and expects exactly one login record per login ([#2](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/2)).
+- Dev stack: the `uwsgi` profile now runs uWSGI on a uwsgi-protocol socket behind nginx, as NetBox's `contrib/uwsgi.ini` does, instead of uWSGI's built-in HTTP router. The router closed every connection after the response without sending `Connection: close`, so a client that reused the connection could have its next request dropped. The e2e worker test no longer retries dropped logins and expects exactly one login record per login. It skips a web server only when the connection is refused and fails when the server answers with an error. nginx resolves the uWSGI container on each request, so rebuilding the stack does not leave it pointing at a stale address ([#2](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/2)).
 
 ### Fixed
 

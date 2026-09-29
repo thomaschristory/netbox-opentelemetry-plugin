@@ -110,6 +110,7 @@ services:
     depends_on:
       netbox-uwsgi:
         condition: service_started
+        restart: true
     volumes:
       - ./nginx/uwsgi.conf:/etc/nginx/conf.d/default.conf:ro
     ports:

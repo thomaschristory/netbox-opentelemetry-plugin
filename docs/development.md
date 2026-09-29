@@ -52,7 +52,7 @@ The Collector writes everything it receives to `dev/data/collector/` (`logs.json
 | --- | --- |
 | `make test` | Unit tests, with `DeprecationWarning` turned into errors. No stack needed. |
 | `make test-netbox` | Integration tests in `tests_netbox/`, inside the running `netbox` container. |
-| `make e2e` | End-to-end tests in `tests/e2e/` against the running stack. The worker test covers each web server that is running and skips the others. |
+| `make e2e` | End-to-end tests in `tests/e2e/` against the running stack. The worker test covers each web server that is running and skips the ones that refuse the connection; a server that answers `/login/` with anything but 200 fails the test. |
 | `make lint` | `ruff check` and `ruff format --check`. |
 | `make format` | Applies ruff fixes and formatting. |
 

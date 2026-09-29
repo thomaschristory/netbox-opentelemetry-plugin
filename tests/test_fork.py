@@ -178,7 +178,8 @@ def test_child_rebuilds_provider_resource_and_repoints_handler(exporters):
     assert result["new_provider"] is True
     assert result["handler_count"] == 1
     assert result["handler_uses_new_provider"] is True
-    assert result["instance_id"].endswith(f"-{result['pid']}")
+    assert result["instance_id"].rsplit("-", 1)[0].endswith(f"-{result['pid']}")
+    assert re.fullmatch(r"[0-9a-f]{6}", result["instance_id"].rsplit("-", 1)[1])
     assert result["instance_id"] != parent_instance
     assert result["bodies"] == ["from child"]
     assert result["record_instance_ids"] == [result["instance_id"]]
@@ -222,7 +223,7 @@ def test_other_rqworker_fork_keeps_rqworker_role(exporters):
         return {
             "role": ctx.role,
             "resource_role": ctx.resource.attributes["netbox.process.role"],
-            "pid_in_id": ctx.resource.attributes["service.instance.id"].endswith(f"-{os.getpid()}"),
+            "pid_in_id": ctx.resource.attributes["service.instance.id"].rsplit("-", 1)[0].endswith(f"-{os.getpid()}"),
         }
 
     assert _run_in_child(probe) == {"role": "rqworker", "resource_role": "rqworker", "pid_in_id": True}
@@ -570,7 +571,8 @@ def test_child_rebuilds_tracer_provider_and_keeps_the_switchable(exporters, span
     result = _run_in_child(probe)
     assert result["same_switchable"] and result["new_delegate"]
     assert result["names"] == ["child"]
-    assert result["instance_ids"] == [f"{result['instance_ids'][0].rsplit('-', 1)[0]}-{result['pid']}"]
+    assert len(result["instance_ids"]) == 1
+    assert result["instance_ids"][0].rsplit("-", 1)[0].endswith(f"-{result['pid']}")
     assert result["exporter_count"] == 2
     ctx.tracer_provider.force_flush()
     assert [s.name for s in span_exporters[0].get_finished_spans()] == ["parent-unflushed"]
@@ -706,7 +708,7 @@ def test_child_rebuilds_the_metrics_pipeline_and_keeps_the_switchable(exporters,
     assert result["exporters"] == 2
     assert result["points"] == [1]
     assert result["parent_exported_in_child"] == 0
-    assert result["instance"].endswith(f"-{result['pid']}")
+    assert result["instance"].rsplit("-", 1)[0].endswith(f"-{result['pid']}")
     assert "otel-metrics" in result["threads"]
 
 
@@ -1087,7 +1089,7 @@ def test_grpc_exporters_are_rebuilt_in_forked_children_and_deliver(grpc_receiver
         assert result["built"] == {"logs": 2, "traces": 2, "metrics": 2}
         assert result["fresh"] is True
         assert all(m.startswith("opentelemetry.exporter.otlp.proto.grpc.") for m in result["modules"]), result
-        assert result["instance_id"].endswith(f"-{result['pid']}")
+        assert result["instance_id"].rsplit("-", 1)[0].endswith(f"-{result['pid']}")
         assert result["instance_id"] != parent_id
         assert not grpc_receiver.missing(result["instance_id"], expected(tag))
         # The child's own pipeline sent nothing of the parent's under the child's id.
@@ -1250,7 +1252,7 @@ def test_respawned_worker_starts_from_the_master_not_from_the_worker_it_replaces
     second = serve_then_exit("second")
 
     for worker, name in ((first, "first"), (second, "second")):
-        assert worker["instance"].endswith(f"-{worker['pid']}")
+        assert worker["instance"].rsplit("-", 1)[0].endswith(f"-{worker['pid']}")
         assert worker["instance"] != master["instance"]
         if hooks == "uwsgi_post_fork":
             assert worker["built_before_hook"] == [1, 1, 1]  # the at-fork hook really was off
@@ -1270,3 +1272,19 @@ def test_respawned_worker_starts_from_the_master_not_from_the_worker_it_replaces
     assert [r.log_record.body for r in logs[0].get_finished_logs()] == ["master unflushed"]
     assert len(spans[0].get_finished_spans()) == 0
     assert [p.value for p in all_batches_points(metrics[0], "netbox.object_changes")] == [5]
+
+
+def test_siblings_forked_from_one_parent_get_distinct_random_suffixes(exporters):
+    """Each forked child gets its own random suffix, and none inherits the parent's."""
+    ctx = bootstrap.install(USER, env={}, argv=ARGV_WEB)
+    parent_suffix = ctx.resource.attributes["service.instance.id"].rsplit("-", 1)[1]
+
+    def probe():
+        return {"id": ctx.resource.attributes["service.instance.id"], "pid": os.getpid()}
+
+    first, second = _run_in_child(probe), _run_in_child(probe)
+    suffixes = {first["id"].rsplit("-", 1)[1], second["id"].rsplit("-", 1)[1]}
+    assert len(suffixes) == 2
+    assert parent_suffix not in suffixes
+    for child in (first, second):
+        assert child["id"].rsplit("-", 1)[0].endswith(f"-{child['pid']}")

@@ -29,7 +29,6 @@ import warnings
 import weakref
 from collections.abc import Mapping
 from typing import NamedTuple
-from urllib.parse import urlsplit
 
 import opentelemetry.context
 import requests
@@ -149,28 +148,40 @@ class _NoVerifySession(requests.Session):
 _skip_verify_warned: set[str] = set()
 
 
+def _warning_host(url: str) -> str | None:
+    """The host as urllib3 names it in its InsecureRequestWarning (IDNA, lowercase, no brackets)."""
+    from urllib3.util import parse_url
+
+    host = parse_url(url).host
+    return host.strip("[]").rstrip(".") if host else None
+
+
 def _silence_insecure_request_warning(endpoint: str) -> None:
     """Stop urllib3 warning about the Collector host on every export.
 
     urllib3 registers an "always" filter for its InsecureRequestWarning, so every unverified
-    request warns, and Django routes warnings into logging. The filter matches only this host,
-    so unverified requests NetBox makes to any other host still warn.
+    request warns, and Django routes warnings into logging. The filter matches only the host the
+    warning names for an export: the Collector's, or, when the environment routes the endpoint
+    through an HTTPS proxy (requests honours HTTPS_PROXY), the proxy's. Unverified requests NetBox
+    makes to any other host still warn.
     """
-    try:
-        host = urlsplit(endpoint).hostname
-    except ValueError:  # a malformed IPv6 literal; the export itself will report it
-        return
-    if not host:
-        return
     from urllib3.exceptions import InsecureRequestWarning
 
-    host = re.escape(host.rstrip("."))
-    # filterwarnings matches the message from its start, case insensitively.
-    warnings.filterwarnings(
-        "ignore",
-        message=rf"Unverified HTTPS request is being made to host '\[?{host}\]?'",
-        category=InsecureRequestWarning,
-    )
+    try:
+        hosts = {_warning_host(endpoint)}
+        proxy = requests.utils.select_proxy(endpoint, requests.utils.get_environ_proxies(endpoint))
+        if proxy:
+            hosts.add(_warning_host(proxy))
+    except Exception:  # a malformed endpoint or proxy URL; the export itself will report it
+        logger.debug("could not derive the host for the InsecureRequestWarning filter", exc_info=True)
+        return
+    for host in hosts - {None}:
+        # filterwarnings matches the message from its start, case insensitively.
+        warnings.filterwarnings(
+            "ignore",
+            message=rf"Unverified HTTPS request is being made to host '\[?{re.escape(host)}\]?'",
+            category=InsecureRequestWarning,
+        )
 
 
 def _http_session(cfg: ExporterConfig) -> requests.Session | None:

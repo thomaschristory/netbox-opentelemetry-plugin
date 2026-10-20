@@ -12,7 +12,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Fixed
 
-- With `exporter.insecure_skip_verify = True`, the logs no longer repeat a TLS warning on every export or job. `urllib3`'s `InsecureRequestWarning`, emitted on every unverified request and routed into logging by Django, is now filtered out for the Collector's host only; other hosts still warn. The plugin's own warning is logged once per endpoint when a process starts, and no longer again in every forked RQ work-horse ([#35](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/35)).
+- With `exporter.insecure_skip_verify = True`, the logs no longer repeat a TLS warning on every export or job. `urllib3`'s `InsecureRequestWarning`, emitted on every unverified request and routed into logging by Django, is now filtered out for the host it names on an export only (the Collector's, or the proxy's when `HTTPS_PROXY` routes the endpoint through one); other hosts still warn. The plugin's own warning is logged once per endpoint when a process starts, and no longer again in every forked RQ work-horse ([#35](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/35)).
 
 ## [0.3.0] - 2026-09-29
 

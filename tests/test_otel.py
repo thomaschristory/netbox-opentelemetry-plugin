@@ -425,6 +425,15 @@ def test_build_logger_provider_sets_max_queue_size(resource):
     provider.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def _restore_warning_filters():
+    # Building an exporter with insecure_skip_verify adds process-wide warnings filters.
+    import warnings
+
+    with warnings.catch_warnings():
+        yield
+
+
 def _skip_verify_cfg(endpoint="https://collector:4318/v1/logs"):
     return ExporterConfig(endpoint, "http/protobuf", {}, 3.0, insecure_skip_verify=True)
 
@@ -524,6 +533,53 @@ def test_skip_verify_silences_urllib3_warning_for_an_ipv6_collector(monkeypatch)
         otel.build_log_exporter(_skip_verify_cfg("https://[fd00::1]:4318/v1/logs")).shutdown()
         _insecure_request_warning("fd00::1")
     assert caught == []
+
+
+def test_skip_verify_silences_urllib3_warning_for_an_idn_collector(monkeypatch):
+    import warnings
+
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        otel.build_log_exporter(_skip_verify_cfg("https://Bücher.example:4318/v1/logs")).shutdown()
+        # urllib3 connects to, and names, the IDNA form of the host.
+        _insecure_request_warning("xn--bcher-kva.example")
+    assert caught == []
+
+
+def test_skip_verify_silences_urllib3_warning_for_the_environment_proxy(monkeypatch):
+    # Through an HTTPS proxy, urllib3's warning names the proxy host, not the Collector.
+    import warnings
+
+    import requests
+
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    # What requests reads from HTTPS_PROXY (and, on macOS, the system settings) for the endpoint.
+    monkeypatch.setattr(
+        requests.utils, "get_environ_proxies", lambda url, no_proxy=None: {"https": "http://proxy.corp:3128"}
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        otel.build_log_exporter(_skip_verify_cfg("https://collector.example:4318/v1/logs")).shutdown()
+        _insecure_request_warning("proxy.corp")
+        _insecure_request_warning("collector.example")
+        _insecure_request_warning("webhook.example")
+    assert [str(w.message).split("'")[1] for w in caught] == ["webhook.example"]
+
+
+def test_skip_verify_ignores_a_proxy_the_endpoint_bypasses(monkeypatch):
+    import warnings
+
+    import requests
+
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    # requests returns no proxies for an endpoint that NO_PROXY matches.
+    monkeypatch.setattr(requests.utils, "get_environ_proxies", lambda url, no_proxy=None: {})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        otel.build_log_exporter(_skip_verify_cfg("https://collector.example:4318/v1/logs")).shutdown()
+        _insecure_request_warning("proxy.corp")
+    assert len(caught) == 1
 
 
 def test_urllib3_insecure_request_warning_message_is_unchanged():

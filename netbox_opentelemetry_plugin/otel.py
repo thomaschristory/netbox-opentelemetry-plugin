@@ -172,8 +172,9 @@ def _silence_insecure_request_warning(endpoint: str) -> None:
         proxy = requests.utils.select_proxy(endpoint, requests.utils.get_environ_proxies(endpoint))
         if proxy:
             hosts.add(_warning_host(proxy))
-    except Exception:  # a malformed endpoint or proxy URL; the export itself will report it
-        logger.debug("could not derive the host for the InsecureRequestWarning filter", exc_info=True)
+    except Exception as exc:  # a malformed endpoint or proxy URL; the export itself will report it
+        # Only the type: the message can quote the URL, credentials included.
+        logger.debug("could not derive the host for the InsecureRequestWarning filter: %s", type(exc).__name__)
         return
     for host in hosts - {None}:
         # filterwarnings matches the message from its start, case insensitively.

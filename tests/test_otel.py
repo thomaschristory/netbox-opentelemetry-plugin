@@ -582,6 +582,13 @@ def test_skip_verify_ignores_a_proxy_the_endpoint_bypasses(monkeypatch):
     assert len(caught) == 1
 
 
+def test_insecure_request_warning_filter_survives_a_malformed_endpoint_without_logging_it(caplog):
+    caplog.set_level(logging.DEBUG, logger="netbox_opentelemetry_plugin")
+    otel._silence_insecure_request_warning("https://user:s3cret@[fd00::1/v1/logs")
+    assert "could not derive the host" in caplog.text
+    assert "s3cret" not in caplog.text
+
+
 def test_urllib3_insecure_request_warning_message_is_unchanged():
     # The filter matches urllib3's message text; if urllib3 rewords it, the filter stops matching
     # and every export logs the warning again.

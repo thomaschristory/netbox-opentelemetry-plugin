@@ -25,9 +25,11 @@ import socket
 import threading
 import time
 import traceback
+import warnings
 import weakref
 from collections.abc import Mapping
 from typing import NamedTuple
+from urllib.parse import urlsplit
 
 import opentelemetry.context
 import requests
@@ -141,22 +143,48 @@ class _NoVerifySession(requests.Session):
         return super().request(method, url, *args, **kwargs)
 
 
-# (pid, endpoint) pairs already warned about, so each process warns once per endpoint.
-_skip_verify_warned: set[tuple[int, str]] = set()
+# Endpoints already warned about. Not keyed on the PID: a forked child (an RQ work-horse, a
+# preloaded gunicorn worker) inherits the set, so the warning is logged once when a process
+# starts, not again every time a child rebuilds its exporters.
+_skip_verify_warned: set[str] = set()
+
+
+def _silence_insecure_request_warning(endpoint: str) -> None:
+    """Stop urllib3 warning about the Collector host on every export.
+
+    urllib3 registers an "always" filter for its InsecureRequestWarning, so every unverified
+    request warns, and Django routes warnings into logging. The filter matches only this host,
+    so unverified requests NetBox makes to any other host still warn.
+    """
+    try:
+        host = urlsplit(endpoint).hostname
+    except ValueError:  # a malformed IPv6 literal; the export itself will report it
+        return
+    if not host:
+        return
+    from urllib3.exceptions import InsecureRequestWarning
+
+    host = re.escape(host.rstrip("."))
+    # filterwarnings matches the message from its start, case insensitively.
+    warnings.filterwarnings(
+        "ignore",
+        message=rf"Unverified HTTPS request is being made to host '\[?{host}\]?'",
+        category=InsecureRequestWarning,
+    )
 
 
 def _http_session(cfg: ExporterConfig) -> requests.Session | None:
     if not cfg.insecure_skip_verify:
         return None
     endpoint = cfg.redacted()["endpoint"]
-    key = (os.getpid(), endpoint)
-    if key not in _skip_verify_warned:
-        _skip_verify_warned.add(key)
+    if endpoint not in _skip_verify_warned:
+        _skip_verify_warned.add(endpoint)
         logger.warning(
             "TLS certificate verification is disabled for %s (exporter.insecure_skip_verify); "
             "the Collector's identity is not checked",
             endpoint,
         )
+    _silence_insecure_request_warning(cfg.endpoint)
     return _NoVerifySession()
 
 

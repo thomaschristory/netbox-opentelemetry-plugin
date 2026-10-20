@@ -459,15 +459,83 @@ def test_http_exporter_verifies_by_default(monkeypatch):
     exporter.shutdown()
 
 
-def test_skip_verify_warns_once_per_process_and_endpoint(monkeypatch, caplog):
+def _skip_verify_messages(caplog):
+    return [r.getMessage() for r in caplog.records if "certificate verification is disabled" in r.getMessage()]
+
+
+def test_skip_verify_warns_once_per_endpoint(monkeypatch, caplog):
     monkeypatch.setattr(otel, "_skip_verify_warned", set())
     caplog.set_level(logging.WARNING, logger="netbox_opentelemetry_plugin")
     for _ in range(2):
         otel.build_log_exporter(_skip_verify_cfg()).shutdown()
     otel.build_span_exporter(_skip_verify_cfg("https://collector:4318/v1/traces")).shutdown()
-    messages = [r.getMessage() for r in caplog.records if "certificate verification is disabled" in r.getMessage()]
+    messages = _skip_verify_messages(caplog)
     assert len(messages) == 2
     assert "https://collector:4318/v1/logs" in messages[0]
+
+
+def test_skip_verify_does_not_warn_again_in_a_forked_child(monkeypatch, caplog):
+    # A forked child (an RQ work-horse, a preloaded gunicorn worker) inherits the set and rebuilds
+    # its exporters under a new PID; the parent already warned, so the child must not.
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    caplog.set_level(logging.WARNING, logger="netbox_opentelemetry_plugin")
+    otel.build_log_exporter(_skip_verify_cfg()).shutdown()
+    monkeypatch.setattr(os, "getpid", lambda: 999_999)
+    otel.build_log_exporter(_skip_verify_cfg()).shutdown()
+    assert len(_skip_verify_messages(caplog)) == 1
+
+
+def _insecure_request_warning(host):
+    # The message urllib3 builds in HTTPSConnectionPool._validate_conn, on every unverified request.
+    import warnings
+
+    from urllib3.exceptions import InsecureRequestWarning
+
+    warnings.warn(
+        f"Unverified HTTPS request is being made to host '{host}'. "
+        "Adding certificate verification is strongly advised.",
+        InsecureRequestWarning,
+        stacklevel=1,  # urllib3's default
+    )
+
+
+def test_skip_verify_silences_urllib3_warning_for_the_collector_host_only(monkeypatch):
+    import warnings
+
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    # catch_warnings restores the process-wide filters the exporter build adds.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        otel.build_log_exporter(_skip_verify_cfg("https://Collector.example:4318/v1/logs")).shutdown()
+        for _ in range(3):
+            _insecure_request_warning("collector.example")
+        _insecure_request_warning("webhook.example")
+        _insecure_request_warning("collector.example.evil")
+    hosts = [str(w.message).split("'")[1] for w in caught]
+    assert hosts == ["webhook.example", "collector.example.evil"]
+
+
+def test_skip_verify_silences_urllib3_warning_for_an_ipv6_collector(monkeypatch):
+    import warnings
+
+    monkeypatch.setattr(otel, "_skip_verify_warned", set())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        otel.build_log_exporter(_skip_verify_cfg("https://[fd00::1]:4318/v1/logs")).shutdown()
+        _insecure_request_warning("fd00::1")
+    assert caught == []
+
+
+def test_urllib3_insecure_request_warning_message_is_unchanged():
+    # The filter matches urllib3's message text; if urllib3 rewords it, the filter stops matching
+    # and every export logs the warning again.
+    import inspect
+
+    from urllib3.connectionpool import HTTPSConnectionPool
+
+    source = inspect.getsource(HTTPSConnectionPool._validate_conn)
+    assert "Unverified HTTPS request is being made to host '{conn.host}'" in source
+    assert "InsecureRequestWarning" in source
 
 
 def test_skip_verify_warning_redacts_endpoint_userinfo(monkeypatch, caplog):

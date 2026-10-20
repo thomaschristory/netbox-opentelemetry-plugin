@@ -25,6 +25,7 @@ import socket
 import threading
 import time
 import traceback
+import warnings
 import weakref
 from collections.abc import Mapping
 from typing import NamedTuple
@@ -141,22 +142,61 @@ class _NoVerifySession(requests.Session):
         return super().request(method, url, *args, **kwargs)
 
 
-# (pid, endpoint) pairs already warned about, so each process warns once per endpoint.
-_skip_verify_warned: set[tuple[int, str]] = set()
+# Endpoints already warned about. Not keyed on the PID: a forked child (an RQ work-horse, a
+# preloaded gunicorn worker) inherits the set, so the warning is logged once when a process
+# starts, not again every time a child rebuilds its exporters.
+_skip_verify_warned: set[str] = set()
+
+
+def _warning_host(url: str) -> str | None:
+    """The host as urllib3 names it in its InsecureRequestWarning (IDNA, lowercase, no brackets)."""
+    from urllib3.util import parse_url
+
+    host = parse_url(url).host
+    return host.strip("[]").rstrip(".") if host else None
+
+
+def _silence_insecure_request_warning(endpoint: str) -> None:
+    """Stop urllib3 warning about the Collector host on every export.
+
+    urllib3 registers an "always" filter for its InsecureRequestWarning, so every unverified
+    request warns, and Django routes warnings into logging. The filter matches only the host the
+    warning names for an export: the Collector's, or, when the environment routes the endpoint
+    through an HTTPS proxy (requests honours HTTPS_PROXY), the proxy's. Unverified requests NetBox
+    makes to any other host still warn.
+    """
+    from urllib3.exceptions import InsecureRequestWarning
+
+    try:
+        hosts = {_warning_host(endpoint)}
+        proxy = requests.utils.select_proxy(endpoint, requests.utils.get_environ_proxies(endpoint))
+        if proxy:
+            hosts.add(_warning_host(proxy))
+    except Exception as exc:  # a malformed endpoint or proxy URL; the export itself will report it
+        # Only the type: the message can quote the URL, credentials included.
+        logger.debug("could not derive the host for the InsecureRequestWarning filter: %s", type(exc).__name__)
+        return
+    for host in hosts - {None}:
+        # filterwarnings matches the message from its start, case insensitively.
+        warnings.filterwarnings(
+            "ignore",
+            message=rf"Unverified HTTPS request is being made to host '\[?{re.escape(host)}\]?'",
+            category=InsecureRequestWarning,
+        )
 
 
 def _http_session(cfg: ExporterConfig) -> requests.Session | None:
     if not cfg.insecure_skip_verify:
         return None
     endpoint = cfg.redacted()["endpoint"]
-    key = (os.getpid(), endpoint)
-    if key not in _skip_verify_warned:
-        _skip_verify_warned.add(key)
+    if endpoint not in _skip_verify_warned:
+        _skip_verify_warned.add(endpoint)
         logger.warning(
             "TLS certificate verification is disabled for %s (exporter.insecure_skip_verify); "
             "the Collector's identity is not checked",
             endpoint,
         )
+    _silence_insecure_request_warning(cfg.endpoint)
     return _NoVerifySession()
 
 

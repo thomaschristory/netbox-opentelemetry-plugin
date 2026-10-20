@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-20
+
 ### Added
 
 - README: a Screenshots section with Grafana views of audit records, a request trace and HTTP metrics, taken from the dev stack's `ui` profile. The audit records screenshot is new and is also in the development docs ([#29](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/29)).
@@ -69,7 +71,8 @@ All notable changes to this project are documented in this file. The format foll
 - Reuse of an OpenTelemetry SDK already configured outside the plugin (for example by `opentelemetry-instrument`).
 - NetBox 4.7 support.
 
-[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.0...v0.2.1

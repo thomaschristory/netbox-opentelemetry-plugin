@@ -62,6 +62,10 @@ The image is about 2.5 GB. Grafana is on `http://localhost:3000`, published on t
 
 ![NetBox logs in Grafana Explore, Loki data source](images/grafana-logs.png)
 
+Audit records have the instrumentation scope `netbox_opentelemetry_plugin.audit`: `{service_name="netbox"} | scope_name="netbox_opentelemetry_plugin.audit"` selects them, and the Table view can show their attributes as columns.
+
+![NetBox audit records in Grafana Explore, Loki data source, shown as a table of change action, object type, object, user, process role and trace id](images/grafana-audit.png)
+
 ![A NetBox API request trace in Grafana Explore, Tempo data source, with its database and Redis spans](images/grafana-trace.png)
 
 ![NetBox HTTP server request rate per route in Grafana Explore, Prometheus data source](images/grafana-metrics.png)

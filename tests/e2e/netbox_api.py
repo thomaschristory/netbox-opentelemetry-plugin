@@ -77,7 +77,7 @@ def run_script(base_url: str, header: str, script: str, data: dict) -> int:
         timeout=30,
     )
     response.raise_for_status()
-    # Verified live against NetBox 4.7.1: the run response is the Script serializer, and the
+    # Verified live against NetBox 4.7.3: the run response is the Script serializer, and the
     # enqueued Job is nested under "result" (top-level "id" is the Script's own id, not the job's).
     return response.json()["result"]["id"]
 

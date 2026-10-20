@@ -30,7 +30,7 @@ Since the plugin has no migration, running `manage.py migrate` is not required f
 netbox-docker images do not include plugins; build a custom image on top of the upstream one, following the pattern documented in the netbox-docker wiki ("Using Netbox Plugins"). The venv inside the netbox-docker image has no `pip`, only `uv`:
 
 ```dockerfile
-FROM netboxcommunity/netbox:v4.7.1
+FROM netboxcommunity/netbox:v4.7.3
 COPY ./plugin_requirements.txt /opt/netbox/
 RUN /usr/local/bin/uv pip install -r /opt/netbox/plugin_requirements.txt
 ```
@@ -50,7 +50,7 @@ For the Helm chart (`netbox-community/netbox-chart`), build and reference the sa
 ```yaml
 image:
   repository: your-registry/netbox-custom
-  tag: v4.7.1-otel
+  tag: v4.7.3-otel
 
 plugins:
   - netbox_opentelemetry_plugin

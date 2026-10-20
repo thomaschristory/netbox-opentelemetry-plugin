@@ -13,9 +13,9 @@ netbox-opentelemetry-plugin exports NetBox telemetry (logs, audit records, trace
 
 ## Screenshots
 
-Taken in Grafana from the dev stack's `ui` profile (`make dev-ui`). Any OTLP backend works; the plugin only talks to the Collector.
+Taken in Grafana from the dev stack's `ui` profile (`make dev-ui`). Any OTLP backend works, through a Collector or with the exporter pointed at it directly.
 
-Audit records in Loki, one per `ObjectChange`, with the change, the user and the trace id as attributes:
+Audit records in Loki, one per `ObjectChange`, with the change and the user as attributes, and the trace id of the request:
 
 ![NetBox audit records in Grafana Explore, Loki data source, shown as a table of change action, object type, object, user, process role and trace id](https://raw.githubusercontent.com/thomaschristory/netbox-opentelemetry-plugin/main/docs/images/grafana-audit.png)
 

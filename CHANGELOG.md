@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- README: a Screenshots section with Grafana views of audit records, a request trace and HTTP metrics, taken from the dev stack's `ui` profile. The audit records screenshot is new and is also in the development docs ([#29](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/29)).
+
 ### Changed
 
 - CI runs the load check and the NetBox integration tests on NetBox 4.7.0 and 4.7.3, the lowest and the latest supported release, instead of 4.7.1. The compatibility table in the README and the docs lists plugin versions 0.1.x to 0.3.x instead of only 0.1.x. The dev stack image is pinned to `netboxcommunity/netbox:v4.7.3-5.1.1` instead of the moving `v4.7-5.1.1` tag, and the installation examples use 4.7.3 ([#28](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/28)).

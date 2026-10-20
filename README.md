@@ -11,6 +11,22 @@ netbox-opentelemetry-plugin exports NetBox telemetry (logs, audit records, trace
 | Traces | off | Spans for Django requests, PostgreSQL, Redis, outbound HTTP and RQ jobs. |
 | Metrics | off | HTTP and job metrics, change counters, optional process runtime metrics. |
 
+## Screenshots
+
+Taken in Grafana from the dev stack's `ui` profile (`make dev-ui`). Any OTLP backend works, through a Collector or with the exporter pointed at it directly.
+
+Audit records in Loki, one per `ObjectChange`, with the change and the user as attributes, and the trace id of the request:
+
+![NetBox audit records in Grafana Explore, Loki data source, shown as a table of change action, object type, object, user, process role and trace id](https://raw.githubusercontent.com/thomaschristory/netbox-opentelemetry-plugin/main/docs/images/grafana-audit.png)
+
+A REST API request trace in Tempo, with its PostgreSQL and Redis spans:
+
+![A NetBox API request trace in Grafana Explore, Tempo data source, with its database and Redis spans](https://raw.githubusercontent.com/thomaschristory/netbox-opentelemetry-plugin/main/docs/images/grafana-trace.png)
+
+HTTP server request rate per route in Prometheus:
+
+![NetBox HTTP server request rate per route in Grafana Explore, Prometheus data source](https://raw.githubusercontent.com/thomaschristory/netbox-opentelemetry-plugin/main/docs/images/grafana-metrics.png)
+
 ## Compatibility
 
 | Plugin | NetBox | Python |

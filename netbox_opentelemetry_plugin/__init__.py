@@ -20,7 +20,6 @@ class NetBoxOpenTelemetryConfig(PluginConfig):
     version = __version__
     author = "Thomas Christory"
     author_email = "9317624+thomaschristory@users.noreply.github.com"
-    base_url = "opentelemetry"
     min_version = "4.7.0"
     max_version = "4.7.99"
     # Always registered: NetBox reads it while loading settings, before ready(). Without a

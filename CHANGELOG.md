@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+
+- The package metadata lists the `Framework :: Django :: 6.1` classifier, the Django release NetBox 4.7 runs on ([#42](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/42)).
+
+### Removed
+
+- `base_url` on the `PluginConfig`. The plugin has no UI or API URLs, so NetBox never used it; nothing changes for users ([#41](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/41)).
+
 ## [0.3.1] - 2026-10-20
 
 ### Added

@@ -31,9 +31,10 @@ HTTP server request rate per route in Prometheus:
 
 | Plugin | NetBox | Python |
 |---|---|---|
+| 0.4.x | 4.7.2 to 4.7.x | 3.12, 3.13, 3.14 |
 | 0.1.x to 0.3.x | 4.7.0 to 4.7.x | 3.12, 3.13, 3.14 |
 
-`min_version = "4.7.0"` and `max_version = "4.7.99"` in the plugin's `PluginConfig` enforce this NetBox range; NetBox refuses to load the plugin outside it.
+`min_version = "4.7.2"` and `max_version = "4.7.99"` in the plugin's `PluginConfig` enforce this NetBox range; NetBox refuses to load the plugin outside it. NetBox 4.7.0 and 4.7.1 recorded plaintext API tokens created through background bulk requests in job results, fixed in 4.7.2. On those versions, upgrade NetBox before upgrading the plugin, or stay on 0.3.x: NetBox skips a plugin whose `min_version` is above its own version with a warning, and nothing is exported.
 
 ## Dependencies
 

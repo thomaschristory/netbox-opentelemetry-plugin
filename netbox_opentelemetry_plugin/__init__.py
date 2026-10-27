@@ -20,7 +20,7 @@ class NetBoxOpenTelemetryConfig(PluginConfig):
     version = __version__
     author = "Thomas Christory"
     author_email = "9317624+thomaschristory@users.noreply.github.com"
-    min_version = "4.7.0"
+    min_version = "4.7.2"
     max_version = "4.7.99"
     # Always registered: NetBox reads it while loading settings, before ready(). Without a
     # recording span (traces off) it returns immediately.

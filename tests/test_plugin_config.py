@@ -1,4 +1,7 @@
 import logging
+import re
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 import netbox_opentelemetry_plugin as plugin
@@ -13,6 +16,20 @@ def test_plugin_config_metadata():
     assert cfg.max_version == "4.7.99"
     assert cfg.default_settings == {}
     assert cfg.version == __version__
+
+
+def test_plugin_config_has_no_base_url():
+    # NetBox reads base_url only to mount a plugin's urls.py and api/urls.py; the plugin has neither.
+    assert "base_url" not in vars(plugin.NetBoxOpenTelemetryConfig)
+
+
+def test_django_classifier_matches_the_tested_django():
+    pyproject = tomllib.loads((Path(__file__).resolve().parent.parent / "pyproject.toml").read_text())
+    pins = [d for d in pyproject["dependency-groups"]["dev"] if re.match(r"django\s*==", d)]
+    assert len(pins) == 1, pins
+    major_minor = ".".join(pins[0].split("==")[1].strip().split(".")[:2])
+    classifiers = [c for c in pyproject["project"]["classifiers"] if c.startswith("Framework :: Django :: ")]
+    assert classifiers == [f"Framework :: Django :: {major_minor}"]
 
 
 def test_plugin_config_author():

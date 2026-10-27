@@ -14,6 +14,7 @@ keywords = ["netbox", "netbox-plugin", "opentelemetry", "otlp", "observability"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Django",
+    "Framework :: Django :: 6.1",
     "Intended Audience :: System Administrators",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",

@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-27
+
 ### Changed
 
 - The plugin requires NetBox 4.7.2 or later (`min_version = "4.7.2"`, was `4.7.0`). NetBox 4.7.0 and 4.7.1 recorded plaintext API tokens created through background bulk requests in job results. On those versions, upgrade NetBox first or stay on 0.3.x: NetBox skips the plugin with a warning and nothing is exported. CI runs the load check and the integration tests on 4.7.2 and 4.7.3 ([#40](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/40)).
@@ -80,7 +82,8 @@ All notable changes to this project are documented in this file. The format foll
 - Reuse of an OpenTelemetry SDK already configured outside the plugin (for example by `opentelemetry-instrument`).
 - NetBox 4.7 support.
 
-[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/thomaschristory/netbox-opentelemetry-plugin/compare/v0.2.1...v0.2.2

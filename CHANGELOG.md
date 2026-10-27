@@ -8,6 +8,7 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
+- The plugin requires NetBox 4.7.2 or later (`min_version = "4.7.2"`, was `4.7.0`). NetBox 4.7.0 and 4.7.1 recorded plaintext API tokens created through background bulk requests in job results. On those versions, upgrade NetBox first or stay on 0.3.x: NetBox skips the plugin with a warning and nothing is exported. CI runs the load check and the integration tests on 4.7.2 and 4.7.3 ([#40](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/40)).
 - The package metadata lists the `Framework :: Django :: 6.1` classifier, the Django release NetBox 4.7 runs on ([#42](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/42)).
 
 ### Removed

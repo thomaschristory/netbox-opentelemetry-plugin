@@ -19,13 +19,15 @@ def test_plugin_config_metadata():
 
 
 def test_plugin_config_has_no_base_url():
-    # NetBox reads base_url only to mount a plugin's urls.py and api/urls.py; the plugin has neither.
+    # NetBox reads base_url only for a plugin's urls.py and api/urls.py (mounting them, and listing the
+    # API root under /api/plugins/); the plugin has neither.
     assert "base_url" not in vars(plugin.NetBoxOpenTelemetryConfig)
 
 
 def test_django_classifier_matches_the_tested_django():
+    # The dev pin follows the Django release the supported NetBox versions run on.
     pyproject = tomllib.loads((Path(__file__).resolve().parent.parent / "pyproject.toml").read_text())
-    pins = [d for d in pyproject["dependency-groups"]["dev"] if re.match(r"django\s*==", d)]
+    pins = [d for d in pyproject["dependency-groups"]["dev"] if re.match(r"django\s*==", d, re.IGNORECASE)]
     assert len(pins) == 1, pins
     major_minor = ".".join(pins[0].split("==")[1].strip().split(".")[:2])
     classifiers = [c for c in pyproject["project"]["classifiers"] if c.startswith("Framework :: Django :: ")]

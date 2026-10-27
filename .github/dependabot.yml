@@ -29,6 +29,12 @@ updates:
       day: monday
     cooldown:
       default-days: 7
+    # The django dev pin follows the Django release NetBox 4.7 runs on (6.1); only patch releases.
+    ignore:
+      - dependency-name: django
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
     groups:
       python:
         update-types:

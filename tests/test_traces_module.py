@@ -1,6 +1,9 @@
 import contextlib
 import http.server
 import logging
+import os
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -219,6 +222,79 @@ def test_real_requests_instrumentation_records_client_duration_with_allowlisted_
     assert any(p.attributes.get("error.type") for p in points)
     assert "s3cret" not in repr(data)
     assert metric_names(data) == {"http.client.request.duration"}
+
+
+@pytest.mark.parametrize("opt_in", [None, "", "database", "http", "http/dup", "database,http/dup"])
+def test_http_metrics_with_existing_semconv_opt_in_in_a_fresh_process(local_server, opt_in):
+    env = dict(os.environ)
+    if opt_in is None:
+        env.pop("OTEL_SEMCONV_STABILITY_OPT_IN", None)
+    else:
+        env["OTEL_SEMCONV_STABILITY_OPT_IN"] = opt_in
+    probe = """
+import sys
+import django
+import requests
+import tests.conftest
+from django.conf import settings
+from django.http import HttpResponse
+from django.test import Client
+from django.urls import path
+from tests.test_traces_module import _ctx, _meter
+from tests.otel_helpers import metric_names
+from netbox_opentelemetry_plugin.modules.traces import TracesModule
+
+def view(request):
+    requests.get(sys.argv[1], timeout=5)
+    return HttpResponse(status=204)
+
+urlpatterns = [path("", view)]
+settings.configure(SECRET_KEY="test", ROOT_URLCONF=__name__, ALLOWED_HOSTS=["testserver"], MIDDLEWARE=[])
+django.setup()
+meter, reader = _meter()
+ctx, _ = _ctx(traces_on=False, meter_provider=meter)
+module = TracesModule()
+module.install(ctx)
+try:
+    assert Client().get("/").status_code == 204
+    assert metric_names(reader.get_metrics_data()) == {
+        "http.server.request.duration", "http.client.request.duration"
+    }
+finally:
+    module.shutdown()
+    meter.delegate.shutdown()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", probe, local_server], env=env, capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_http_metric_exemplars_keep_trace_correlation_without_dropped_attributes(local_server, monkeypatch):
+    from opentelemetry.exporter.otlp.proto.common.metrics_encoder import encode_metrics
+
+    monkeypatch.setattr(traces_module, "HTTP_METRIC_INSTRUMENTATIONS", ("requests",))
+    meter, reader = _meter()
+    ctx, exporter = _ctx(instrument=("requests",), meter_provider=meter)
+    module = TracesModule()
+    module.install(ctx)
+    try:
+        with ctx.tracer_provider.get_tracer("test").start_as_current_span("request", kind=SpanKind.SERVER):
+            requests.get(local_server, timeout=5)
+        data = reader.get_metrics_data()
+        (point,) = data_points(data, "http.client.request.duration")
+        (exemplar,) = point.exemplars
+        (client,) = [span for span in exporter.get_finished_spans() if span.kind is SpanKind.CLIENT]
+        assert exemplar.trace_id == client.context.trace_id
+        assert exemplar.span_id == client.context.span_id
+        assert not exemplar.filtered_attributes
+        encoded = encode_metrics(data).SerializeToString()
+        assert b"server.port" not in encoded
+        assert b"network.protocol.version" not in encoded
+    finally:
+        module.shutdown()
+        meter.delegate.shutdown()
+        ctx.tracer_provider.shutdown()
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):

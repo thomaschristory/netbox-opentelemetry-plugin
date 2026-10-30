@@ -1,6 +1,9 @@
 import threading
 import time
 
+import pytest
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.common.metrics_encoder import encode_metrics
 from opentelemetry.metrics import NoOpMeterProvider
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -49,6 +52,34 @@ def test_every_allowlisted_attribute_key_set_is_explicit():
     for name, keys in otel.METRIC_ALLOWLIST.items():
         if keys is None:
             assert name.endswith(".*"), f"{name}: only runtime wildcards may keep their own attributes"
+
+
+@pytest.mark.parametrize(
+    ("factory", "name", "record"),
+    [
+        ("create_counter", "netbox.object_changes", "add"),
+        ("create_histogram", "http.server.request.duration", "record"),
+    ],
+)
+def test_metric_exemplars_cannot_reintroduce_filtered_attributes(factory, name, record):
+    provider, reader = _reader_provider()
+    instrument = getattr(provider.get_meter("t"), factory)(name)
+    span_context = trace.SpanContext(
+        trace_id=123, span_id=456, is_remote=False, trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED)
+    )
+    try:
+        with trace.use_span(trace.NonRecordingSpan(span_context)):
+            getattr(instrument, record)(1, {"excluded": "must-not-export"})
+        data = reader.get_metrics_data()
+        (point,) = data_points(data, name)
+        (exemplar,) = point.exemplars
+        assert not exemplar.filtered_attributes
+        assert exemplar.trace_id == span_context.trace_id
+        assert exemplar.span_id == span_context.span_id
+        assert exemplar.value == 1
+        assert b"must-not-export" not in encode_metrics(data).SerializeToString()
+    finally:
+        provider.shutdown()
 
 
 def test_build_metric_exporter_http_and_grpc():

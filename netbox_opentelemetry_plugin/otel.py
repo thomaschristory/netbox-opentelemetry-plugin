@@ -46,6 +46,11 @@ from opentelemetry.sdk._logs.export import (
     LogRecordExportResult,
     SimpleLogRecordProcessor,
 )
+from opentelemetry.sdk.metrics import (
+    AlignedHistogramBucketExemplarReservoir,
+    ExemplarReservoir,
+    SimpleFixedSizeExemplarReservoir,
+)
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricReader, PeriodicExportingMetricReader
 from opentelemetry.sdk.metrics.view import DropAggregation, View
@@ -448,6 +453,8 @@ class AllowlistLoggingHandler(logging.Handler):
     def __init__(self, level: int, logger_provider: LoggerProvider) -> None:
         super().__init__(level=level)
         self._logger_provider = logger_provider
+        # A record can reach this handler again through a configured ancestor logger.
+        self._emitted_records: weakref.WeakSet[logging.LogRecord] = weakref.WeakSet()
 
     def set_logger_provider(self, provider: LoggerProvider) -> None:
         """Point the handler at another provider (used in a forked child)."""
@@ -458,7 +465,10 @@ class AllowlistLoggingHandler(logging.Handler):
             return
         token = self._emitting.set(True)
         try:
+            if record in self._emitted_records:
+                return
             self._logger_provider.get_logger(record.name).emit(self._translate(record))
+            self._emitted_records.add(record)
         except Exception:
             self.handleError(record)
         finally:
@@ -970,9 +980,13 @@ def load_instrumentor(name: str):
 def prefer_stable_http_semconv() -> None:
     """Select the stable HTTP semantic conventions (url.full, http.request.method, ...).
 
-    The instrumentations read this once, on first use. An operator's own value is kept.
+    The instrumentations read this once, on first use. Keep other opt-ins and an explicit http/dup.
     """
-    os.environ.setdefault("OTEL_SEMCONV_STABILITY_OPT_IN", "http")
+    name = "OTEL_SEMCONV_STABILITY_OPT_IN"
+    configured = os.environ.get(name, "")
+    modes = {value.strip() for value in configured.split(",")}
+    if not modes.intersection({"http", "http/dup"}):
+        os.environ[name] = f"{configured},http" if configured.strip() else "http"
 
 
 def emit_event(
@@ -1022,6 +1036,23 @@ METRIC_ALLOWLIST: Mapping[str, frozenset[str] | None] = {
 }
 
 
+class _AttributeFreeExemplarReservoir(ExemplarReservoir):
+    """Keep SDK sampling and trace correlation, without retaining attributes discarded by a View."""
+
+    def __init__(self, **kwargs) -> None:
+        self._delegate: ExemplarReservoir
+        if "boundaries" in kwargs:
+            self._delegate = AlignedHistogramBucketExemplarReservoir(**kwargs)
+        else:
+            self._delegate = SimpleFixedSizeExemplarReservoir(**kwargs)
+
+    def offer(self, value, time_unix_nano, attributes, context) -> None:
+        self._delegate.offer(value, time_unix_nano, {}, context)
+
+    def collect(self, point_attributes):
+        return self._delegate.collect(point_attributes)
+
+
 def metric_views() -> list[View]:
     """Drop every instrument, then add one View per allowlisted name.
 
@@ -1033,7 +1064,13 @@ def metric_views() -> list[View]:
         if keys is None:
             views.append(View(instrument_name=name))
         else:
-            views.append(View(instrument_name=name, attribute_keys=set(keys)))
+            views.append(
+                View(
+                    instrument_name=name,
+                    attribute_keys=set(keys),
+                    exemplar_reservoir_factory=lambda aggregation_type: _AttributeFreeExemplarReservoir,
+                )
+            )
     return views
 
 

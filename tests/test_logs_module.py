@@ -73,6 +73,34 @@ def test_records_are_exported(exporter):
         module.shutdown()
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("stop_at", [None, "t.logs.overlap.middle", "t.logs.overlap.middle.child"])
+def test_overlapping_loggers_export_each_record_once(exporter, monkeypatch, caplog, reverse, stop_at):
+    names = ["t.logs.overlap", "t.logs.overlap.middle.child"]
+    if reverse:
+        names.reverse()
+    if stop_at:
+        monkeypatch.setattr(logging.getLogger(stop_at), "propagate", False)
+    ctx = _context(_settings(names, set_levels=True), exporter)
+    module = LogsModule()
+    module.install(ctx)
+    try:
+        child = logging.getLogger("t.logs.overlap.middle.child")
+        for _ in range(2):
+            child.info("separate records with the same body")
+        assert [r.log_record.body for r in exporter.get_finished_logs()] == [
+            "separate records with the same body",
+            "separate records with the same body",
+        ]
+        if stop_at:
+            assert logging.getLogger(stop_at).propagate is False
+        else:
+            assert len([record for record in caplog.records if record.name == child.name]) == 2
+    finally:
+        module.shutdown()
+        ctx.logger_provider.shutdown()
+
+
 def test_logger_levels_untouched_by_default(exporter):
     lg = logging.getLogger("t.logs.untouched")
     lg.setLevel(logging.NOTSET)

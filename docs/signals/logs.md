@@ -6,6 +6,8 @@ With `logs.enabled` (default `True`), the plugin attaches a logging handler dire
 
 `logs.loggers` defaults to `["netbox", "django", "rq"]`. For each name, the plugin calls `logging.getLogger(name).addHandler(...)`, at `logs.level` (default `INFO`). Because Python's logging propagates a record up through parent loggers, this also captures records from a child logger under one of those names, for example `django.request` or `django.security.csrf`, as long as the record passes that child logger's own effective level first.
 
+Overlapping selections, such as `["netbox", "netbox.api.views"]`, export each record only once. The handler deduplicates the same record as it propagates; logger propagation and existing console or file handlers are unchanged.
+
 ## Getting INFO records
 
 `logs.level = "INFO"` only decides what the handler accepts once a record reaches it; it does not change any logger's own effective level. NetBox's default `LOGGING` setting is an empty dict, so `netbox` (and anything under it, such as `netbox.dcim.api.views`) has no level of its own and inherits the root logger's level, `WARNING`: with the defaults, an INFO record from `netbox.*` is filtered out by the logger itself before the handler ever sees it. (NetBox's own configuration docs describe INFO records reaching the console by default; the code disagrees, and this plugin follows the code.)

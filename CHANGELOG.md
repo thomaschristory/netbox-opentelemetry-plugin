@@ -6,6 +6,12 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Overlapping `logs.loggers` selections export each record only once without changing application logger propagation ([#47](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/47)).
+- HTTP metrics remain available when `OTEL_SEMCONV_STABILITY_OPT_IN` is empty or contains only non-HTTP opt-ins; existing opt-ins, including `http/dup`, are preserved ([#48](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/48)).
+- Metric exemplars no longer reintroduce attributes discarded by the metric allowlist; sampled values and trace correlation are preserved ([#49](https://github.com/thomaschristory/netbox-opentelemetry-plugin/issues/49)).
+
 ## [0.4.0] - 2026-10-27
 
 ### Changed

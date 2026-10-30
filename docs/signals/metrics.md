@@ -23,6 +23,8 @@ With `metrics.enabled`, the web processes and the RQ worker processes each build
 
 Only the names and attribute keys above ever leave the process from the plugin's `MeterProvider`. Every other instrument name is dropped by a catch-all View before it reaches an exporter, and every listed instrument keeps only the attribute keys shown, dropping any other attribute the instrumentation library adds: for example, the Django instrumentor's own `http.server.active_requests` is dropped entirely, and `server.port` and `url.path` are dropped from the two HTTP histograms even though the instrumentors set them. `process.*` and `cpython.gc.*` are the exception: they keep whatever attributes their own instrumentor sets, since those are low-cardinality process states, not request data.
 
+Exemplars retain their sampled value, timestamp and trace/span ids for metric-to-trace correlation, but cannot carry attributes discarded by the allowlist. Filtering a data point alone is insufficient: the SDK would otherwise preserve those attributes in its exemplars.
+
 ## HTTP metrics
 
 `http.server.request.duration` and `http.client.request.duration` come from the same Django and requests instrumentors that produce the [trace](traces.md) spans, and are recorded whenever metrics are on, whether traces are on or off. `traces.excluded_urls` applies to `http.server.request.duration` either way: an excluded URL gets neither a span nor a duration measurement.

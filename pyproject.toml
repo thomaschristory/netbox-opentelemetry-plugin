@@ -49,7 +49,7 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.12",
     "requests>=2.32",
-    "rq==2.12.0",
+    "rq==3.0.0",
     "django==6.1.2",
     "redis==8.1.0",
     "psycopg[binary]==3.3.6",
